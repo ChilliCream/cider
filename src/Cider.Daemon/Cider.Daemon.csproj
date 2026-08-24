@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Cider.Daemon</RootNamespace>
+    <AssemblyName>cider</AssemblyName>
+    <!--
+      The wire JSON is source-generated, and so are the route handlers: the
+      Request Delegate Generator replaces the reflection MapGet/MapPost would otherwise do. Both
+      are switched on automatically by PublishAot; turning them on here means the ordinary build
+      compiles and analyzes exactly what the AOT publish will. IsAotCompatible is a library-only
+      switch, hence the three analyzers by hand. Flipping PublishAot is the release pipeline's job.
+    -->
+    <EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+
+    <!--
+      The released binary is Native AOT for osx-arm64 only: Apple `container`
+      requires Apple silicon, so there is no x64 slice and no universal binary anywhere in this
+      build. RuntimeIdentifiers is listed here (rather than only passed as -r on the publish
+      command line) so `dotnet restore`/`dotnet build` on net11.0 resolve the AOT-only ILCompiler
+      and runtime packs without extra flags.
+
+      StripSymbols keeps its SDK default (true), which runs dsymutil and produces the ~20 MB
+      binary (vs. ~78 MB unstripped) that matches the graphql-platform prior art. On a machine
+      with only the Xcode Command Line Tools (no full Xcode.app) dsymutil prints a handful of
+      "warning:"/"note:" lines about a missing Swift module-debug cache (.pcm files it cannot
+      find); these are dsymutil noise about its own debug-map bookkeeping, not IL2xxx/IL3xxx
+      trim/AOT warnings — `dotnet publish ... -p:PublishAot=true` still reports zero of those.
+      Full dSYM packaging for crash symbolication is the release pipeline's job.
+
+      UseLdClassicXCodeLinker=false works around a separate CLT-only issue one step earlier: left
+      at its default (empty), the SDK's native build targets shell out to `xcodebuild -version` to
+      decide whether to add `-ld_classic`, and on a CLT-only machine that probe writes an
+      "xcode-select: error: tool 'xcodebuild' requires Xcode" line to stderr. The probe itself is
+      wrapped in IgnoreExitCode="true" so it does not fail the build, but MSBuild's console logger
+      still scans captured output for the word "error" and flags the whole run as failed (`dotnet
+      publish` exits 1) even though the binary comes out fine — confirmed by running the published
+      `cider version` after such a "failed" publish. Setting the property explicitly skips the
+      probe outright; CLT's modern `ld` does not need `-ld_classic` here.
+    -->
+    <RuntimeIdentifiers>osx-arm64</RuntimeIdentifiers>
+    <UseLdClassicXCodeLinker>false</UseLdClassicXCodeLinker>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Cider.Core\Cider.Core.csproj" />
+    <ProjectReference Include="..\Cider.AppleContainer\Cider.AppleContainer.csproj" />
+    <ProjectReference Include="..\Cider.Dns\Cider.Dns.csproj" />
+  </ItemGroup>
+
+</Project>

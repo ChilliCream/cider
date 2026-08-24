@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The one "service" the AppHost orchestrates. It runs on the host (Aspire project resources are
+       plain processes), so every byte it sends to redis/postgres travels host -> published port ->
+       container, which is exactly the path this fixture exists to prove. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Single-targeted on purpose: the repository Directory.Build.props sets TargetFrameworks
+         (plural), which makes MSBuild take the cross-targeting path, and that path never imports
+         Microsoft.NET.RuntimeIdentifierInference.targets - so Aspire.AppHost.Sdk's call to the
+         PickBestRid task fails with MSB4036. -->
+    <TargetFrameworks></TargetFrameworks>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>E2EAspireConsumer</RootNamespace>
+    <AssemblyName>e2e-aspire-consumer</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="9.0.3" />
+    <PackageReference Include="StackExchange.Redis" Version="2.8.24" />
+  </ItemGroup>
+
+</Project>

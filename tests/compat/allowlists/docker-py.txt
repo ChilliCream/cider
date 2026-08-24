@@ -1,0 +1,96 @@
+# tests/compat/allowlists/docker-py.txt
+# Generated 2026-08-22 from docker-py tag 7.1.0 against cider (merged main 9c430f4).
+# One pytest node id per line = expected to keep passing.
+#
+# HOW THIS BASELINE WAS DERIVED (2026-08-22/23):
+#   Copied verbatim from the "passed" set of the run that produced
+#   reports/docker-py-junit.xml (69 passed / 102 failed / 2 skipped /
+#   2 xpassed / 18 errors, 17m01s) -- i.e. exactly the ids run-docker-py.sh's
+#   own junit parser emitted into /tmp/cider-compat-docker-py-results.json.
+#   The suite was NOT re-run to confirm, so treat the first future run as the
+#   real confirmation of this baseline.
+#
+# WHAT A FUTURE RUN SHOULD EXPECT:
+#   - The previous baseline (2026-08-21) was 0 passed / 152 errors: every test
+#     died in the session fixture at c.pull(TEST_IMG, stream=True, decode=True)
+#     because /images/create's NDJSON framing emitted a whitespace-only chunk.
+#     That is fixed; the suite now actually runs.
+#   - ~4 of the 69 ids below are network-dependent (they pull from Docker Hub).
+#     On a host that cannot reach registry-1.docker.io they will fail with
+#     `Failed: Timeout >45.0s` and be reported as regressions. That is an
+#     environment failure, not a daemon regression -- check the run log for
+#     `i/o timeout` / `DeadlineExceeded` before filing anything.
+#   - The docker-py suite LEAKS `dockerpytest_*` networks (12 were left behind
+#     by this run). Apple `container network create` hangs indefinitely once
+#     they accumulate, which then breaks every later suite on the same host.
+#     Delete them (`container network delete dockerpytest_...`) before re-running.
+#
+tests/integration/api_container_test.py::ArchiveTest::test_copy_file_to_container
+tests/integration/api_container_test.py::AttachContainerTest::test_attach_no_stream
+tests/integration/api_container_test.py::AttachContainerTest::test_run_container_reading_socket_http
+tests/integration/api_container_test.py::AttachContainerTest::test_run_container_streaming
+tests/integration/api_container_test.py::ContainerCPUTest::test_container_cpu_shares
+tests/integration/api_container_test.py::ContainerCPUTest::test_container_cpuset
+tests/integration/api_container_test.py::ContainerUpdateTest::test_restart_policy_update
+tests/integration/api_container_test.py::CreateContainerTest::test_create
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_auto_remove
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_cgroupns
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_cpu_rt_options
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_device_cgroup_rules
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_environment_variable_no_value
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_init
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_isolation
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_memory_constraints_with_int
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_memory_constraints_with_str
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_stop_timeout
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_storage_opt
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_tmpfs
+tests/integration/api_container_test.py::CreateContainerTest::test_create_with_uts_mode
+tests/integration/api_container_test.py::CreateContainerTest::test_valid_log_driver_and_log_opt
+tests/integration/api_container_test.py::CreateContainerTest::test_valid_no_log_driver_specified
+tests/integration/api_container_test.py::GetContainerStatsTest::test_get_container_stats_no_stream
+tests/integration/api_container_test.py::KillTest::test_kill
+tests/integration/api_container_test.py::KillTest::test_kill_with_dict_instead_of_id
+tests/integration/api_container_test.py::KillTest::test_kill_with_signal
+tests/integration/api_container_test.py::KillTest::test_kill_with_signal_integer
+tests/integration/api_container_test.py::KillTest::test_kill_with_signal_name
+tests/integration/api_container_test.py::ListContainersTest::test_list_containers
+tests/integration/api_container_test.py::LogsTest::test_logs
+tests/integration/api_container_test.py::LogsTest::test_logs_streaming_and_follow
+tests/integration/api_container_test.py::LogsTest::test_logs_streaming_and_follow_and_cancel
+tests/integration/api_container_test.py::LogsTest::test_logs_tail_option
+tests/integration/api_container_test.py::LogsTest::test_logs_with_dict_instead_of_id
+tests/integration/api_container_test.py::LogsTest::test_logs_with_until
+tests/integration/api_container_test.py::PortTest::test_port
+tests/integration/api_container_test.py::RemoveContainerTest::test_remove
+tests/integration/api_container_test.py::RemoveContainerTest::test_remove_with_dict_instead_of_id
+tests/integration/api_container_test.py::RenameContainerTest::test_rename_container
+tests/integration/api_container_test.py::RestartContainerTest::test_restart
+tests/integration/api_container_test.py::RestartContainerTest::test_restart_with_dict_instead_of_id
+tests/integration/api_container_test.py::RestartContainerTest::test_restart_with_low_timeout
+tests/integration/api_container_test.py::StartContainerTest::test_run_shlex_commands
+tests/integration/api_container_test.py::StartContainerTest::test_start_container
+tests/integration/api_container_test.py::StartContainerTest::test_start_container_with_dict_instead_of_id
+tests/integration/api_container_test.py::StopTest::test_stop
+tests/integration/api_container_test.py::StopTest::test_stop_with_dict_instead_of_id
+tests/integration/api_container_test.py::WaitTest::test_wait
+tests/integration/api_container_test.py::WaitTest::test_wait_with_condition
+tests/integration/api_container_test.py::WaitTest::test_wait_with_dict_instead_of_id
+tests/integration/api_exec_test.py::ExecTest::test_exec_inspect
+tests/integration/api_exec_test.py::ExecTest::test_exec_start_detached
+tests/integration/api_image_test.py::ImportImageTest::test_import_from_bytes
+tests/integration/api_image_test.py::ImportImageTest::test_import_from_file
+tests/integration/api_image_test.py::ImportImageTest::test_import_from_stream
+tests/integration/api_image_test.py::ImportImageTest::test_import_image_from_data_with_changes
+tests/integration/api_image_test.py::ImportImageTest::test_import_image_with_changes
+tests/integration/api_image_test.py::ListImagesTest::test_images
+tests/integration/api_image_test.py::ListImagesTest::test_images_quiet
+tests/integration/api_image_test.py::SaveLoadImagesTest::test_get_image_load_image
+tests/integration/api_volume_test.py::TestVolumes::test_create_volume
+tests/integration/api_volume_test.py::TestVolumes::test_force_remove_volume
+tests/integration/api_volume_test.py::TestVolumes::test_inspect_nonexistent_volume
+tests/integration/api_volume_test.py::TestVolumes::test_inspect_volume
+tests/integration/api_volume_test.py::TestVolumes::test_list_volumes
+tests/integration/api_volume_test.py::TestVolumes::test_prune_volumes
+tests/integration/api_volume_test.py::TestVolumes::test_remove_nonexistent_volume
+tests/integration/api_volume_test.py::TestVolumes::test_remove_volume

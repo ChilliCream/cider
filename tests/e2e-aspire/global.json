@@ -1,0 +1,7 @@
+{
+  "//": "Aspire.AppHost.Sdk 13.5.0 fails on the .NET 11 preview SDK the repository root global.json rolls forward to (MSB4036: the PickBestRid task was removed). This fixture is built and run with its own working directory, so pinning the 10.0.x SDK here keeps it off that path without touching the main build.",
+  "sdk": {
+    "version": "10.0.302",
+    "rollForward": "latestFeature"
+  }
+}

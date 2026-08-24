@@ -1,0 +1,81 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
+using Cider.AppleContainer.Cli.Models;
+
+namespace Cider.AppleContainer.Cli;
+
+/// <summary>JSON settings for everything the <c>container</c> CLI prints: tolerant and case-insensitive.</summary>
+/// <remarks>
+/// The contracts come from <see cref="AppleJsonContext"/> so nothing here needs runtime reflection;
+/// this stays the single door onto the CLI's JSON, exactly as before.
+/// </remarks>
+internal static class AppleJson
+{
+    public static readonly JsonSerializerOptions Options = AppleJsonContext.Default.Options;
+
+    public static T? Deserialize<T>(string json) =>
+        JsonSerializer.Deserialize(json, (JsonTypeInfo<T>)Options.GetTypeInfo(typeof(T)));
+}
+
+/// <summary>
+/// The source-generated contracts for the <c>container</c> CLI's JSON. The options repeat what the
+/// hand-built <c>AppleJson.Options</c> carried, including the <c>Web</c> defaults it started from.
+/// </summary>
+[JsonSourceGenerationOptions(
+    JsonSerializerDefaults.Web,
+    PropertyNameCaseInsensitive = true,
+    NumberHandling = JsonNumberHandling.AllowReadingFromString,
+    ReadCommentHandling = JsonCommentHandling.Skip,
+    AllowTrailingCommas = true,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+[JsonSerializable(typeof(AppleContainerJson))]
+[JsonSerializable(typeof(AppleContainerConfiguration))]
+[JsonSerializable(typeof(AppleContainerStatus))]
+[JsonSerializable(typeof(AppleImageReference))]
+[JsonSerializable(typeof(AppleDescriptor))]
+[JsonSerializable(typeof(AppleInitProcess))]
+[JsonSerializable(typeof(AppleUser))]
+[JsonSerializable(typeof(AppleUserId))]
+[JsonSerializable(typeof(AppleUserRaw))]
+[JsonSerializable(typeof(AppleRlimit))]
+[JsonSerializable(typeof(AppleMount))]
+[JsonSerializable(typeof(AppleMountType))]
+[JsonSerializable(typeof(AppleVolumeMount))]
+[JsonSerializable(typeof(AppleEmptyObject))]
+[JsonSerializable(typeof(AppleNetworkRequest))]
+[JsonSerializable(typeof(AppleNetworkRequestOptions))]
+[JsonSerializable(typeof(AppleNetworkAttachment))]
+[JsonSerializable(typeof(AplePlatform))]
+[JsonSerializable(typeof(ApplePublishedPort))]
+[JsonSerializable(typeof(ApplePublishedSocket))]
+[JsonSerializable(typeof(AppleResources))]
+[JsonSerializable(typeof(AppleDnsConfiguration))]
+[JsonSerializable(typeof(AppleImageJson))]
+[JsonSerializable(typeof(AppleImageConfiguration))]
+[JsonSerializable(typeof(AppleImageVariant))]
+[JsonSerializable(typeof(AppleOciImageDocument))]
+[JsonSerializable(typeof(AppleOciManifest))]
+[JsonSerializable(typeof(AppleOciHistory))]
+[JsonSerializable(typeof(AppleOciConfig))]
+[JsonSerializable(typeof(AppleOciHealthcheck))]
+[JsonSerializable(typeof(AppleOciRootFs))]
+[JsonSerializable(typeof(AppleNetworkJson))]
+[JsonSerializable(typeof(AppleNetworkConfiguration))]
+[JsonSerializable(typeof(AppleNetworkStatus))]
+[JsonSerializable(typeof(AppleVolumeJson))]
+[JsonSerializable(typeof(AppleVolumeConfiguration))]
+[JsonSerializable(typeof(AppleSystemStatus))]
+[JsonSerializable(typeof(AppleVersionEntry))]
+[JsonSerializable(typeof(AppleDiskUsage))]
+[JsonSerializable(typeof(AppleDiskUsageEntry))]
+[JsonSerializable(typeof(AppleStats))]
+// The CLI prints most `--format json` results as an array; a few inspect commands print
+// a bare object, so both shapes are registered for those.
+[JsonSerializable(typeof(List<AppleContainerJson>))]
+[JsonSerializable(typeof(List<AppleImageJson>))]
+[JsonSerializable(typeof(List<AppleNetworkJson>))]
+[JsonSerializable(typeof(List<AppleVolumeJson>))]
+[JsonSerializable(typeof(List<AppleStats>))]
+[JsonSerializable(typeof(List<AppleVersionEntry>))]
+internal sealed partial class AppleJsonContext : JsonSerializerContext;

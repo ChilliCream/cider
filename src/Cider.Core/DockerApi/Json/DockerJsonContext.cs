@@ -1,0 +1,157 @@
+// The source-generated half of the Docker wire format. Every option here mirrors what
+// DockerJson.CreateOptions used to set by hand; see the null/empty policy note at the top of
+// DockerJson.cs for the contract these settings encode. The one setting with no source-generation
+// counterpart is Encoder, which DockerJson applies to a copy of this context's options.
+
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Cider.Core.DockerApi.Models;
+
+namespace Cider.Core.DockerApi.Json;
+
+[JsonSourceGenerationOptions(
+    // Docker's Go structs serialize with their field names -> PascalCase, verbatim.
+    PropertyNamingPolicy = JsonKnownNamingPolicy.Unspecified,
+    DictionaryKeyPolicy = JsonKnownNamingPolicy.Unspecified,
+    DefaultIgnoreCondition = JsonIgnoreCondition.Never,
+    NumberHandling = JsonNumberHandling.AllowReadingFromString,
+    // Go clients occasionally send odd casing (e.g. "hostConfig").
+    PropertyNameCaseInsensitive = true,
+    UnmappedMemberHandling = JsonUnmappedMemberHandling.Skip,
+    ReadCommentHandling = JsonCommentHandling.Skip,
+    AllowTrailingCommas = true,
+    WriteIndented = false,
+    Converters = [typeof(EmptyStructConverter)])]
+[JsonSerializable(typeof(ContainerConfig))]
+[JsonSerializable(typeof(HealthConfig))]
+[JsonSerializable(typeof(ContainerCreateRequest))]
+[JsonSerializable(typeof(HostConfig))]
+[JsonSerializable(typeof(LogConfig))]
+[JsonSerializable(typeof(PortBinding))]
+[JsonSerializable(typeof(RestartPolicy))]
+[JsonSerializable(typeof(Ulimit))]
+[JsonSerializable(typeof(DeviceMapping))]
+[JsonSerializable(typeof(DeviceRequest))]
+[JsonSerializable(typeof(WeightDevice))]
+[JsonSerializable(typeof(ThrottleDevice))]
+[JsonSerializable(typeof(Mount))]
+[JsonSerializable(typeof(BindOptions))]
+[JsonSerializable(typeof(VolumeOptions))]
+[JsonSerializable(typeof(VolumeDriverConfig))]
+[JsonSerializable(typeof(TmpfsOptions))]
+[JsonSerializable(typeof(NetworkingConfig))]
+[JsonSerializable(typeof(EndpointSettings))]
+[JsonSerializable(typeof(EndpointIPAMConfig))]
+[JsonSerializable(typeof(ContainerSummary))]
+[JsonSerializable(typeof(Port))]
+[JsonSerializable(typeof(SummaryHostConfig))]
+[JsonSerializable(typeof(NetworkSettingsSummary))]
+[JsonSerializable(typeof(ContainerCreateResponse))]
+[JsonSerializable(typeof(ContainerInspectResponse))]
+[JsonSerializable(typeof(ContainerInspectState))]
+[JsonSerializable(typeof(Models.Health))]
+[JsonSerializable(typeof(HealthcheckResult))]
+[JsonSerializable(typeof(GraphDriverData))]
+[JsonSerializable(typeof(MountPoint))]
+[JsonSerializable(typeof(NetworkSettings))]
+[JsonSerializable(typeof(ContainerWaitResponse))]
+[JsonSerializable(typeof(ContainerWaitExitError))]
+[JsonSerializable(typeof(ContainerTopResponse))]
+[JsonSerializable(typeof(ContainerUpdateRequest))]
+[JsonSerializable(typeof(ContainerUpdateResponse))]
+[JsonSerializable(typeof(ContainerPruneResponse))]
+[JsonSerializable(typeof(ContainerPathStat))]
+[JsonSerializable(typeof(ContainerStats))]
+[JsonSerializable(typeof(PidsStats))]
+[JsonSerializable(typeof(BlkioStats))]
+[JsonSerializable(typeof(BlkioStatEntry))]
+[JsonSerializable(typeof(StorageStats))]
+[JsonSerializable(typeof(CpuStats))]
+[JsonSerializable(typeof(CpuUsage))]
+[JsonSerializable(typeof(ThrottlingData))]
+[JsonSerializable(typeof(MemoryStats))]
+[JsonSerializable(typeof(NetworkStats))]
+[JsonSerializable(typeof(EmptyStruct))]
+[JsonSerializable(typeof(EventMessage))]
+[JsonSerializable(typeof(EventActor))]
+[JsonSerializable(typeof(ExecCreateRequest))]
+[JsonSerializable(typeof(ExecCreateResponse))]
+[JsonSerializable(typeof(ExecStartRequest))]
+[JsonSerializable(typeof(ExecInspectResponse))]
+[JsonSerializable(typeof(ProcessConfig))]
+[JsonSerializable(typeof(ImageSummary))]
+[JsonSerializable(typeof(ImageInspectResponse))]
+[JsonSerializable(typeof(RootFS))]
+[JsonSerializable(typeof(ImageMetadata))]
+[JsonSerializable(typeof(ImageDeleteResponseItem))]
+[JsonSerializable(typeof(ImageHistoryItem))]
+[JsonSerializable(typeof(ImagePruneResponse))]
+[JsonSerializable(typeof(BuildCachePruneResponse))]
+[JsonSerializable(typeof(IdResponse))]
+[JsonSerializable(typeof(ImageLoadResponse))]
+[JsonSerializable(typeof(ImageSearchItem))]
+[JsonSerializable(typeof(BuildResultAux))]
+[JsonSerializable(typeof(JsonMessage))]
+[JsonSerializable(typeof(JsonProgress))]
+[JsonSerializable(typeof(JsonError))]
+[JsonSerializable(typeof(NetworkResource))]
+[JsonSerializable(typeof(Ipam))]
+[JsonSerializable(typeof(IpamConfig))]
+[JsonSerializable(typeof(ConfigReference))]
+[JsonSerializable(typeof(EndpointResource))]
+[JsonSerializable(typeof(PeerInfo))]
+[JsonSerializable(typeof(NetworkCreateRequest))]
+[JsonSerializable(typeof(NetworkCreateResponse))]
+[JsonSerializable(typeof(NetworkConnectRequest))]
+[JsonSerializable(typeof(NetworkDisconnectRequest))]
+[JsonSerializable(typeof(NetworkPruneResponse))]
+[JsonSerializable(typeof(PingInfo))]
+[JsonSerializable(typeof(VersionResponse))]
+[JsonSerializable(typeof(ComponentVersion))]
+[JsonSerializable(typeof(PlatformInfo))]
+[JsonSerializable(typeof(SystemInfo))]
+[JsonSerializable(typeof(PluginsInfo))]
+[JsonSerializable(typeof(RegistryServiceConfig))]
+[JsonSerializable(typeof(IndexInfo))]
+[JsonSerializable(typeof(Models.RuntimeInfo))]
+[JsonSerializable(typeof(SwarmInfo))]
+[JsonSerializable(typeof(AuthConfig))]
+[JsonSerializable(typeof(AuthResponse))]
+[JsonSerializable(typeof(DiskUsage))]
+[JsonSerializable(typeof(BuildCache))]
+[JsonSerializable(typeof(ErrorResponse))]
+[JsonSerializable(typeof(Volume))]
+[JsonSerializable(typeof(VolumeUsageData))]
+[JsonSerializable(typeof(VolumeListResponse))]
+[JsonSerializable(typeof(VolumeCreateRequest))]
+[JsonSerializable(typeof(VolumePruneResponse))]
+// Collection roots: the list-shaped response bodies, plus the primitives a handler can hand to
+// DockerJson directly.
+[JsonSerializable(typeof(List<ContainerSummary>))]
+[JsonSerializable(typeof(List<ImageSummary>))]
+[JsonSerializable(typeof(List<ImageDeleteResponseItem>))]
+[JsonSerializable(typeof(List<ImageHistoryItem>))]
+[JsonSerializable(typeof(List<ImageSearchItem>))]
+[JsonSerializable(typeof(List<NetworkResource>))]
+[JsonSerializable(typeof(List<Volume>))]
+// The managers hand the routes IReadOnlyList<T>, which is the static type DockerResults.Json
+// infers, so the interface needs its own contract next to the concrete one.
+[JsonSerializable(typeof(IReadOnlyList<ContainerSummary>))]
+[JsonSerializable(typeof(IReadOnlyList<ImageSummary>))]
+[JsonSerializable(typeof(IReadOnlyList<ImageDeleteResponseItem>))]
+[JsonSerializable(typeof(IReadOnlyList<ImageHistoryItem>))]
+[JsonSerializable(typeof(IReadOnlyList<ImageSearchItem>))]
+[JsonSerializable(typeof(IReadOnlyList<NetworkResource>))]
+[JsonSerializable(typeof(IReadOnlyList<Volume>))]
+[JsonSerializable(typeof(IReadOnlyList<string>))]
+[JsonSerializable(typeof(List<string>))]
+[JsonSerializable(typeof(List<List<string>>))]
+[JsonSerializable(typeof(Dictionary<string, string>))]
+// Persisted state: JsonFileStore<T> writes these through DockerJson too.
+[JsonSerializable(typeof(State.ContainerRecord))]
+[JsonSerializable(typeof(State.NetworkRecord))]
+[JsonSerializable(typeof(State.VolumeRecord))]
+[JsonSerializable(typeof(State.ExecRecord))]
+// Engine specs: not a wire type, but tests normalize a spec through DockerJson.
+[JsonSerializable(typeof(Runtime.ContainerSpec))]
+internal sealed partial class DockerJsonContext : JsonSerializerContext;

@@ -1,0 +1,464 @@
+using System.Formats.Tar;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Cider.Core.Ids;
+using Cider.Core.Runtime;
+
+namespace Cider.Tests.Fakes;
+
+public sealed partial class FakeContainerRuntime
+{
+    /// <summary>
+    /// Test hook: fails the next <see cref="PullImageAsync"/> with this error — simulates the real
+    /// adapter's registry 404/401 (RuntimeErrorKind.NotFound) so a caller can verify the failure
+    /// surfaces before any progress is written.
+    /// </summary>
+    public RuntimeException? PullFailure { get; set; }
+
+    /// <summary>
+    /// Test hook: progress events the failing <see cref="PullImageAsync"/> reports before throwing
+    /// <see cref="PullFailure"/> — e.g. a terminal error-only event, the way a runtime adapter may
+    /// announce the failure it is about to throw.
+    /// </summary>
+    public IList<ProgressEvent> PullFailureProgress { get; } = [];
+
+    private readonly List<RuntimeImageDetail> _images =
+    [
+        new RuntimeImageDetail
+        {
+            Id = FixedDigest("alpine:latest"),
+            References = ["docker.io/library/alpine:latest"],
+            Size = 7_800_000,
+            Created = DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
+            Config = new ImageConfig
+            {
+                Cmd = ["/bin/sh"],
+                Env = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+            },
+            Architecture = "arm64",
+            Os = "linux",
+            Layers = ["layer-alpine-1"],
+
+            // Apple carries the image config's history array through verbatim, including the entries
+            // that produced no layer; `docker history` is built from it.
+            History =
+            [
+                new RuntimeImageHistory
+                {
+                    Created = DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
+                    CreatedBy = "ADD alpine-minirootfs.tar.gz / # buildkit",
+                    Comment = "buildkit.dockerfile.v0",
+                },
+                new RuntimeImageHistory
+                {
+                    Created = DateTimeOffset.Parse("2026-01-01T00:00:01Z"),
+                    CreatedBy = "CMD [\"/bin/sh\"]",
+                    Comment = "buildkit.dockerfile.v0",
+                    EmptyLayer = true,
+                },
+            ],
+        },
+        new RuntimeImageDetail
+        {
+            Id = FixedDigest("hello-world:latest"),
+            References = ["docker.io/library/hello-world:latest"],
+            Size = 13_300,
+            Created = DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
+            Config = new ImageConfig { Cmd = ["/hello"] },
+            Architecture = "arm64",
+            Os = "linux",
+            Layers = ["layer-hello-1"],
+        },
+        new RuntimeImageDetail
+        {
+            Id = FixedDigest("busybox:latest"),
+            References = ["docker.io/library/busybox:latest"],
+            Size = 4_200_000,
+            Created = DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
+            Config = new ImageConfig { Cmd = ["sh"] },
+            Architecture = "arm64",
+            Os = "linux",
+            Layers = ["layer-busybox-1"],
+        },
+        new RuntimeImageDetail
+        {
+            Id = FixedDigest("nginx:latest"),
+            References = ["docker.io/library/nginx:latest"],
+            Size = 142_000_000,
+            Created = DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
+            Config = new ImageConfig { Cmd = ["nginx", "-g", "daemon off;"], ExposedPorts = ["80/tcp"] },
+            Architecture = "arm64",
+            Os = "linux",
+            Layers = ["layer-nginx-1", "layer-nginx-2"],
+        },
+    ];
+
+    public Task<IReadOnlyList<RuntimeImage>> ListImagesAsync(CancellationToken ct)
+    {
+        Record("ListImagesAsync");
+        lock (_sync)
+        {
+            return Task.FromResult<IReadOnlyList<RuntimeImage>>(_images.Cast<RuntimeImage>().ToList());
+        }
+    }
+
+    public Task<RuntimeImageDetail?> InspectImageAsync(string reference, CancellationToken ct)
+    {
+        Record($"InspectImageAsync:{reference}");
+        lock (_sync)
+        {
+            return Task.FromResult(FindImage(reference));
+        }
+    }
+
+    public Task PullImageAsync(string reference, string? platform, RegistryAuth? auth, IProgress<ProgressEvent> progress, CancellationToken ct)
+    {
+        Record($"PullImageAsync:{reference}");
+
+        if (PullFailure is { } failure)
+        {
+            PullFailure = null;
+            foreach (var reported in PullFailureProgress)
+            {
+                progress.Report(reported);
+            }
+
+            PullFailureProgress.Clear();
+            throw failure;
+        }
+
+        if (!ImageReference.TryParse(reference, out var parsed))
+        {
+            throw RuntimeException.InvalidArgument($"invalid reference: {reference}");
+        }
+
+        var normalized = parsed.Normalize();
+
+        progress.Report(new ProgressEvent { Status = $"Pulling from {normalized.Path}", Id = normalized.Tag ?? normalized.Digest });
+        progress.Report(new ProgressEvent { Status = "Downloading", Id = "layer1", Current = 1, Total = 2 });
+        progress.Report(new ProgressEvent { Status = "Downloading", Id = "layer1", Current = 2, Total = 2 });
+        progress.Report(new ProgressEvent { Status = "Pull complete", Id = "layer1" });
+
+        lock (_sync)
+        {
+            var normalizedRef = normalized.ToString();
+            var existing = FindImage(normalized.Familiar());
+            if (existing is null)
+            {
+                _images.Add(new RuntimeImageDetail
+                {
+                    Id = FixedDigest(normalizedRef),
+                    References = [normalizedRef],
+                    Size = 5_000_000,
+                    Created = DateTimeOffset.UtcNow,
+                    Config = new ImageConfig { Cmd = ["/bin/sh"] },
+                    Architecture = "arm64",
+                    Os = "linux",
+                    Layers = ["layer-pulled-1"],
+                });
+            }
+            else if (!existing.References.Contains(normalizedRef, StringComparer.Ordinal))
+            {
+                var index = _images.IndexOf(existing);
+                _images[index] = existing with { References = [.. existing.References, normalizedRef] };
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task PushImageAsync(string reference, RegistryAuth? auth, IProgress<ProgressEvent> progress, CancellationToken ct)
+    {
+        Record($"PushImageAsync:{reference}");
+        progress.Report(new ProgressEvent { Status = "Pushed" });
+        return Task.CompletedTask;
+    }
+
+    public Task TagImageAsync(string sourceReference, string targetReference, CancellationToken ct)
+    {
+        Record($"TagImageAsync:{sourceReference}->{targetReference}");
+        lock (_sync)
+        {
+            var source = FindImage(sourceReference) ?? throw RuntimeException.NotFound($"no such image: {sourceReference}");
+            var targetNormalized = ImageReference.Parse(targetReference).Normalize().ToString();
+            if (!source.References.Contains(targetNormalized, StringComparer.Ordinal))
+            {
+                var index = _images.IndexOf(source);
+                _images[index] = source with { References = [.. source.References, targetNormalized] };
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task RemoveImageAsync(string reference, bool force, CancellationToken ct)
+    {
+        Record($"RemoveImageAsync:{reference}:{force}");
+
+        // Apple's `container image delete` resolves a *reference* only: handed a sha256:… id it
+        // fails with "image with reference sha256:… not found", which is why every caller routes
+        // through ImageManager.RuntimeReferenceFor. Modelling that refusal here is what lets the
+        // prune and rmi paths catch a regression back to deleting by raw digest.
+        if (IsDigestReference(reference))
+        {
+            throw RuntimeException.NotFound($"image with reference {reference} not found");
+        }
+
+        lock (_sync)
+        {
+            var image = FindImage(reference) ?? throw RuntimeException.NotFound($"no such image: {reference}");
+            var normalizedTag = TryNormalizedTag(reference);
+            if (normalizedTag is not null && image.References.Count > 1 && image.References.Contains(normalizedTag, StringComparer.Ordinal))
+            {
+                var index = _images.IndexOf(image);
+                _images[index] = image with { References = image.References.Where(r => r != normalizedTag).ToList() };
+                return Task.CompletedTask;
+            }
+
+            _images.Remove(image);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public async Task SaveImagesAsync(IReadOnlyList<string> references, Stream tarOutput, CancellationToken ct)
+    {
+        Record($"SaveImagesAsync:{string.Join(",", references)}");
+        var bytes = Encoding.UTF8.GetBytes($"fake-tar:{string.Join(",", references)}");
+        await tarOutput.WriteAsync(bytes, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The bytes of the last archive handed to <see cref="LoadImagesAsync"/> — the commit/import
+    /// paths build one themselves, so tests assert on it directly.
+    /// </summary>
+    public byte[]? LastLoadedTar { get; private set; }
+
+    public async Task<IReadOnlyList<string>> LoadImagesAsync(Stream tarInput, CancellationToken ct)
+    {
+        Record("LoadImagesAsync");
+        using var buffer = new MemoryStream();
+        await tarInput.CopyToAsync(buffer, ct).ConfigureAwait(false);
+        LastLoadedTar = buffer.ToArray();
+
+        // A real OCI layout (what OciImageWriter produces for commit/import) is registered under the
+        // id and reference it actually declares, exactly like `container image load` does — Apple
+        // keys the image by the digest of the index blob index.json points at.
+        if (TryReadOciLayout(LastLoadedTar, out var ociReference, out var ociId))
+        {
+            lock (_sync)
+            {
+                if (FindImage(ociId) is null)
+                {
+                    _images.Add(new RuntimeImageDetail
+                    {
+                        Id = ociId,
+                        References = [ociReference],
+                        Size = LastLoadedTar.Length,
+                        Created = DateTimeOffset.UtcNow,
+                        Config = new ImageConfig(),
+                        Architecture = "arm64",
+                        Os = "linux",
+                        Layers = ["layer-loaded-1"],
+                    });
+                }
+            }
+
+            return [ociReference];
+        }
+
+        const string reference = "docker.io/library/loaded:latest";
+        lock (_sync)
+        {
+            if (FindImage(reference) is null)
+            {
+                _images.Add(new RuntimeImageDetail
+                {
+                    Id = FixedDigest(reference + buffer.Length),
+                    References = [reference],
+                    Size = buffer.Length,
+                    Created = DateTimeOffset.UtcNow,
+                    Config = new ImageConfig(),
+                    Architecture = "arm64",
+                    Os = "linux",
+                });
+            }
+        }
+
+        return [reference];
+    }
+
+    public Task<string> BuildImageAsync(BuildSpec spec, IProgress<ProgressEvent> progress, CancellationToken ct)
+    {
+        Record($"BuildImageAsync:{spec.ContextDir}");
+        progress.Report(new ProgressEvent { Stream = "Step 1/1 : FROM scratch\n" });
+
+        // Mirrors AppleContainerRuntime.BuildImageAsync: an untagged build still gets a real
+        // reference on the Apple side, just a synthetic one the manager must hide.
+        var tags = spec.Tags.Count > 0 ? spec.Tags : [SyntheticBuildTag.New()];
+        var references = tags.Select(t => ImageReference.Parse(t).Normalize().ToString()).ToList();
+        var id = FixedDigest(tags[0] + Guid.NewGuid());
+
+        lock (_sync)
+        {
+            _images.Add(new RuntimeImageDetail
+            {
+                Id = id,
+                References = references,
+                Size = 1_000,
+                Created = DateTimeOffset.UtcNow,
+                Config = new ImageConfig(),
+                Architecture = "arm64",
+                Os = "linux",
+                Layers = ["layer-built-1"],
+            });
+        }
+
+        // A runtime adapter that mistakes the Docker-shaped closing lines for its own emits these —
+        // AppleContainerRuntime did until that was fixed, synthetic build tag and all. Keeping them
+        // here is what makes ImageManager's "exactly once" assertions able to fail: without the
+        // manager dropping runtime-reported terminal lines, the client sees each of them twice.
+        progress.Report(new ProgressEvent { Stream = $"Successfully built {DockerId.Short(IdWithoutPrefix(id))}\n" });
+        foreach (var tag in tags)
+        {
+            progress.Report(new ProgressEvent { Stream = $"Successfully tagged {tag}\n" });
+        }
+
+        return Task.FromResult(id);
+    }
+
+    public Task LoginAsync(RegistryAuth auth, CancellationToken ct)
+    {
+        Record($"LoginAsync:{auth.Username}");
+        return Task.CompletedTask;
+    }
+
+    public Task<RuntimeDiskUsage> GetDiskUsageAsync(CancellationToken ct)
+    {
+        Record("GetDiskUsageAsync");
+        lock (_sync)
+        {
+            return Task.FromResult(new RuntimeDiskUsage
+            {
+                ImagesBytes = _images.Sum(i => i.Size),
+                ContainersBytes = 0,
+                VolumesBytes = _volumes.Sum(v => v.SizeBytes ?? 0),
+                BuildCacheBytes = 0,
+                ImagesCount = _images.Count,
+                ContainersCount = _containers.Count,
+                VolumesCount = _volumes.Count,
+            });
+        }
+    }
+
+    private RuntimeImageDetail? FindImage(string reference)
+    {
+        if (string.IsNullOrWhiteSpace(reference))
+        {
+            return null;
+        }
+
+        var stripped = reference.StartsWith("sha256:", StringComparison.Ordinal) ? reference["sha256:".Length..] : reference;
+        if (DockerId.IsFullId(stripped))
+        {
+            var byId = _images.FirstOrDefault(i => IdWithoutPrefix(i.Id) == stripped);
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+        else if (DockerId.IsHexPrefix(stripped) && stripped.Length >= 4)
+        {
+            var matches = _images.Where(i => IdWithoutPrefix(i.Id).StartsWith(stripped, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (matches.Count == 1)
+            {
+                return matches[0];
+            }
+        }
+
+        if (!ImageReference.TryParse(reference, out var parsed))
+        {
+            return null;
+        }
+
+        var familiar = parsed.Normalize().Familiar();
+        var normalizedForm = parsed.Normalize().ToString();
+        foreach (var image in _images)
+        {
+            foreach (var r in image.References)
+            {
+                if (!ImageReference.TryParse(r, out var rp))
+                {
+                    continue;
+                }
+
+                if (string.Equals(rp.Normalize().Familiar(), familiar, StringComparison.Ordinal) ||
+                    string.Equals(rp.Normalize().ToString(), normalizedForm, StringComparison.Ordinal))
+                {
+                    return image;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>A bare image id — the one thing Apple's reference-taking verbs cannot resolve.</summary>
+    private static bool IsDigestReference(string reference)
+    {
+        var stripped = IdWithoutPrefix(reference);
+        return reference.StartsWith("sha256:", StringComparison.Ordinal) || DockerId.IsFullId(stripped);
+    }
+
+    private static string? TryNormalizedTag(string reference)
+    {
+        var stripped = reference.StartsWith("sha256:", StringComparison.Ordinal) ? reference["sha256:".Length..] : reference;
+        if (DockerId.IsFullId(stripped) || DockerId.IsHexPrefix(stripped))
+        {
+            return null;
+        }
+
+        return ImageReference.TryParse(reference, out var parsed) ? parsed.Normalize().ToString() : null;
+    }
+
+    private static string IdWithoutPrefix(string id) =>
+        id.StartsWith("sha256:", StringComparison.Ordinal) ? id["sha256:".Length..] : id;
+
+    /// <summary>Reads <c>index.json</c> out of an OCI-layout tar: its single descriptor is the image.</summary>
+    private static bool TryReadOciLayout(byte[] tar, out string reference, out string id)
+    {
+        reference = "";
+        id = "";
+        try
+        {
+            using var stream = new MemoryStream(tar, writable: false);
+            using var reader = new TarReader(stream);
+            while (reader.GetNextEntry() is { } entry)
+            {
+                if (!string.Equals(entry.Name, "index.json", StringComparison.Ordinal) || entry.DataStream is null)
+                {
+                    continue;
+                }
+
+                using var content = new MemoryStream();
+                entry.DataStream.CopyTo(content);
+                using var document = JsonDocument.Parse(content.ToArray());
+                var descriptor = document.RootElement.GetProperty("manifests")[0];
+                id = descriptor.GetProperty("digest").GetString() ?? "";
+                reference = descriptor.GetProperty("annotations")
+                    .GetProperty("org.opencontainers.image.ref.name").GetString() ?? "";
+                return id.Length > 0 && reference.Length > 0;
+            }
+        }
+        catch (Exception ex) when (ex is InvalidDataException or JsonException or KeyNotFoundException or IndexOutOfRangeException)
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static string FixedDigest(string seed) =>
+        "sha256:" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(seed)));
+}

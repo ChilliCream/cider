@@ -1,0 +1,52 @@
+# tests/compat/fixtures/compose/docker-compose.yml
+#
+# Minimal two-service smoke fixture for run-compose-e2e.sh's fallback path
+# (used when `go` is not on PATH and the docker/compose pkg/e2e suite can't
+# be built). Exercises: image pull, container create/start, Compose's
+# service-name DNS, and a published... actually no published port here —
+# `web` is reached purely over the Compose network by service name, which is
+# the part of Docker-compat networking most worth smoke-testing.
+#
+# `web` speaks just enough HTTP to satisfy `wget -qO-`: a shell loop pipes a
+# canned "HTTP/1.1 200 OK" response into BusyBox `nc -l -p 8080` for each
+# connection. BusyBox in alpine:3.22 has no `httpd` applet (confirmed by
+# testing: "httpd: applet not found"), so this nc-loop is the robust choice
+# — no extra `apk add` package layer, no reliance on nc's non-portable `-e`
+# flag, just plain listen-respond-repeat.
+services:
+  web:
+    image: alpine:3.22
+    command: >
+      sh -c '
+      while true; do
+        printf "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n" | nc -l -p 8080;
+      done
+      '
+    expose:
+      - "8080"
+
+  client:
+    image: alpine:3.22
+    depends_on:
+      - web
+    command: >
+      sh -c '
+      i=0;
+      while [ $$i -lt 60 ]; do
+        echo "=== attempt $$i: nslookup web ===";
+        nslookup web || echo "nslookup web FAILED";
+        echo "=== attempt $$i: wget web:8080 ===";
+        if wget -qO- -T 3 http://web:8080; then
+          echo " -- OK reached web by name";
+        else
+          echo " -- FAILED to reach web by name";
+        fi;
+        i=$$((i+1));
+        sleep 2;
+      done
+      '
+
+networks:
+  default:
+    external: true
+    name: cider-compat-net

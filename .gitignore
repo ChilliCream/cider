@@ -1,0 +1,57 @@
+## .NET
+[Bb]in/
+[Oo]bj/
+## local `dotnet publish` output (e.g. `dotnet publish src/Cider.Daemon -o ./out|./publish`) —
+## never a build artifact worth tracking, wherever it lands.
+publish/
+publish-fdd/
+out/
+## (build output only — do NOT use bare [Ll]ogs/ style rules here: they also match
+## real source directories such as src/Cider.Core/Logs/ and tests/Cider.Tests/Logs/)
+artifacts/
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+*.nupkg
+*.snupkg
+.vs/
+.vscode/
+.idea/
+*.received.*
+TestResults/
+BenchmarkDotNet.Artifacts/
+project.lock.json
+project.fragment.lock.json
+msbuild.log
+msbuild.err
+msbuild.wrn
+*.binlog
+.dotnet/
+.packages/
+nuget.config.user
+
+## macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+## cider runtime artifacts
+*.sock
+.cider/
+## transitional: the pre-rename runtime data dir, ignored until nobody has one left
+.apple-demon/
+
+## nitro agent workspace: the JSONL export is the tracker's source of truth in git;
+## the SQLite database and its WAL/SHM files are local-only.
+.nitro/*
+!.nitro/agents/
+.nitro/agents/*
+!.nitro/agents/tasks.jsonl
+
+## python bytecode from the compat harness
+__pycache__/
+*.pyc

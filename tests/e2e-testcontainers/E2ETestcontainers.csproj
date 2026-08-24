@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Deliberately NOT part of Cider.sln: this is a fixture the E2E suite shells out to with
+       `dotnet run`, so that a real third-party Docker client library (Testcontainers) exercises the
+       daemon from a separate process with its own DOCKER_HOST. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <RootNamespace>E2ETestcontainers</RootNamespace>
+    <AssemblyName>e2e-testcontainers</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Testcontainers" Version="4.6.0" />
+    <!-- Pin the transitive SSH.NET dependency past the NU1903 advisory (GHSA-q939-rpr3-3284,
+         a path-traversal issue in ScpClient.Download that this fixture never calls) without
+         bumping Testcontainers itself. -->
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
+  </ItemGroup>
+
+</Project>

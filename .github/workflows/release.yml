@@ -1,0 +1,402 @@
+name: Release
+
+run-name: Release ${{ github.ref_name }}
+
+# Cider is Apple-silicon-only, a deliberate and reviewed decision: a single
+# osx-arm64 slice, no universal binary, no x64 RID anywhere in this pipeline. An Intel Mac must
+# fail early and clearly at brew/pkg install time and at daemon startup -- not silently install
+# something that cannot run -- but that guard is the daemon's / formula's job, not this
+# workflow's; nothing here should ever grow a second RID "for completeness".
+#
+# Modeled on ChilliCream/graphql-platform's .github/workflows/release.yml (the AOT + codesign +
+# notarize dance), trimmed to Cider's single-RID scope and extended with the .pkg half
+# graphql-platform's Nitro CLI does not build. Every action below is pinned by commit SHA, as
+# graphql-platform's is.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-context:
+    name: Compute release context
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      git_tag: ${{ steps.ctx.outputs.git_tag }}
+      version: ${{ steps.ctx.outputs.version }}
+      is_stable: ${{ steps.ctx.outputs.is_stable }}
+      has_installer_cert: ${{ steps.ctx.outputs.has_installer_cert }}
+    steps:
+      # A job-level `if:` cannot see the `secrets` context (only github/inputs/needs/vars) --
+      # actionlint catches this if you try. So the Installer-cert presence check happens here, in
+      # a step (where `secrets` IS available), and is threaded through as a job output that
+      # build-pkg's `if:` can read via `needs`.
+      - name: Compute
+        id: ctx
+        shell: bash
+        env:
+          HAS_INSTALLER_CERT: ${{ secrets.APPLE_DEVELOPER_INSTALLER_CERTIFICATE_BASE64 != '' }}
+        run: |
+          set -euo pipefail
+          GIT_TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${GIT_TAG#v}"
+
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            IS_STABLE=true
+          else
+            IS_STABLE=false
+          fi
+
+          {
+            echo "git_tag=$GIT_TAG"
+            echo "version=$VERSION"
+            echo "is_stable=$IS_STABLE"
+            echo "has_installer_cert=$HAS_INSTALLER_CERT"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  create-draft:
+    name: Create draft release
+    runs-on: ubuntu-22.04
+    needs: [release-context]
+    permissions:
+      contents: write
+    env:
+      GIT_TAG: ${{ needs.release-context.outputs.git_tag }}
+      IS_STABLE: ${{ needs.release-context.outputs.is_stable }}
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GIT_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release for $GIT_TAG already exists; leaving it untouched."
+            exit 0
+          fi
+
+          prerelease_flag=()
+          if [[ "$IS_STABLE" != "true" ]]; then
+            prerelease_flag=(--prerelease)
+          fi
+
+          gh release create "$GIT_TAG" \
+            --repo "${{ github.repository }}" \
+            --draft \
+            "${prerelease_flag[@]}" \
+            --title "$GIT_TAG" \
+            --generate-notes \
+            --target "$GITHUB_SHA"
+
+  # ---------------------------------------------------------------------------------------------
+  # AOT publish, codesign, notarize, zip. osx-arm64 only (see the file-level comment). Carries
+  # forward the AOT properties the project settled on: net11.0, PublishAot=true,
+  # UseLdClassicXCodeLinker=false (works around a CLT-only xcodebuild probe that otherwise makes
+  # MSBuild's console logger flag a successful publish as failed -- see
+  # src/Cider.Daemon/Cider.Daemon.csproj for the full explanation).
+  # ---------------------------------------------------------------------------------------------
+  build-sign-notarize:
+    name: Build, sign, notarize (osx-arm64)
+    runs-on: macos-15
+    needs: [release-context]
+    permissions:
+      contents: read
+    env:
+      GIT_TAG: ${{ needs.release-context.outputs.git_tag }}
+      VERSION: ${{ needs.release-context.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          show-progress: false
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: |
+            10.x
+            11.0.100-preview.6.26359.118
+
+      - name: Publish binary (osx-arm64, Native AOT)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet publish src/Cider.Daemon \
+            -c Release \
+            -r osx-arm64 \
+            -f net11.0 \
+            -o publish \
+            --self-contained \
+            -p:PublishAot=true \
+            -p:UseLdClassicXCodeLinker=false \
+            -p:Version="${VERSION}"
+
+      # https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications
+      - name: Set up signing resources
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.TEMPORARY_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Sign binary
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          echo "Code signing 'publish/cider'..."
+
+          codesign --sign "$CODESIGN_IDENTITY" \
+            --verbose=3 \
+            --identifier "com.chillicream.cider" \
+            --options runtime \
+            --timestamp \
+            --force \
+            publish/cider
+
+          codesign --verify --deep --strict --verbose=2 publish/cider
+
+      - name: Zip binary
+        shell: bash
+        run: zip -j cider-osx-arm64.zip publish/cider
+
+      - name: Notarize binary
+        env:
+          APPLE_DEVELOPER_ID_EMAIL: ${{ secrets.APPLE_DEVELOPER_ID_EMAIL }}
+          APPLE_DEVELOPER_TEAM_ID: ${{ secrets.APPLE_DEVELOPER_TEAM_ID }}
+          APPLE_DEVELOPER_CIDER_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CIDER_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "Notarizing 'cider-osx-arm64.zip'..."
+
+          xcrun notarytool submit cider-osx-arm64.zip \
+            --apple-id "$APPLE_DEVELOPER_ID_EMAIL" \
+            --team-id "$APPLE_DEVELOPER_TEAM_ID" \
+            --password "$APPLE_DEVELOPER_CIDER_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+      - name: Clean up signing resources
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+
+      - name: Upload signed binary (for the .pkg job)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cider-signed-binary
+          path: publish/cider
+          if-no-files-found: error
+
+      - name: Upload zip (release asset)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cider-zip
+          path: cider-osx-arm64.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------------
+  # THE .pkg HALF -- guarded.
+  #
+  # Signing a .pkg needs a Developer ID INSTALLER certificate, which is a DIFFERENT certificate
+  # from the Developer ID Application one used for codesign above. As of this writing,
+  # ChilliCream/graphql-platform's repo secrets (checked via `gh api
+  # repos/ChilliCream/graphql-platform/actions/secrets`) contain no Installer-cert secret of any
+  # name, and Cider's own repo has no secrets configured yet at all -- so this cannot be confirmed
+  # to exist. NEEDS-USER: create a Developer ID Installer certificate in the Apple Developer
+  # portal and add it as the three secrets this job reads (APPLE_DEVELOPER_INSTALLER_CERTIFICATE_
+  # BASE64 / _PASSWORD / _IDENTITY) -- ideally as an organization secret alongside the existing
+  # Application-cert secrets, per the ticket -- before this job can ever run.
+  #
+  # The `if:` below means the job is SKIPPED, not failed, when the secret is absent, so a tag
+  # push still succeeds with the signed+notarized binary/zip. It must never fall through to
+  # producing an unsigned .pkg as a release asset.
+  # ---------------------------------------------------------------------------------------------
+  build-pkg:
+    name: Build, sign, notarize .pkg (osx-arm64)
+    runs-on: macos-15
+    needs: [release-context, build-sign-notarize]
+    if: needs.release-context.outputs.has_installer_cert == 'true'
+    permissions:
+      contents: read
+    env:
+      GIT_TAG: ${{ needs.release-context.outputs.git_tag }}
+      VERSION: ${{ needs.release-context.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          show-progress: false
+
+      - name: Download signed binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cider-signed-binary
+          path: publish
+
+      - name: Restore executable bit
+        run: chmod 755 publish/cider
+
+      - name: Set up Installer signing resources
+        env:
+          INSTALLER_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_INSTALLER_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_INSTALLER_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.TEMPORARY_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH=$RUNNER_TEMP/installer_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/installer-signing.keychain-db
+
+          echo -n "$INSTALLER_CERTIFICATE_BASE64" | base64 --decode -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Build .pkg (pkgbuild -> productbuild, signed)
+        env:
+          INSTALLER_IDENTITY: ${{ secrets.APPLE_DEVELOPER_INSTALLER_CERTIFICATE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          scripts/build-pkg.sh \
+            publish/cider \
+            "$VERSION" \
+            "cider-${VERSION}.pkg" \
+            "$INSTALLER_IDENTITY" \
+            "$KEYCHAIN_PATH"
+
+      - name: Notarize .pkg
+        env:
+          APPLE_DEVELOPER_ID_EMAIL: ${{ secrets.APPLE_DEVELOPER_ID_EMAIL }}
+          APPLE_DEVELOPER_TEAM_ID: ${{ secrets.APPLE_DEVELOPER_TEAM_ID }}
+          APPLE_DEVELOPER_CIDER_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CIDER_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "Notarizing 'cider-${VERSION}.pkg'..."
+
+          xcrun notarytool submit "cider-${VERSION}.pkg" \
+            --apple-id "$APPLE_DEVELOPER_ID_EMAIL" \
+            --team-id "$APPLE_DEVELOPER_TEAM_ID" \
+            --password "$APPLE_DEVELOPER_CIDER_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+      # Stapling is the reason the .pkg is worth building: a bare notarized binary cannot be
+      # stapled and so revalidates online, whereas a stapled .pkg installs cleanly offline.
+      - name: Staple .pkg
+        run: xcrun stapler staple "cider-${VERSION}.pkg"
+
+      - name: Validate staple
+        run: xcrun stapler validate "cider-${VERSION}.pkg"
+
+      - name: Clean up signing resources
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/installer-signing.keychain-db" || true
+
+      - name: Upload .pkg (release asset)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cider-pkg
+          path: cider-${{ env.VERSION }}.pkg
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish release
+    runs-on: ubuntu-22.04
+    needs:
+      - release-context
+      - create-draft
+      - build-sign-notarize
+      - build-pkg
+    # build-pkg is skipped (not failed) when the Installer cert secret is absent -- proceed on
+    # skip so the binary/zip still ship, but not on an actual pkg failure.
+    if: ${{ !failure() && !cancelled() }}
+    permissions:
+      contents: write
+    env:
+      GIT_TAG: ${{ needs.release-context.outputs.git_tag }}
+      IS_STABLE: ${{ needs.release-context.outputs.is_stable }}
+    steps:
+      # Downloaded separately (not by a single `cider-*` pattern) so a skipped build-pkg -- no
+      # Installer cert secret -- does not need special-casing here: this step just has nothing to
+      # download and download-artifact's own `if-no-artifact-found: warn` default lets the job
+      # continue with the zip alone. The signed-binary artifact (build-sign-notarize's
+      # intermediate hand-off to build-pkg) is deliberately not downloaded here at all.
+      - name: Download zip
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cider-zip
+          path: assets
+
+      - name: Download .pkg (if built)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cider-pkg
+          path: assets
+          if-no-artifact-found: warn
+
+      - name: Checksum release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd assets
+          shopt -s nullglob
+          files=(cider-osx-arm64.zip cider-*.pkg)
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "::error::no release assets found to checksum"
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
+
+      - name: Attach assets to draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd assets
+          shopt -s nullglob
+          files=(cider-osx-arm64.zip cider-*.pkg SHA256SUMS)
+          gh release upload "$GIT_TAG" "${files[@]}" \
+            --clobber \
+            --repo "${{ github.repository }}"
+
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$IS_STABLE" == "true" ]]; then
+            prerelease=false
+          else
+            prerelease=true
+          fi
+          gh release edit "$GIT_TAG" \
+            --repo "${{ github.repository }}" \
+            --draft=false \
+            --prerelease=$prerelease
