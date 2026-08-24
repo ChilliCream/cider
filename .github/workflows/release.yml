@@ -352,3 +352,35 @@ jobs:
             --repo "${{ github.repository }}" \
             --draft=false \
             --prerelease=$prerelease
+
+  update-homebrew:
+    name: Update Homebrew tap
+    runs-on: ubuntu-22.04
+    needs: [release-context, publish-release]
+    if: needs.publish-release.result == 'success'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          sparse-checkout: .github/actions
+          show-progress: false
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.ACTIONS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.ACTIONS_APP_PRIVATE_KEY }}
+          owner: ChilliCream
+          repositories: homebrew-tools
+
+      - name: Run Homebrew tap update workflow
+        uses: ./.github/actions/dispatch-and-watch-workflow
+        with:
+          repo: ChilliCream/homebrew-tools
+          workflow: release-cider.yaml
+          version: ${{ needs.release-context.outputs.git_tag }}
+          is_stable: ${{ needs.release-context.outputs.is_stable }}
+          token: ${{ steps.app-token.outputs.token }}
