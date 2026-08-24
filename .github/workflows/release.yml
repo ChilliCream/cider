@@ -357,7 +357,7 @@ jobs:
     name: Update Homebrew tap
     runs-on: ubuntu-22.04
     needs: [release-context, publish-release]
-    if: needs.publish-release.result == 'success'
+    if: ${{ !cancelled() && needs.publish-release.result == 'success' }}
     permissions:
       contents: read
     steps:

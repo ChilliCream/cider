@@ -21,15 +21,39 @@ Cider your default engine for a day or two.
 - **Apple `container` ≥ 1.2.x** installed. Running `container system start` once is a convenience,
   not a prerequisite: the daemon calls `container system start --enable-kernel-install` itself at
   startup if the runtime is not up.
-- The **`docker` CLI**, for actually using the daemon.
-- To build from source: the **.NET 10 SDK**. The solution multi-targets `net10.0;net11.0`; pass
-  `-p:CiderTargetFrameworks=net10.0` if you do not have a .NET 11 preview SDK installed. The Native
-  AOT publish (below) needs the **.NET 11 preview SDK** specifically, since that is the framework
-  AOT picks out of the multi-target.
+- The **`docker` CLI** and **`docker compose`**, for actually using the daemon. The Homebrew formula
+  pulls both in as dependencies (Homebrew's `docker` formula is the CLI only); Docker Desktop is not
+  needed.
 
 ## Install
 
-Cider separates three things on purpose, and this is the part people get wrong:
+To install Cider and make it your default Docker engine:
+
+```bash
+brew install chillicream/tools/cider
+cider install
+docker context use cider
+```
+
+Done — `docker`, `docker compose`, Testcontainers and Aspire now talk to Cider. You do **not** need
+to touch `/var/run/docker.sock`; that is only for tools that hardcode the path and ignore the
+docker context (see [Taking over `/var/run/docker.sock`](#taking-over-varrundockersock)). To go
+back: `docker context use default` (or whatever `docker context ls` showed before).
+
+If you had no docker CLI before, `brew` installed Homebrew's `docker` and `docker-compose` alongside
+Cider. One catch: Homebrew puts the compose plugin in `$(brew --prefix)/lib/docker/cli-plugins`,
+which the docker CLI does not search by default, so `docker compose` says "not a docker command"
+until you add that directory to `~/.docker/config.json` once:
+
+```json
+{ "cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins"] }
+```
+
+(Merge it into the file if one already exists.) If you already had `docker compose` working, nothing
+changes.
+
+The rest of this section explains what those three lines do, because Cider separates three things
+on purpose, and this is the part people get wrong:
 
 1. **Getting the binary** — starts nothing.
 2. **`cider install`** — the opt-in step that makes a background daemon exist (a launchd agent) and
@@ -40,52 +64,6 @@ Cider separates three things on purpose, and this is the part people get wrong:
 
 So if you install Cider and then type `docker ps`, you are still talking to whatever engine you had
 before. That is intentional, not a broken install.
-
-### Getting the binary
-
-| Route | Status |
-|---|---|
-| `brew install chillicream/tools/cider` | **Not available yet** — the Homebrew tap ships with the first release. |
-| Signed `.pkg` installer | **Not available yet** — same release. |
-| From source | Works today, and is the only route right now. |
-
-From source, the one-command route:
-
-```bash
-git clone https://github.com/ChilliCream/cider.git
-cd cider
-scripts/install-local.sh
-```
-
-That checks the preconditions (Apple silicon, the .NET 11 preview SDK, the Apple `container` CLI),
-Native AOT-publishes the daemon to the **stable** path `~/.cider/bin/cider` (never a repo-relative
-`./out` — the launchd agent it registers embeds that exact path, so it has to survive rebuilds and
-the checkout itself being moved or deleted), runs `cider install`, and then makes Cider the
-**default** docker socket: `docker context use cider`, plus repointing the root-owned
-`/var/run/docker.sock` at Cider's socket over an **interactive `sudo`** you get to confirm (it prints
-exactly what will change, from what to what, before asking). Re-running it upgrades everything in
-place. See `scripts/install-local.sh --help` for the full flag list; the ones you are most likely to
-reach for:
-
-| Flag | Effect |
-|---|---|
-| `--dry-run` | Print every command the script would run, including the `sudo` one, without running any of them. |
-| `--no-default-socket` | Stop after `cider install` — do not touch `/var/run/docker.sock` or the active docker context. |
-| `--no-daemon` | Publish the binary only; skip `cider install` and everything after it. |
-| `--yes` | Skip the confirmation before the `sudo` step (for repeat runs). |
-| `--uninstall` | Reverse all of it: `cider uninstall`, restore the previous system socket target from its backup (never `rm -f`), switch back to the `orbstack` docker context, remove the published binary. |
-
-Under the hood that first stage is a Native AOT publish: the resulting binary is self-contained
-(~20 MB arm64, no .NET runtime dependency — `otool -L` shows only system frameworks), so it also
-runs on a Mac with no .NET SDK or runtime installed at all. It needs the **.NET 11 preview SDK**
-specifically — AOT picks one framework out of the `net10.0;net11.0` multi-target, and net11.0 is the
-one with prior art ([graphql-platform](https://github.com/ChilliCream/graphql-platform)'s release
-workflow AOT-publishes the same way). Cider is Apple-silicon-only by nature (Apple `container`
-requires it), so `osx-arm64` is the only supported RID — there is no universal binary and no x64
-slice to build. To just try the daemon out without installing anything (or touching
-`/var/run/docker.sock`), skip the script and run `dotnet run --project src/Cider.Daemon -- serve` —
-that path stays framework-dependent and works with just the .NET 10 SDK
-(`-p:CiderTargetFrameworks=net10.0` if `net11.0` is not installed).
 
 ### `cider install` — the opt-in daemon
 
@@ -161,10 +139,10 @@ installed files by hand.
 
 ## Quick start
 
-Start the daemon (or `cider install` it, above):
+Start the daemon in the foreground (or `cider install` it as a background agent, above):
 
 ```bash
-dotnet run --project src/Cider.Daemon -- serve
+cider serve                                  # from a checkout: dotnet run --project src/Cider.Daemon -- serve
 ```
 
 By default it listens on `~/.cider/docker.sock` and keeps its state under `~/.cider`. Point Docker
