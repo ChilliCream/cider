@@ -2,20 +2,9 @@ name: Release
 
 run-name: Release ${{ github.ref_name }}
 
-# Cider is Apple-silicon-only, a deliberate and reviewed decision: a single
-# osx-arm64 slice, no universal binary, no x64 RID anywhere in this pipeline. An Intel Mac must
-# fail early and clearly at brew/pkg install time and at daemon startup -- not silently install
-# something that cannot run -- but that guard is the daemon's / formula's job, not this
-# workflow's; nothing here should ever grow a second RID "for completeness".
-#
-# Modeled on ChilliCream/graphql-platform's .github/workflows/release.yml (the AOT + codesign +
-# notarize dance), trimmed to Cider's single-RID scope and extended with the .pkg half
-# graphql-platform's Nitro CLI does not build. Every action below is pinned by commit SHA, as
-# graphql-platform's is.
 on:
   push:
     tags:
-      # Bare semver tags, no "v" prefix: 0.7.0, 0.7.0-preview.1, ...
       - "[0-9]*.[0-9]*.[0-9]*"
 
 permissions:
@@ -37,10 +26,6 @@ jobs:
       is_stable: ${{ steps.ctx.outputs.is_stable }}
       has_installer_cert: ${{ steps.ctx.outputs.has_installer_cert }}
     steps:
-      # A job-level `if:` cannot see the `secrets` context (only github/inputs/needs/vars) --
-      # actionlint catches this if you try. So the Installer-cert presence check happens here, in
-      # a step (where `secrets` IS available), and is threaded through as a job output that
-      # build-pkg's `if:` can read via `needs`.
       - name: Compute
         id: ctx
         shell: bash
@@ -97,13 +82,6 @@ jobs:
             --generate-notes \
             --target "$GITHUB_SHA"
 
-  # ---------------------------------------------------------------------------------------------
-  # AOT publish, codesign, notarize, zip. osx-arm64 only (see the file-level comment). Carries
-  # forward the AOT properties the project settled on: net11.0, PublishAot=true,
-  # UseLdClassicXCodeLinker=false (works around a CLT-only xcodebuild probe that otherwise makes
-  # MSBuild's console logger flag a successful publish as failed -- see
-  # src/Cider.Daemon/Cider.Daemon.csproj for the full explanation).
-  # ---------------------------------------------------------------------------------------------
   build-sign-notarize:
     name: Build, sign, notarize (osx-arm64)
     runs-on: macos-15
@@ -140,7 +118,6 @@ jobs:
             -p:UseLdClassicXCodeLinker=false \
             -p:Version="${VERSION}"
 
-      # https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications
       - name: Set up signing resources
         env:
           BUILD_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_BASE64 }}
@@ -215,23 +192,6 @@ jobs:
           path: cider-osx-arm64.zip
           if-no-files-found: error
 
-  # ---------------------------------------------------------------------------------------------
-  # THE .pkg HALF -- guarded.
-  #
-  # Signing a .pkg needs a Developer ID INSTALLER certificate, which is a DIFFERENT certificate
-  # from the Developer ID Application one used for codesign above. As of this writing,
-  # ChilliCream/graphql-platform's repo secrets (checked via `gh api
-  # repos/ChilliCream/graphql-platform/actions/secrets`) contain no Installer-cert secret of any
-  # name, and Cider's own repo has no secrets configured yet at all -- so this cannot be confirmed
-  # to exist. NEEDS-USER: create a Developer ID Installer certificate in the Apple Developer
-  # portal and add it as the three secrets this job reads (APPLE_DEVELOPER_INSTALLER_CERTIFICATE_
-  # BASE64 / _PASSWORD / _IDENTITY) -- ideally as an organization secret alongside the existing
-  # Application-cert secrets, per the ticket -- before this job can ever run.
-  #
-  # The `if:` below means the job is SKIPPED, not failed, when the secret is absent, so a tag
-  # push still succeeds with the signed+notarized binary/zip. It must never fall through to
-  # producing an unsigned .pkg as a release asset.
-  # ---------------------------------------------------------------------------------------------
   build-pkg:
     name: Build, sign, notarize .pkg (osx-arm64)
     runs-on: macos-15
@@ -306,8 +266,6 @@ jobs:
             --password "$APPLE_DEVELOPER_CIDER_APP_SPECIFIC_PASSWORD" \
             --wait
 
-      # Stapling is the reason the .pkg is worth building: a bare notarized binary cannot be
-      # stapled and so revalidates online, whereas a stapled .pkg installs cleanly offline.
       - name: Staple .pkg
         run: xcrun stapler staple "cider-${VERSION}.pkg"
 
@@ -333,8 +291,6 @@ jobs:
       - create-draft
       - build-sign-notarize
       - build-pkg
-    # build-pkg is skipped (not failed) when the Installer cert secret is absent -- proceed on
-    # skip so the binary/zip still ship, but not on an actual pkg failure.
     if: ${{ !failure() && !cancelled() }}
     permissions:
       contents: write
@@ -342,11 +298,6 @@ jobs:
       GIT_TAG: ${{ needs.release-context.outputs.git_tag }}
       IS_STABLE: ${{ needs.release-context.outputs.is_stable }}
     steps:
-      # Downloaded separately (not by a single `cider-*` pattern) so a skipped build-pkg -- no
-      # Installer cert secret -- does not need special-casing here: this step just has nothing to
-      # download and download-artifact's own `if-no-artifact-found: warn` default lets the job
-      # continue with the zip alone. The signed-binary artifact (build-sign-notarize's
-      # intermediate hand-off to build-pkg) is deliberately not downloaded here at all.
       - name: Download zip
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -354,11 +305,11 @@ jobs:
           path: assets
 
       - name: Download .pkg (if built)
+        if: needs.build-pkg.result == 'success'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cider-pkg
           path: assets
-          if-no-artifact-found: warn
 
       - name: Checksum release assets
         shell: bash
