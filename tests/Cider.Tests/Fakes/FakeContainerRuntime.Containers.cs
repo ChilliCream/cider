@@ -351,6 +351,31 @@ public sealed partial class FakeContainerRuntime
         }
     }
 
+    /// <summary>
+    /// Unlike the CLI transport (which cannot wait at all), the fake genuinely waits — it completes
+    /// when the container's held process exits, the way the XPC apiserver's <c>containerWait</c>
+    /// blocks (docs/spikes/xpc/02-apiserver-xpc-protocol.md §8.6). <c>null</c> only when the
+    /// container has no held process at all (never started).
+    /// </summary>
+    public async Task<(int ExitCode, DateTimeOffset ExitedAt)?> WaitContainerAsync(string runtimeId, CancellationToken ct)
+    {
+        Record($"WaitContainerAsync:{runtimeId}");
+
+        FakeProcess? process;
+        lock (_sync)
+        {
+            process = Require(runtimeId).Process;
+        }
+
+        if (process is null)
+        {
+            return null;
+        }
+
+        var exitCode = await process.Exited.WaitAsync(ct);
+        return (exitCode, DateTimeOffset.UtcNow);
+    }
+
     /// <inheritdoc />
     public Task<IContainerProcess> ExecAsync(string runtimeId, ExecSpec spec, CancellationToken ct)
     {

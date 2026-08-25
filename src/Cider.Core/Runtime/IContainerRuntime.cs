@@ -32,6 +32,15 @@ public interface IContainerRuntime
     /// <summary><c>null</c> when the container does not exist.</summary>
     Task<RuntimeContainer?> InspectContainerAsync(string runtimeId, CancellationToken ct);
 
+    /// <summary>
+    /// Blocks until <paramref name="runtimeId"/>'s init process exits, even one the daemon did not
+    /// itself start (e.g. after a daemon restart) — the XPC apiserver's own <c>containerWait</c> call
+    /// (docs/spikes/xpc/02-apiserver-xpc-protocol.md §8.6) blocks the same way. Returns <c>null</c>
+    /// when the transport cannot wait at all (the CLI: there is no equivalent command), in which case
+    /// callers keep today's "exit code unknown" path.
+    /// </summary>
+    Task<(int ExitCode, DateTimeOffset ExitedAt)?> WaitContainerAsync(string runtimeId, CancellationToken ct);
+
     Task<IContainerProcess> ExecAsync(string runtimeId, ExecSpec spec, CancellationToken ct);
 
     /// <summary>The runtime's own merged log stream — used only as a fallback for our own capture.</summary>

@@ -83,6 +83,52 @@ public sealed class ContainerManagerCreateTests
     }
 
     [Fact]
+    public async Task HostConfig_Sysctls_and_an_explicit_stop_signal_land_on_the_engine_spec()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        var record = await harness.CreateAsync("alpine", "web", request =>
+        {
+            request.StopSignal = "SIGINT";
+            request.HostConfig = new HostConfig
+            {
+                Sysctls = new Dictionary<string, string> { ["net.core.somaxconn"] = "1024" },
+            };
+        });
+
+        var spec = harness.Runtime.GetSpec("web");
+
+        Assert.NotNull(spec);
+        Assert.Equal("1024", spec.Sysctls["net.core.somaxconn"]);
+        Assert.Equal("SIGINT", spec.StopSignal);
+        Assert.Equal("SIGINT", record.StopSignal);
+    }
+
+    [Fact]
+    public async Task An_unset_stop_signal_falls_back_to_the_images_config_on_the_engine_spec()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        harness.Runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = "sha256:" + new string('f', 64),
+            References = ["docker.io/library/with-stopsignal:latest"],
+            Size = 100,
+            Created = DateTimeOffset.UnixEpoch,
+            Architecture = "arm64",
+            Os = "linux",
+            Config = new ImageConfig { StopSignal = "SIGQUIT" },
+        });
+
+        var record = await harness.CreateAsync("with-stopsignal", "quitter");
+        var spec = harness.Runtime.GetSpec("quitter");
+
+        Assert.NotNull(spec);
+        Assert.Empty(spec.Sysctls);
+        Assert.Equal("SIGQUIT", spec.StopSignal);
+        Assert.Equal("SIGQUIT", record.StopSignal);
+    }
+
+    [Fact]
     public async Task Create_uses_the_name_as_the_engine_id_and_stamps_the_identity_labels()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();
@@ -622,6 +668,7 @@ public sealed class ContainerManagerCreateTests
             request.Tty = true;
             request.OpenStdin = true;
             request.Hostname = "rich-host";
+            request.StopSignal = "SIGUSR1";
             request.HostConfig = new HostConfig
             {
                 Binds = [$"{hostDir}:/data:ro", "named-vol:/var/lib/app"],
@@ -638,11 +685,14 @@ public sealed class ContainerManagerCreateTests
                 Dns = ["1.1.1.1"],
                 DnsSearch = ["example.test"],
                 DnsOptions = ["ndots:2"],
+                Sysctls = new Dictionary<string, string> { ["net.core.somaxconn"] = "1024" },
             };
         });
 
         var before = harness.Runtime.GetSpec(record.RuntimeId);
         Assert.NotNull(before);
+        Assert.Equal("1024", before.Sysctls["net.core.somaxconn"]);
+        Assert.Equal("SIGUSR1", before.StopSignal);
 
         await harness.Networks.ConnectAsync("extra", new NetworkConnectRequest { Container = "rich" }, CancellationToken.None);
 

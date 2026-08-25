@@ -36,6 +36,13 @@ public sealed record ContainerSpec
     public IReadOnlyList<TmpfsSpec> Tmpfs { get; init; } = [];
     public IReadOnlyList<string> PublishSockets { get; init; } = [];
     public string? Hostname { get; init; }
+
+    /// <summary>Kernel parameters (Docker <c>--sysctl</c> / <c>HostConfig.Sysctls</c>).</summary>
+    public IReadOnlyDictionary<string, string> Sysctls { get; init; } = new Dictionary<string, string>();
+
+    /// <summary>The signal <c>docker stop</c> sends before falling back to <c>SIGKILL</c> (Docker
+    /// <c>--stop-signal</c> / the image's own <c>StopSignal</c>); <c>null</c> means the engine's default.</summary>
+    public string? StopSignal { get; init; }
 }
 
 /// <summary>The kinds of mount the runtime understands.</summary>

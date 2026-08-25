@@ -39,6 +39,8 @@ public sealed record RuntimeNetworkAttachment
     public string? Hostname { get; init; }
     public string? IPv4Address { get; init; }
     public string? IPv4Gateway { get; init; }
+    public string? Ipv6Address { get; init; }
+    public string? Ipv6Gateway { get; init; }
     public string? MacAddress { get; init; }
 }
 

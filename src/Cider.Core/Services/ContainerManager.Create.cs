@@ -194,6 +194,8 @@ public sealed partial class ContainerManager
                 Ulimits = [.. (hostConfig.Ulimits ?? []).Select(u => new UlimitSpec { Name = u.Name, Soft = u.Soft, Hard = u.Hard })],
                 Tmpfs = tmpfsSpecs,
                 Hostname = hostname,
+                Sysctls = hostConfig.Sysctls ?? new Dictionary<string, string>(),
+                StopSignal = stopSignal,
             };
 
             try

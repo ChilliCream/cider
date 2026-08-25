@@ -158,6 +158,23 @@ public sealed partial class AppleContainerRuntime : IContainerRuntime
             _logger.LogDebug("ignoring hostname '{Hostname}': not settable through the container CLI", hostname);
         }
 
+        if (spec.Sysctls.Count > 0)
+        {
+            // No `--sysctl`/equivalent on 1.2.x; the container CLI has no way to set kernel parameters.
+            _logger.LogDebug(
+                "ignoring {Count} sysctl(s) for {RuntimeId}: not settable through the container CLI",
+                spec.Sysctls.Count, spec.RuntimeId);
+        }
+
+        if (!string.IsNullOrEmpty(spec.StopSignal))
+        {
+            // `container stop -s <signal>` takes the signal per-call, not at create; ContainerManager
+            // already passes it through StopContainerAsync, so nothing is lost — just not settable here.
+            _logger.LogDebug(
+                "ignoring stop signal '{StopSignal}' for {RuntimeId}: not settable at create through the container CLI",
+                spec.StopSignal, spec.RuntimeId);
+        }
+
         var args = ArgBuilder.Create(spec);
         var result = await _cli.RunAsync(args, ct);
         ContainerCli.ThrowIfFailed(result, $"create {spec.RuntimeId}");
@@ -275,6 +292,21 @@ public sealed partial class AppleContainerRuntime : IContainerRuntime
 
             var json = await InspectRawAsync(runtimeId, ct);
             return json is null ? null : RuntimeMapper.ToContainer(json);
+        });
+
+    /// <summary>
+    /// The CLI transport has no <c>container wait</c> equivalent (only the XPC apiserver's
+    /// <c>containerWait</c> route blocks on exit, docs/spikes/xpc/02-apiserver-xpc-protocol.md §8.6),
+    /// so this always reports "cannot wait" and lets the caller keep its existing "exit code unknown"
+    /// fallback.
+    /// </summary>
+    public Task<(int ExitCode, DateTimeOffset ExitedAt)?> WaitContainerAsync(string runtimeId, CancellationToken ct) =>
+        GuardAsync(() =>
+        {
+            ArgumentException.ThrowIfNullOrEmpty(runtimeId);
+            _logger.LogDebug(
+                "WaitContainerAsync for {RuntimeId}: not supported by the container CLI transport", runtimeId);
+            return Task.FromResult<(int ExitCode, DateTimeOffset ExitedAt)?>(null);
         });
 
     public Task<IContainerProcess> ExecAsync(string runtimeId, ExecSpec spec, CancellationToken ct) =>
