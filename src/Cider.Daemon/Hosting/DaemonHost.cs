@@ -14,6 +14,7 @@ using Cider.Daemon.Dns;
 using Cider.Daemon.Routes;
 using Cider.Daemon.Tunnel;
 using Cider.Dns;
+using Grpc.AspNetCore.Server.Model;
 using Grpc.Health.V1;
 using Grpc.HealthCheck;
 using Microsoft.AspNetCore.Connections;
@@ -71,15 +72,62 @@ public static class DaemonHost
         app.MapStubRoutes();
 
         // The session leg of the BuildKit tunnel (cider-ger.9): the standard gRPC health check
-        // buildkitd polls every 5 s, then a fallback that hands FileSend/DiffCopy captures to
-        // SessionBridge and forwards everything else the CLI actually advertised
-        // (SessionBridge.SelectForwardTarget). No route is mapped yet for the control-plane leg
-        // (/grpc) -- that is cider-ger.10 (Solve rewrite, shared-session bridging, pass-through).
+        // buildkitd polls every 5 s, hands FileSend/DiffCopy captures to SessionBridge and forwards
+        // everything else the CLI actually advertised (SessionBridge.SelectForwardTarget).
         app.MapGrpcService<HealthServiceImpl>().RequireTunnel(TunnelKind.Session);
         var sessionBridge = app.Services.GetRequiredService<SessionBridge>();
-        app.MapGrpcForwarder(TunnelKind.Session, http => sessionBridge.SelectForwardTarget(http));
+
+        // The control-plane leg (/grpc, cider-ger.10): ControlProxyMethodProvider maps only Solve,
+        // ListWorkers and Session (see its own doc comment for why MapGrpcService<ControlProxyService>
+        // here binds none of the generated Control methods on its own); every other Control method
+        // and every other service on the same connection (LLBBridge/*, Content/*, TraceService/Export)
+        // falls through to the combined fallback below, dialed straight through the current BuilderLink.
+        var builderConnection = app.Services.GetRequiredService<IBuilderConnection>();
+        app.MapGrpcService<ControlProxyService>().RequireTunnel(TunnelKind.Control);
+
+        // Both tunnel legs' fallback traffic arrives shaped identically ("/{service}/{method}"), so
+        // it cannot be mapped as two separate GrpcForwarder.MapGrpcForwarder fallbacks -- ASP.NET
+        // Core's router finds both equally specific for the same path and throws
+        // AmbiguousMatchException the moment a Control leg and a Session leg exist on the same app.
+        // One combined fallback dispatches by the connection's own TunnelKind instead; a connection
+        // that is not a tunnel at all, or whose kind matches neither leg, answers Unimplemented (a
+        // gRPC request) or 404 (anything else) exactly like TunnelRoutes.RequireTunnel would.
+        var forwarderLog = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Cider.Daemon.BuildKit.GrpcForwarder");
+        app.MapFallback("/{service}/{method}", async (HttpContext http) =>
+        {
+            var kind = http.Features.Get<ITunnelFeature>()?.Kind;
+            var target = kind switch
+            {
+                TunnelKind.Session => await sessionBridge.SelectForwardTarget(http).ConfigureAwait(false),
+                TunnelKind.Control => await SelectControlForwardTarget(http, builderConnection).ConfigureAwait(false),
+                _ => null,
+            };
+
+            if (target is null)
+            {
+                WriteUnimplemented(http);
+                return;
+            }
+
+            await GrpcForwarder.ForwardAsync(http, target, forwarderLog).ConfigureAwait(false);
+        });
 
         return app;
+    }
+
+    private static void WriteUnimplemented(HttpContext http)
+    {
+        if (http.Request.ContentType?.StartsWith("application/grpc", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            http.Response.StatusCode = StatusCodes.Status200OK;
+            http.Response.ContentType = "application/grpc";
+            http.Response.Headers["grpc-status"] = "12";
+            http.Response.Headers["grpc-message"] = "cider: not available on this tunnel";
+        }
+        else
+        {
+            http.Response.StatusCode = StatusCodes.Status404NotFound;
+        }
     }
 
     private static void ConfigureLogging(WebApplicationBuilder builder, CiderOptions options)
@@ -228,6 +276,13 @@ public static class DaemonHost
         // CliSession, dialed lazily the first time something attaches.
         services.AddSingleton<SessionBridge>();
 
+        // The control-plane proxy (cider-ger.10): loads a captured docker-exporter tar into cider's
+        // own image store, and the service + method provider pair that maps only Solve/ListWorkers/
+        // Session (see ControlProxyMethodProvider's doc comment).
+        services.AddSingleton<ExportLoader>();
+        services.AddSingleton<ControlProxyService>();
+        services.AddSingleton<IServiceMethodProvider<ControlProxyService>, ControlProxyMethodProvider>();
+
         // Answers grpc.health.v1.Health/Check on the session tunnel (see BuildKitMethods.Health) --
         // buildkitd polls this every 5 s while a session is attached. "" (the default service name)
         // is marked Serving unconditionally: this proxy has no finer-grained health signal to report.
@@ -272,6 +327,24 @@ public static class DaemonHost
     /// <summary>Maps a configured log level name onto <see cref="LogLevel"/>, defaulting to Information.</summary>
     public static LogLevel ParseLevel(string? level) =>
         Enum.TryParse<LogLevel>(level, ignoreCase: true, out var parsed) ? parsed : LogLevel.Information;
+
+    /// <summary>
+    /// The <c>/grpc</c> fallback forwarder's target selector: the current <see cref="BuilderLink"/>'s
+    /// own <see cref="ForwardTarget"/>, or <see langword="null"/> (answered as Unimplemented by the
+    /// combined fallback above) when the builder cannot be reached at all.
+    /// </summary>
+    private static async ValueTask<ForwardTarget?> SelectControlForwardTarget(HttpContext http, IBuilderConnection builder)
+    {
+        try
+        {
+            var link = await builder.GetAsync(http.RequestAborted).ConfigureAwait(false);
+            return link.Target;
+        }
+        catch (BuilderUnavailableException)
+        {
+            return null;
+        }
+    }
 
     private sealed class ServiceProviderHolder
     {
