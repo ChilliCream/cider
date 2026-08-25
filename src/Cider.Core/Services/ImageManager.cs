@@ -34,17 +34,34 @@ public sealed class ImageManager
     // commit, import) invalidates the whole cache at once rather than trying to reason about which
     // entries a given mutation could have touched (a `tag` can retarget a reference that used to
     // point elsewhere, a `prune` can drop several images at once, etc.).
+    //
+    // Even with the version-based invalidation above, a change made outside this process (a second
+    // `cider`/dockerd-compatible process, or `container image pull/rm/tag` run directly) bumps
+    // nothing this manager knows about, so a bare version check would serve a stale entry forever.
+    // A short TTL bounds that: once an entry is older than <see cref="CacheTtl"/> it reads as a miss
+    // regardless of its version, so drift is caught within 30s without giving up the zero-runtime-call
+    // fast path for the common case (repeated resolution of the same reference within one request).
     private long _imageCacheVersion;
     private readonly ConcurrentDictionary<string, CachedImageDetail> _imageCache = new(StringComparer.Ordinal);
+    private readonly TimeProvider _timeProvider;
 
-    private readonly record struct CachedImageDetail(RuntimeImageDetail Detail, long Version);
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(30);
+
+    private readonly record struct CachedImageDetail(RuntimeImageDetail Detail, long Version, DateTimeOffset StoredAt);
 
     public ImageManager(IContainerRuntime runtime, EventBus events, CiderOptions options, ILogger<ImageManager> logger)
+        : this(runtime, events, options, logger, TimeProvider.System)
+    {
+    }
+
+    /// <param name="timeProvider">Drives the image detail cache's TTL; defaults to <see cref="TimeProvider.System"/> — overridable so tests can advance the clock without a real 30s wait.</param>
+    public ImageManager(IContainerRuntime runtime, EventBus events, CiderOptions options, ILogger<ImageManager> logger, TimeProvider timeProvider)
     {
         _runtime = runtime;
         _events = events;
         _options = options;
         _logger = logger;
+        _timeProvider = timeProvider;
     }
 
     /// <param name="nameFilter">
@@ -915,6 +932,14 @@ public sealed class ImageManager
             return null;
         }
 
+        // Captured once, before the cache lookup and before the first runtime call below, so a
+        // concurrent mutation (pull/rm/tag/...) that bumps the version while a runtime call here is
+        // still in flight is never lost: CacheDetail compares the *current* version against this
+        // captured one and skips its write if they no longer match, rather than re-reading the
+        // version fresh right before the write (which would let it stamp a result fetched before the
+        // bump as belonging to the version after it).
+        var version = Interlocked.Read(ref _imageCacheVersion);
+
         var cacheKey = CacheKeyFor(reference);
         if (cacheKey is not null && TryGetCachedDetail(cacheKey, out var cached))
         {
@@ -925,7 +950,7 @@ public sealed class ImageManager
         var direct = await _runtime.InspectImageAsync(reference, ct).ConfigureAwait(false);
         if (direct is not null)
         {
-            CacheDetail(direct);
+            CacheDetail(direct, version);
             return direct;
         }
 
@@ -939,7 +964,7 @@ public sealed class ImageManager
 
         if (candidate is RuntimeImageDetail detail)
         {
-            CacheDetail(detail);
+            CacheDetail(detail, version);
             return detail;
         }
 
@@ -949,7 +974,7 @@ public sealed class ImageManager
             var byRef = await _runtime.InspectImageAsync(candidateRef, ct).ConfigureAwait(false);
             if (byRef is not null)
             {
-                CacheDetail(byRef);
+                CacheDetail(byRef, version);
                 return byRef;
             }
         }
@@ -981,7 +1006,9 @@ public sealed class ImageManager
 
     private bool TryGetCachedDetail(string cacheKey, out RuntimeImageDetail detail)
     {
-        if (_imageCache.TryGetValue(cacheKey, out var cached) && cached.Version == Interlocked.Read(ref _imageCacheVersion))
+        if (_imageCache.TryGetValue(cacheKey, out var cached)
+            && cached.Version == Interlocked.Read(ref _imageCacheVersion)
+            && _timeProvider.GetUtcNow() - cached.StoredAt < CacheTtl)
         {
             detail = cached.Detail;
             return true;
@@ -991,10 +1018,22 @@ public sealed class ImageManager
         return false;
     }
 
-    /// <summary>Indexes a freshly resolved detail under its id and every reference it carries.</summary>
-    private void CacheDetail(RuntimeImageDetail detail)
+    /// <summary>
+    /// Indexes a freshly resolved detail under its id and every reference it carries, stamped with
+    /// <paramref name="version"/> — the cache version <see cref="FindImageDetailAsync"/> captured
+    /// before making the runtime call that produced <paramref name="detail"/>, not a fresh read.
+    /// If the cache has since been invalidated (<paramref name="version"/> no longer matches), the
+    /// write is skipped outright: the detail behind it is already stale, and stamping it with
+    /// today's version would wrongly resurrect it as current.
+    /// </summary>
+    private void CacheDetail(RuntimeImageDetail detail, long version)
     {
-        var entry = new CachedImageDetail(detail, Interlocked.Read(ref _imageCacheVersion));
+        if (version != Interlocked.Read(ref _imageCacheVersion))
+        {
+            return;
+        }
+
+        var entry = new CachedImageDetail(detail, version, _timeProvider.GetUtcNow());
         _imageCache["sha256:" + IdWithoutPrefix(detail.Id)] = entry;
         foreach (var reference in detail.References)
         {
@@ -1007,12 +1046,23 @@ public sealed class ImageManager
 
     /// <summary>
     /// Bumps the cache's version so every entry currently in <see cref="_imageCache"/> reads as
-    /// stale — called after any runtime call that can change what an image reference resolves to.
-    /// A version bump rather than <c>Clear()</c>: cheaper (no dictionary walk) and race-free against
-    /// a concurrent read that is mid-<see cref="CacheDetail"/> for data already stale by the time it
-    /// writes (it stamps the version it read before the bump, so it cannot un-invalidate anything).
+    /// stale, and drops them outright — called after any runtime call that can change what an image
+    /// reference resolves to. Clearing here (rather than leaving superseded entries to be
+    /// overwritten piecemeal as each reference happens to be re-resolved) keeps the dictionary from
+    /// accumulating entries no live version will ever match again. Bumping the version first and
+    /// clearing after would still be race-free, but ordering it this way — clear, then bump — means a
+    /// write from a read already in flight can land in between only under its own pre-bump version,
+    /// which <see cref="TryGetCachedDetail"/> and <see cref="CacheDetail"/> already treat as current
+    /// until the increment below lands: the reader stamps the version it captured before its own
+    /// runtime call, and <see cref="CacheDetail"/> re-checks that captured version against the
+    /// current one right before writing, so a bump that lands while the read is still in flight makes
+    /// it skip the write instead of resurrecting stale data as current.
     /// </summary>
-    private void InvalidateImageCache() => Interlocked.Increment(ref _imageCacheVersion);
+    private void InvalidateImageCache()
+    {
+        _imageCache.Clear();
+        Interlocked.Increment(ref _imageCacheVersion);
+    }
 
     private static RuntimeImage? MatchImage(IReadOnlyList<RuntimeImage> images, string reference)
     {

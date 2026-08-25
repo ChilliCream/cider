@@ -37,13 +37,24 @@ public sealed class ImageManagerTests : IDisposable
         return (manager, runtime);
     }
 
-    private (ImageManager Manager, FakeContainerRuntime Runtime, EventBus Events) CreateManagerWithEvents()
+    private (ImageManager Manager, FakeContainerRuntime Runtime, EventBus Events) CreateManagerWithEvents(TimeProvider? timeProvider = null)
     {
         var runtime = new FakeContainerRuntime();
         var events = new EventBus();
         var options = new CiderOptions { DataDir = _tmpDir };
-        var manager = new ImageManager(runtime, events, options, NullLogger<ImageManager>.Instance);
+        var manager = timeProvider is null
+            ? new ImageManager(runtime, events, options, NullLogger<ImageManager>.Instance)
+            : new ImageManager(runtime, events, options, NullLogger<ImageManager>.Instance, timeProvider);
         return (manager, runtime, events);
+    }
+
+    /// <summary>Builds a manager over a <see cref="ManualTimeProvider"/> the test can advance, for the image
+    /// detail cache's TTL-based drift protection (cider-ede.17).</summary>
+    private (ImageManager Manager, FakeContainerRuntime Runtime, ManualTimeProvider Clock) CreateManagerWithClock()
+    {
+        var clock = new ManualTimeProvider();
+        var (manager, runtime, _) = CreateManagerWithEvents(clock);
+        return (manager, runtime, clock);
     }
 
     /// <summary>Replays everything published since <paramref name="since"/>; an <c>until</c> in the past ends the stream.</summary>
@@ -221,7 +232,7 @@ public sealed class ImageManagerTests : IDisposable
     [Fact]
     public async Task PullAsync_InvalidatesTheCache_SoASubsequentLookupSeesTheNewDigest()
     {
-        var (manager, runtime) = CreateManager();
+        var (manager, runtime, clock) = CreateManagerWithClock();
         var oldDigest = "sha256:" + new string('1', 64);
         var newDigest = "sha256:" + new string('2', 64);
         runtime.SeedImage(new RuntimeImageDetail
@@ -253,10 +264,25 @@ public sealed class ImageManagerTests : IDisposable
         });
 
         // Proves the cache, not coincidence, is what is being exercised: the runtime already moved
-        // on, but a read through the manager should still be serving the id it cached before.
+        // on, but a read through the manager should still be serving the id it cached before — and
+        // making no runtime call to do it — as long as the entry is still within its TTL.
+        var callsBeforeStillCached = runtime.Calls.Count;
         var stillCached = await manager.InspectAsync("refreshed:latest", CancellationToken.None);
         Assert.Equal(oldDigest, stillCached.Id);
+        Assert.Equal(callsBeforeStillCached, runtime.Calls.Count);
 
+        // Drift protection: once the entry outlives the cache's TTL, it is no longer served even
+        // without any in-process mutation to bump the version — covering an out-of-band digest
+        // change (a second `cider` process, or `container image pull` run directly) that this
+        // manager never saw and so never had a reason to invalidate for.
+        clock.Advance(TimeSpan.FromSeconds(31));
+        var callsBeforeDrifted = runtime.Calls.Count;
+        var drifted = await manager.InspectAsync("refreshed:latest", CancellationToken.None);
+        Assert.Equal(newDigest, drifted.Id);
+        Assert.True(runtime.Calls.Count > callsBeforeDrifted, "an expired entry should be a cache miss, making a fresh runtime call");
+
+        // The explicit invalidation path (a pull through the manager itself) still works too, and
+        // still needs no TTL expiry to see the new digest.
         var messages = new List<JsonMessage>();
         var progress = new SyncProgress<JsonMessage>(messages.Add);
         await manager.PullAsync("refreshed", null, null, null, progress, CancellationToken.None);
@@ -286,6 +312,55 @@ public sealed class ImageManagerTests : IDisposable
 
         var stillThere = await manager.InspectAsync("alpine-renamed:latest", CancellationToken.None);
         Assert.Contains("alpine-renamed:latest", stillThere.RepoTags);
+    }
+
+    [Fact]
+    public async Task FindImageDetailAsync_CacheInvalidatedWhileARuntimeCallIsInFlight_DoesNotResurrectTheStaleResult()
+    {
+        // Reproduces the write/invalidate race directly: a resolution's InspectImageAsync call is
+        // held open while a concurrent PullAsync bumps the cache version, then released. If the
+        // cache write stamped a version read *after* the runtime call (rather than the one captured
+        // before it started), it would win the race and wrongly cache the pre-invalidation detail as
+        // current — so a later lookup would (wrongly) stay a cache hit instead of going back to the
+        // runtime.
+        var inner = new FakeContainerRuntime();
+        var digest = "sha256:" + new string('3', 64);
+        inner.SeedImage(new RuntimeImageDetail
+        {
+            Id = digest,
+            References = ["docker.io/library/racer:latest"],
+            Size = 100,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        var gate = new GatedRuntime(inner);
+        var events = new EventBus();
+        var options = new CiderOptions { DataDir = _tmpDir };
+        var manager = new ImageManager(gate, events, options, NullLogger<ImageManager>.Instance);
+
+        gate.ArmInspectGate();
+        var resolveTask = manager.InspectAsync("racer:latest", CancellationToken.None);
+        await gate.WaitUntilInspectBlockedAsync();
+
+        // A concurrent mutation (a pull of an unrelated image is enough — invalidation is
+        // whole-cache) invalidates the cache while the resolution above is still awaiting its
+        // InspectImageAsync call.
+        var progress = new SyncProgress<JsonMessage>(_ => { });
+        await manager.PullAsync("alpine", null, null, null, progress, CancellationToken.None);
+
+        gate.ReleaseInspect();
+        var first = await resolveTask;
+        Assert.Equal(digest, first.Id);
+
+        var callsAfterFirst = inner.Calls.Count;
+        var second = await manager.InspectAsync("racer:latest", CancellationToken.None);
+        Assert.Equal(digest, second.Id);
+        Assert.True(
+            inner.Calls.Count > callsAfterFirst,
+            "the write raced by a concurrent invalidation must have been dropped, so this lookup should hit the runtime again instead of serving a stale cache entry");
     }
 
     [Fact]
@@ -1193,6 +1268,145 @@ public sealed class ImageManagerTests : IDisposable
     private sealed class SyncProgress<T>(Action<T> onReport) : IProgress<T>
     {
         public void Report(T value) => onReport(value);
+    }
+
+    /// <summary>A <see cref="TimeProvider"/> whose clock only moves when <see cref="Advance"/> is
+    /// called — lets a test cross the image detail cache's TTL (cider-ede.17) without a real wait.</summary>
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private DateTimeOffset _now = DateTimeOffset.UtcNow;
+
+        public override DateTimeOffset GetUtcNow() => _now;
+
+        public void Advance(TimeSpan by) => _now += by;
+    }
+
+    /// <summary>
+    /// Wraps a <see cref="FakeContainerRuntime"/> to hold one <see cref="InspectImageAsync"/> call
+    /// open until released — lets a test put a genuine concurrent operation in flight around a
+    /// runtime call (the write/invalidate race, cider-ede.17) without needing the fake itself to know
+    /// about blocking. Every other member forwards straight through, untouched.
+    /// </summary>
+    private sealed class GatedRuntime(FakeContainerRuntime inner) : IContainerRuntime
+    {
+        // `_releaseGate`/`_blockedSignal` are set by ArmInspectGate and never reassigned afterwards,
+        // so ReleaseInspect (called from the test, arbitrarily later) always completes the same
+        // TaskCompletionSource that InspectImageAsync is awaiting. `_armed` is the one-shot switch:
+        // only the InspectImageAsync call that wins the Exchange blocks on the gate at all, so an
+        // unrelated concurrent resolution started while the gate is held (e.g. a different
+        // reference's lookup) passes straight through instead of piling up behind the same gate.
+        private TaskCompletionSource<bool>? _releaseGate;
+        private TaskCompletionSource<bool>? _blockedSignal;
+        private int _armed;
+
+        /// <summary>The next call to <see cref="InspectImageAsync"/> awaits until <see cref="ReleaseInspect"/> is called.</summary>
+        public void ArmInspectGate()
+        {
+            _releaseGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _blockedSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Volatile.Write(ref _armed, 1);
+        }
+
+        /// <summary>Completes once the gated <see cref="InspectImageAsync"/> call has started waiting.</summary>
+        public Task WaitUntilInspectBlockedAsync() => _blockedSignal?.Task ?? Task.CompletedTask;
+
+        public void ReleaseInspect() => _releaseGate?.TrySetResult(true);
+
+        public async Task<RuntimeImageDetail?> InspectImageAsync(string reference, CancellationToken ct)
+        {
+            if (Interlocked.Exchange(ref _armed, 0) == 1)
+            {
+                _blockedSignal!.TrySetResult(true);
+                await _releaseGate!.Task.ConfigureAwait(false);
+            }
+
+            return await inner.InspectImageAsync(reference, ct).ConfigureAwait(false);
+        }
+
+        public Task<Cider.Core.Runtime.RuntimeInfo> GetInfoAsync(CancellationToken ct) => inner.GetInfoAsync(ct);
+
+        public Task EnsureReadyAsync(CancellationToken ct) => inner.EnsureReadyAsync(ct);
+
+        public Task CreateContainerAsync(ContainerSpec spec, CancellationToken ct) => inner.CreateContainerAsync(spec, ct);
+
+        public Task<IContainerProcess> StartContainerAsync(string runtimeId, StartOptions options, CancellationToken ct) =>
+            inner.StartContainerAsync(runtimeId, options, ct);
+
+        public Task StopContainerAsync(string runtimeId, int? timeoutSeconds, string? signal, CancellationToken ct) =>
+            inner.StopContainerAsync(runtimeId, timeoutSeconds, signal, ct);
+
+        public Task KillContainerAsync(string runtimeId, string signal, CancellationToken ct) => inner.KillContainerAsync(runtimeId, signal, ct);
+
+        public Task RemoveContainerAsync(string runtimeId, bool force, CancellationToken ct) => inner.RemoveContainerAsync(runtimeId, force, ct);
+
+        public Task<IReadOnlyList<RuntimeContainer>> ListContainersAsync(CancellationToken ct) => inner.ListContainersAsync(ct);
+
+        public Task<RuntimeContainer?> InspectContainerAsync(string runtimeId, CancellationToken ct) => inner.InspectContainerAsync(runtimeId, ct);
+
+        public Task<(int ExitCode, DateTimeOffset ExitedAt)?> WaitContainerAsync(string runtimeId, CancellationToken ct) =>
+            inner.WaitContainerAsync(runtimeId, ct);
+
+        public Task<IContainerProcess> ExecAsync(string runtimeId, ExecSpec spec, CancellationToken ct) => inner.ExecAsync(runtimeId, spec, ct);
+
+        public Task<Stream> OpenLogsAsync(string runtimeId, bool follow, int? tail, CancellationToken ct) =>
+            inner.OpenLogsAsync(runtimeId, follow, tail, ct);
+
+        public Task<RuntimeStats?> GetStatsAsync(string runtimeId, CancellationToken ct) => inner.GetStatsAsync(runtimeId, ct);
+
+        public Task CopyFromContainerAsync(string runtimeId, string containerPath, string localDestinationDir, CancellationToken ct) =>
+            inner.CopyFromContainerAsync(runtimeId, containerPath, localDestinationDir, ct);
+
+        public Task CopyToContainerAsync(string runtimeId, string localSourcePath, string containerPath, CancellationToken ct) =>
+            inner.CopyToContainerAsync(runtimeId, localSourcePath, containerPath, ct);
+
+        public Task ExportContainerAsync(string runtimeId, Stream tarOutput, CancellationToken ct) => inner.ExportContainerAsync(runtimeId, tarOutput, ct);
+
+        public Task<IReadOnlyList<RuntimeImage>> ListImagesAsync(CancellationToken ct) => inner.ListImagesAsync(ct);
+
+        public Task PullImageAsync(string reference, string? platform, RegistryAuth? auth, IProgress<ProgressEvent> progress, CancellationToken ct) =>
+            inner.PullImageAsync(reference, platform, auth, progress, ct);
+
+        public Task PushImageAsync(string reference, RegistryAuth? auth, IProgress<ProgressEvent> progress, CancellationToken ct) =>
+            inner.PushImageAsync(reference, auth, progress, ct);
+
+        public Task TagImageAsync(string sourceReference, string targetReference, CancellationToken ct) =>
+            inner.TagImageAsync(sourceReference, targetReference, ct);
+
+        public Task RemoveImageAsync(string reference, bool force, CancellationToken ct) => inner.RemoveImageAsync(reference, force, ct);
+
+        public Task SaveImagesAsync(IReadOnlyList<string> references, Stream tarOutput, CancellationToken ct) =>
+            inner.SaveImagesAsync(references, tarOutput, ct);
+
+        public Task<IReadOnlyList<string>> LoadImagesAsync(Stream tarInput, CancellationToken ct) => inner.LoadImagesAsync(tarInput, ct);
+
+        public Task<string> BuildImageAsync(BuildSpec spec, IProgress<ProgressEvent> progress, CancellationToken ct) =>
+            inner.BuildImageAsync(spec, progress, ct);
+
+        public Task LoginAsync(RegistryAuth auth, CancellationToken ct) => inner.LoginAsync(auth, ct);
+
+        public Task<IReadOnlyList<RuntimeNetwork>> ListNetworksAsync(CancellationToken ct) => inner.ListNetworksAsync(ct);
+
+        public Task<RuntimeNetwork?> InspectNetworkAsync(string name, CancellationToken ct) => inner.InspectNetworkAsync(name, ct);
+
+        public Task CreateNetworkAsync(NetworkSpec spec, CancellationToken ct) => inner.CreateNetworkAsync(spec, ct);
+
+        public Task RemoveNetworkAsync(string name, CancellationToken ct) => inner.RemoveNetworkAsync(name, ct);
+
+        public Task<IReadOnlyList<RuntimeVolume>> ListVolumesAsync(CancellationToken ct) => inner.ListVolumesAsync(ct);
+
+        public Task<RuntimeVolume?> InspectVolumeAsync(string name, CancellationToken ct) => inner.InspectVolumeAsync(name, ct);
+
+        public Task CreateVolumeAsync(VolumeSpec spec, CancellationToken ct) => inner.CreateVolumeAsync(spec, ct);
+
+        public Task RemoveVolumeAsync(string name, bool force, CancellationToken ct) => inner.RemoveVolumeAsync(name, force, ct);
+
+        public Task<RuntimeDiskUsage> GetDiskUsageAsync(CancellationToken ct) => inner.GetDiskUsageAsync(ct);
+
+        public Task<BuilderStatus?> GetBuilderStatusAsync(CancellationToken ct) => inner.GetBuilderStatusAsync(ct);
+
+        public Task StartBuilderAsync(int? cpus, long? memoryBytes, CancellationToken ct) => inner.StartBuilderAsync(cpus, memoryBytes, ct);
+
+        public Task<IContainerProcess> DialBuilderAsync(CancellationToken ct) => inner.DialBuilderAsync(ct);
     }
 
     private static MemoryStream BuildTarWithDockerfile()
