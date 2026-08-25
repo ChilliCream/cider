@@ -79,14 +79,21 @@ internal sealed class ProgressUpdateListener : IDisposable
             // posture XpcClient uses throughout.
             XpcNative.xpc_retain(xpcObject);
             _peer = xpcObject;
+
+            var block = XpcBlock.CreateEventHandler(OnPeerEvent);
+
+            // Order matters here too, same as XpcListener/XpcClient's own connections: the handler
+            // must be installed before activation, or a message racing activation is dropped. Both
+            // calls stay inside this lock — the same one Dispose takes before it cancels/releases
+            // _peer — so Dispose can never interleave between the retain above and activation: it
+            // either runs entirely before this handler installs (peer never activated, and this
+            // method has already returned via the _disposed check above) or entirely after (peer
+            // fully activated first). Without this, a Dispose racing between the retain and
+            // xpc_connection_activate could cancel and xpc_release the connection while this method
+            // still holds the raw handle, a narrow native use-after-free window.
+            XpcNative.xpc_connection_set_event_handler(xpcObject, block);
+            XpcNative.xpc_connection_activate(xpcObject);
         }
-
-        var block = XpcBlock.CreateEventHandler(OnPeerEvent);
-
-        // Order matters here too, same as XpcListener/XpcClient's own connections: the handler must
-        // be installed before activation, or a message racing activation is dropped.
-        XpcNative.xpc_connection_set_event_handler(xpcObject, block);
-        XpcNative.xpc_connection_activate(xpcObject);
     }
 
     private void OnPeerEvent(nint self, nint xpcObject)

@@ -53,12 +53,11 @@ internal sealed partial class XpcContainerRuntime
             () => _cliFallback.ListImagesAsync(ct)));
 
     /// <summary>
-    /// <c>imageList</c> + client-side match on <see cref="ImageDescription.Reference"/> (there is no
-    /// per-reference lookup route, same as <see cref="ImageSnapshotEnsurer.Match"/> — but exact-name
-    /// only here, no <c>containerizationImageName</c> annotation preference: cider's own reference
-    /// normalization already produced the exact string <c>imageList</c> reports, so the exact match
-    /// <see cref="ImageSnapshotEnsurer.Match"/> only falls back to is this method's first and only
-    /// check).
+    /// <c>imageList</c> + client-side match via <see cref="ImageSnapshotEnsurer.Match"/> — there is no
+    /// per-reference lookup route, so this prefers the index descriptor's
+    /// <c>containerizationImageName</c> annotation the same way Apple's <c>ClientImage.get(reference:)</c>
+    /// does for a locally built image, falling back to exact <see cref="ImageDescription.Reference"/>
+    /// equality.
     /// </summary>
     public Task<RuntimeImageDetail?> InspectImageAsync(string reference, CancellationToken ct) => GuardAsync(async () =>
     {
@@ -69,8 +68,13 @@ internal sealed partial class XpcContainerRuntime
             async () =>
             {
                 var descriptions = await _imagesClient.ImageListAsync(ct).ConfigureAwait(false);
-                var group = GroupByDigest(descriptions)
-                    .Find(g => g.Exists(d => string.Equals(d.Reference, reference, StringComparison.Ordinal)));
+                var matched = ImageSnapshotEnsurer.Match(descriptions, reference);
+                if (matched is null)
+                {
+                    return null;
+                }
+
+                var group = GroupByDigest(descriptions).Find(g => g.Contains(matched));
                 if (group is null)
                 {
                     return null;
@@ -275,21 +279,27 @@ internal sealed partial class XpcContainerRuntime
             : $"{platform.Os}/{platform.Architecture}/{platform.Variant}";
     }
 
-    /// <summary>A real variant's own on-disk size: the sum of its manifest's <c>layers[].size</c> —
-    /// there is no server-reported total the way the CLI's <c>image ls</c> row carries one
-    /// (<c>getFullImageSize</c>, §6), so this is cider's own equivalent, walking the same manifest
-    /// blob <c>RecoverLayerSizesAsync</c> reads for the CLI transport's per-layer breakdown.</summary>
+    /// <summary>A real variant's own on-disk size: cider's own equivalent of the CLI's
+    /// <c>getFullImageSize</c> (Apple's <c>ClientImage</c>/<c>ImageResource.swift</c>), which is the
+    /// manifest descriptor's own <c>size</c> (<paramref name="variant"/>.Size) plus the manifest's
+    /// <c>config.size</c> plus the sum of its <c>layers[].size</c> — not layers alone. Mirrors Apple's
+    /// <c>continue</c> on a manifest fetch failure by returning 0 when the digest can't be resolved to
+    /// a loaded manifest.</summary>
     internal static long VariantSize(OciDescriptor variant, IReadOnlyDictionary<string, AppleOciManifest> manifests)
     {
-        if (variant.Digest is not { } digest || !manifests.TryGetValue(digest, out var manifest) || manifest.Layers is not { Count: > 0 } layers)
+        if (variant.Digest is not { } digest || !manifests.TryGetValue(digest, out var manifest))
         {
             return 0;
         }
 
-        long size = 0;
-        foreach (var layer in layers)
+        long size = variant.Size ?? 0;
+        size += manifest.Config?.Size ?? 0;
+        if (manifest.Layers is { Count: > 0 } layers)
         {
-            size += layer.Size ?? 0;
+            foreach (var layer in layers)
+            {
+                size += layer.Size ?? 0;
+            }
         }
 
         return size;
@@ -635,7 +645,7 @@ internal sealed partial class XpcContainerRuntime
                 var descriptions = new List<ImageDescription>(references.Count);
                 foreach (var reference in references)
                 {
-                    var match = all.Find(d => string.Equals(d.Reference, reference, StringComparison.Ordinal))
+                    var match = ImageSnapshotEnsurer.Match(all, reference)
                         ?? throw RuntimeException.NotFound($"image save: no such image: {reference}");
                     descriptions.Add(match);
                 }

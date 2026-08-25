@@ -54,6 +54,58 @@ public class ImagesMappingTests
         Assert.Equal(2, groups.Count);
     }
 
+    // ---- ImageSnapshotEnsurer.Match: annotation-preferring reference resolution -------------------
+
+    [Fact]
+    public void Match_prefers_the_containerizationImageName_annotation_over_the_stored_Reference()
+    {
+        // A locally built image whose stored Reference (imageList's own field) differs from the
+        // human-facing tag it was built/re-tagged with — that tag only survives as the index
+        // descriptor's containerizationImageName annotation. InspectImageAsync and SaveImagesAsync
+        // both now resolve a caller-given reference through this same Match, so they find it too,
+        // instead of only matching an exact (and here, wrong) Reference string.
+        var descriptions = new List<ImageDescription>
+        {
+            new()
+            {
+                Reference = "sha256:" + new string('4', 64),
+                Descriptor = new Descriptor
+                {
+                    MediaType = "application/vnd.oci.image.index.v1+json",
+                    Digest = Digest,
+                    Size = 374,
+                    Annotations = new Dictionary<string, string> { ["containerizationImageName"] = "myapp:local" },
+                },
+            },
+            Description("docker.io/library/alpine:3.20", "sha256:" + new string('5', 64)),
+        };
+
+        var matched = ImageSnapshotEnsurer.Match(descriptions, "myapp:local");
+
+        Assert.NotNull(matched);
+        Assert.Same(descriptions[0], matched);
+
+        // InspectImageAsync's own next step after Match: resolve the matched description back to its
+        // digest group.
+        var group = XpcContainerRuntime.GroupByDigest(descriptions).Find(g => g.Contains(matched));
+        Assert.NotNull(group);
+        Assert.Equal(Digest, group![0].Descriptor.Digest);
+    }
+
+    [Fact]
+    public void Match_falls_back_to_exact_Reference_equality_when_no_annotation_matches()
+    {
+        var descriptions = new List<ImageDescription>
+        {
+            Description("docker.io/library/alpine:3.20", Digest),
+        };
+
+        var matched = ImageSnapshotEnsurer.Match(descriptions, "docker.io/library/alpine:3.20");
+
+        Assert.NotNull(matched);
+        Assert.Same(descriptions[0], matched);
+    }
+
     // ---- RealVariants: attestation filtering ------------------------------------------------------
 
     [Fact]
@@ -84,19 +136,25 @@ public class ImagesMappingTests
     // ---- ToRuntimeImage / ToRuntimeImageDetail -----------------------------------------------------
 
     [Fact]
-    public void ToRuntimeImage_sums_layer_sizes_across_every_real_variant()
+    public void ToRuntimeImage_sums_the_full_getFullImageSize_formula_across_every_real_variant()
     {
+        // getFullImageSize (Apple's ClientImage/ImageResource.swift) is descriptor.size +
+        // config.size + sum(layers[].size) per variant, summed across every real variant — not
+        // layers alone. The third variant's digest deliberately has no entry in `manifests` (a
+        // manifest that failed to resolve, mirroring Apple's own `continue` on that failure) and
+        // must still contribute exactly 0, not throw and not silently drop the other variants.
         var variants = new List<OciDescriptor>
         {
-            new() { Digest = ManifestDigest, Platform = new OciPlatform { Os = "linux", Architecture = "arm64" } },
-            new() { Digest = "sha256:" + new string('2', 64), Platform = new OciPlatform { Os = "linux", Architecture = "amd64" } },
+            new() { Digest = ManifestDigest, Size = 374, Platform = new OciPlatform { Os = "linux", Architecture = "arm64" } },
+            new() { Digest = "sha256:" + new string('2', 64), Size = 375, Platform = new OciPlatform { Os = "linux", Architecture = "amd64" } },
+            new() { Digest = "sha256:" + new string('3', 64), Size = 376, Platform = new OciPlatform { Os = "linux", Architecture = "386" } },
         };
 
         var manifests = new Dictionary<string, AppleOciManifest>(StringComparer.Ordinal)
         {
             [ManifestDigest] = new AppleOciManifest
             {
-                Config = new OciDescriptor { Digest = ConfigDigest },
+                Config = new OciDescriptor { Digest = ConfigDigest, Size = 1512 },
                 Layers = [new OciDescriptor { Size = 4120486 }, new OciDescriptor { Size = 104 }],
             },
             ["sha256:" + new string('2', 64)] = new AppleOciManifest
@@ -117,8 +175,8 @@ public class ImagesMappingTests
         var image = XpcContainerRuntime.ToRuntimeImage(["alpine:3.22"], Digest, variants, manifests, configs);
 
         Assert.Equal("sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc", image.Id);
-        Assert.Equal(4120486 + 104 + 1000, image.Size);
-        Assert.Equal(["linux/arm64", "linux/amd64"], image.Platforms);
+        Assert.Equal((374 + 1512 + 4120486 + 104) + (375 + 1000) + 0, image.Size);
+        Assert.Equal(["linux/arm64", "linux/amd64", "linux/386"], image.Platforms);
         Assert.Equal(new DateTimeOffset(2026, 8, 25, 19, 18, 4, TimeSpan.Zero), image.Created);
         Assert.Equal("b", image.Labels["a"]);
     }
@@ -128,14 +186,14 @@ public class ImagesMappingTests
     {
         var variants = new List<OciDescriptor>
         {
-            new() { Digest = ManifestDigest, Platform = new OciPlatform { Os = "linux", Architecture = "arm64" } },
+            new() { Digest = ManifestDigest, Size = 374, Platform = new OciPlatform { Os = "linux", Architecture = "arm64" } },
         };
 
         var manifests = new Dictionary<string, AppleOciManifest>(StringComparer.Ordinal)
         {
             [ManifestDigest] = new AppleOciManifest
             {
-                Config = new OciDescriptor { Digest = ConfigDigest },
+                Config = new OciDescriptor { Digest = ConfigDigest, Size = 1512 },
                 Layers = [new OciDescriptor { Size = 4120486 }, new OciDescriptor { Size = 104 }],
             },
         };
@@ -167,8 +225,12 @@ public class ImagesMappingTests
         Assert.NotNull(detail);
         Assert.Equal("arm64", detail!.Architecture);
         Assert.Equal("linux", detail.Os);
-        Assert.Equal(4120486 + 104, detail.Size);
+        // Size uses the single preferred variant's full getFullImageSize formula (descriptor.size +
+        // config.size + sum(layers[].size)) — the same variant.Size semantics RuntimeMapper.ToImageDetail
+        // reads straight off the CLI transport's JSON row for the CLI transport's own Size.
+        Assert.Equal(374 + 1512 + 4120486 + 104, detail.Size);
         Assert.Equal(["sha256:aaa", "sha256:bbb"], detail.Layers);
+        // LayerSizes is the per-layer breakdown field, deliberately layers-only — not the total.
         Assert.Equal([4120486L, 104L], detail.LayerSizes);
         Assert.Equal("someone", detail.Author);
         // RepoDigests strips the tag, same as RuntimeMapper.RepoDigests for the CLI transport.
