@@ -115,12 +115,17 @@ internal sealed class AppleOciConfig
 
 /// <summary>
 /// The shape of the OCI image manifest blob (<c>content/blobs/sha256/&lt;variant.digest&gt;</c> under
-/// AppRoot) — just enough to chase its <c>config.digest</c> down to the real config blob. See
-/// <c>AppleContainerRuntime.RecoverExposedPortsAsync</c>.
+/// AppRoot) — enough to chase its <c>config.digest</c> down to the real config blob (see
+/// <c>AppleContainerRuntime.RecoverExposedPortsAsync</c>) and to read each layer's real byte size
+/// (see <c>AppleContainerRuntime.RecoverLayerSizesAsync</c>) — <c>container image inspect</c> reports
+/// only one total size per platform variant, never a per-layer breakdown.
 /// </summary>
 internal sealed class AppleOciManifest
 {
     public AppleDescriptor? Config { get; set; }
+
+    /// <summary>The manifest's layer descriptors, oldest first, each carrying a real <c>size</c>.</summary>
+    public List<AppleDescriptor>? Layers { get; set; }
 }
 
 internal sealed class AppleOciHealthcheck

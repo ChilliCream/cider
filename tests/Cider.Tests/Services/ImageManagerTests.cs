@@ -692,9 +692,12 @@ public sealed class ImageManagerTests : IDisposable
         // back with CreatedBy "" because it counted rootfs layers instead.
         var history = await manager.HistoryAsync("alpine", CancellationToken.None);
 
-        Assert.Equal(2, history.Count);
+        Assert.Equal(5, history.Count);
         Assert.Equal("CMD [\"/bin/sh\"]", history[0].CreatedBy);
-        Assert.Equal("ADD alpine-minirootfs.tar.gz / # buildkit", history[1].CreatedBy);
+        Assert.Equal("RUN adduser -D app", history[1].CreatedBy);
+        Assert.Equal("ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", history[2].CreatedBy);
+        Assert.Equal("RUN apk add --no-cache curl", history[3].CreatedBy);
+        Assert.Equal("ADD alpine-minirootfs.tar.gz / # buildkit", history[4].CreatedBy);
         Assert.Equal("buildkit.dockerfile.v0", history[0].Comment);
 
         // Only the newest row carries the image id and the tags; the rest are <missing>, exactly as
@@ -702,11 +705,36 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Contains("alpine:latest", history[0].Tags!);
         Assert.Equal("<missing>", history[1].Id);
         Assert.Null(history[1].Tags);
-        Assert.True(history[0].Created >= history[1].Created, "rows must come back newest first");
+        Assert.True(history[0].Created >= history[4].Created, "rows must come back newest first");
+    }
 
-        // Per-layer size is genuinely not available from Apple - one total per platform, no per-blob
-        // sizes - so it is an honest 0 rather than a fabricated number. See the README limitation.
-        Assert.All(history, entry => Assert.Equal(0, entry.Size));
+    [Fact]
+    public async Task HistoryAsync_AssignsRealPerLayerSizes_WalkingHistoryNewestFirstAgainstTheManifestLayers()
+    {
+        var (manager, _) = CreateManager();
+
+        // dockerd's own algorithm: walk `history[]` newest-first, and for every entry that is not
+        // `empty_layer`, consume the manifest's `layers[]` from the end; `empty_layer` entries report
+        // 0. The alpine fixture has 3 layers (2_000_000 / 3_000_000 / 2_800_000, oldest first) and 5
+        // history rows with 2 empty ones, so exactly 3 of the 5 rows must consume a layer, newest
+        // non-empty row first.
+        var history = await manager.HistoryAsync("alpine", CancellationToken.None);
+
+        Assert.Equal(5, history.Count);
+        Assert.Equal("CMD [\"/bin/sh\"]", history[0].CreatedBy);
+        Assert.Equal(0, history[0].Size); // EmptyLayer
+        Assert.Equal("RUN adduser -D app", history[1].CreatedBy);
+        Assert.Equal(2_800_000, history[1].Size); // newest real layer
+        Assert.Equal("ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", history[2].CreatedBy);
+        Assert.Equal(0, history[2].Size); // EmptyLayer
+        Assert.Equal("RUN apk add --no-cache curl", history[3].CreatedBy);
+        Assert.Equal(3_000_000, history[3].Size);
+        Assert.Equal("ADD alpine-minirootfs.tar.gz / # buildkit", history[4].CreatedBy);
+        Assert.Equal(2_000_000, history[4].Size); // oldest real layer
+
+        // Total must equal the sum of the manifest's layer sizes, which is also the image's own Size.
+        var inspect = await manager.InspectAsync("alpine", CancellationToken.None);
+        Assert.Equal(inspect.Size, history.Sum(h => h.Size));
     }
 
     [Fact]

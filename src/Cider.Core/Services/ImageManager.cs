@@ -444,9 +444,7 @@ public sealed class ImageManager
         // Docker builds this from the image config's `history` array, newest entry first, one row per
         // build instruction — including the ones that produced no layer. Apple carries that array
         // through verbatim (`container image inspect` -> variants[i].config.history), so the
-        // instruction text, its comment and its own timestamp are all real values here; only the
-        // per-row `Size` is not, because Apple reports a single total per platform and no per-blob
-        // sizes at all. It is reported as 0 rather than invented — see the README limitation.
+        // instruction text, its comment and its own timestamp are all real values here.
         var history = detail.History;
         if (history.Count == 0)
         {
@@ -464,11 +462,31 @@ public sealed class ImageManager
             })];
         }
 
+        // Per-row `Size`: dockerd's own algorithm (there is no per-row size in the config; it is
+        // derived). Walk `history[]` newest-first — which is exactly this loop's direction, since
+        // `detail.History` is stored oldest-first — and for every entry that is not `EmptyLayer`,
+        // consume the next manifest layer descriptor from the end (`detail.LayerSizes`, also
+        // oldest-first, so "from the end" is newest-first too); an `EmptyLayer` entry reports 0. The
+        // running total this produces equals the sum of `LayerSizes` exactly when every non-empty
+        // entry got a real layer. `LayerSizes` is empty when the engine could not report per-layer
+        // sizes at all, in which case every row is an honest 0 rather than a fabricated number — see
+        // the README limitation.
+        var layerSizes = detail.LayerSizes;
+        var nextLayerIndex = layerSizes.Count - 1;
+
         var items = new List<ImageHistoryItem>(history.Count);
         for (var i = history.Count - 1; i >= 0; i--)
         {
             var entry = history[i];
             var newest = i == history.Count - 1;
+
+            long size = 0;
+            if (!entry.EmptyLayer && nextLayerIndex >= 0)
+            {
+                size = layerSizes[nextLayerIndex];
+                nextLayerIndex--;
+            }
+
             items.Add(new ImageHistoryItem
             {
                 // Only the topmost row carries the image id; Docker shows `<missing>` for the rest,
@@ -477,7 +495,7 @@ public sealed class ImageManager
                 Created = entry.Created.HasValue ? Time.DockerTime.UnixSeconds(entry.Created.Value) : created,
                 CreatedBy = entry.CreatedBy,
                 Tags = newest ? tags : null,
-                Size = 0,
+                Size = size,
                 Comment = entry.Comment,
             });
         }

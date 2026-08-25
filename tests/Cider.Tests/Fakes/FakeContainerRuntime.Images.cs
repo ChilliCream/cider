@@ -38,10 +38,15 @@ public sealed partial class FakeContainerRuntime
             },
             Architecture = "arm64",
             Os = "linux",
-            Layers = ["layer-alpine-1"],
+            Layers = ["layer-alpine-1", "layer-alpine-2", "layer-alpine-3"],
+
+            // The manifest's real per-layer sizes (cider-ede.20) — oldest first, same order as
+            // Layers, summing to the image's total Size above.
+            LayerSizes = [2_000_000, 3_000_000, 2_800_000],
 
             // Apple carries the image config's history array through verbatim, including the entries
-            // that produced no layer; `docker history` is built from it.
+            // that produced no layer; `docker history` is built from it. Five rows, two of them
+            // EmptyLayer, so exactly three rows consume the three LayerSizes above.
             History =
             [
                 new RuntimeImageHistory
@@ -53,6 +58,25 @@ public sealed partial class FakeContainerRuntime
                 new RuntimeImageHistory
                 {
                     Created = DateTimeOffset.Parse("2026-01-01T00:00:01Z"),
+                    CreatedBy = "RUN apk add --no-cache curl",
+                    Comment = "buildkit.dockerfile.v0",
+                },
+                new RuntimeImageHistory
+                {
+                    Created = DateTimeOffset.Parse("2026-01-01T00:00:02Z"),
+                    CreatedBy = "ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    Comment = "buildkit.dockerfile.v0",
+                    EmptyLayer = true,
+                },
+                new RuntimeImageHistory
+                {
+                    Created = DateTimeOffset.Parse("2026-01-01T00:00:03Z"),
+                    CreatedBy = "RUN adduser -D app",
+                    Comment = "buildkit.dockerfile.v0",
+                },
+                new RuntimeImageHistory
+                {
+                    Created = DateTimeOffset.Parse("2026-01-01T00:00:04Z"),
                     CreatedBy = "CMD [\"/bin/sh\"]",
                     Comment = "buildkit.dockerfile.v0",
                     EmptyLayer = true,

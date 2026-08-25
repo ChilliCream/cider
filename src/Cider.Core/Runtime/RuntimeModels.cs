@@ -70,6 +70,13 @@ public sealed record RuntimeImageDetail : RuntimeImage
     /// <summary>Layer diff ids.</summary>
     public IReadOnlyList<string> Layers { get; init; } = [];
 
+    /// <summary>
+    /// Each layer's real byte size from the manifest's <c>layers[].size</c>, oldest first — same
+    /// order and (when both are populated) same length as <see cref="Layers"/>. Empty when the
+    /// engine could not report per-layer sizes, in which case <c>docker history</c> falls back to 0.
+    /// </summary>
+    public IReadOnlyList<long> LayerSizes { get; init; } = [];
+
     public string? Author { get; init; }
     public IReadOnlyList<string> RepoDigests { get; init; } = [];
 

@@ -47,7 +47,13 @@ public sealed partial class AppleContainerRuntime
         await RecoverExposedPortsAsync(images, ct);
 
         var detail = RuntimeMapper.ToImageDetail(images[0], platform: null);
-        return detail is null ? null : await WithSiblingReferencesAsync(detail, ct);
+        if (detail is null)
+        {
+            return null;
+        }
+
+        detail = await RecoverLayerSizesAsync(images[0], detail, ct);
+        return await WithSiblingReferencesAsync(detail, ct);
     });
 
     /// <summary>
@@ -122,6 +128,40 @@ public sealed partial class AppleContainerRuntime
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// <c>docker history</c>'s per-layer <c>Size</c>: dockerd gets it by walking the image config's
+    /// <c>history[]</c> newest-first, consuming the manifest's <c>layers[]</c> from the end for every
+    /// entry that is not <c>empty_layer</c> (<c>ImageManager.HistoryAsync</c> does the walk). Apple's
+    /// <c>image inspect</c> reports only one total size per platform variant, never that per-layer
+    /// breakdown, but the manifest blob in the local content store carries the real
+    /// <c>layers[].size</c> array — read here the same way <see cref="RecoverExposedPortsAsync"/>
+    /// reads the config blob (see docs/spikes/xpc/03-limitations-audit-1.3.md's history row). Recovery
+    /// is best-effort: <paramref name="detail"/> comes back unchanged when the store or the manifest's
+    /// layer sizes are unavailable.
+    /// </summary>
+    private async Task<RuntimeImageDetail> RecoverLayerSizesAsync(AppleImageJson image, RuntimeImageDetail detail, CancellationToken ct)
+    {
+        var variant = RuntimeMapper.PickVariant(image, null);
+        if (string.IsNullOrEmpty(variant?.Digest))
+        {
+            return detail;
+        }
+
+        var appRoot = await ResolveAppRootAsync(ct).ConfigureAwait(false);
+        if (string.IsNullOrEmpty(appRoot))
+        {
+            return detail;
+        }
+
+        var manifest = await TryReadLocalBlobAsync<AppleOciManifest>(appRoot, variant.Digest, ct).ConfigureAwait(false);
+        if (manifest?.Layers is not { Count: > 0 } layers)
+        {
+            return detail;
+        }
+
+        return detail with { LayerSizes = [.. layers.Select(l => l.Size ?? 0)] };
     }
 
     /// <summary>Follows a variant's manifest digest to its config blob and returns that config, or

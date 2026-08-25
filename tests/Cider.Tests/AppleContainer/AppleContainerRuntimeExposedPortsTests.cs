@@ -59,10 +59,18 @@ public sealed class AppleContainerRuntimeExposedPortsTests : IDisposable
     private static string StatusJson(string appRoot) =>
         $$"""{"status":"running","appRoot":"{{appRoot.Replace("\\", "\\\\")}}","installRoot":"/usr/local/"}""";
 
+    // `layers[].size` is what `docker history` (cider-ede.20) needs: `container image inspect`
+    // reports only one total size per platform variant, never a per-layer breakdown, but the real
+    // manifest blob in Apple's local content store carries it (docs/spikes/xpc/03-limitations-audit-1.3.md
+    // history row) — recovered from disk the same way the config blob below is.
     private static readonly string ManifestBlob =
         "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"," +
         "\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\"," +
-        "\"digest\":\"sha256:" + ConfigDigestHex + "\",\"size\":10036}}";
+        "\"digest\":\"sha256:" + ConfigDigestHex + "\",\"size\":10036}," +
+        "\"layers\":[" +
+        "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"sha256:layer1\",\"size\":111111}," +
+        "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"sha256:layer2\",\"size\":222222}" +
+        "]}";
 
     private const string ConfigBlob = """
     {
@@ -104,6 +112,32 @@ public sealed class AppleContainerRuntimeExposedPortsTests : IDisposable
         // The CLI's own (truncated) fields still come through untouched.
         Assert.Equal(new[] { "postgres" }, detail.Config.Cmd);
         Assert.Equal("SIGINT", detail.Config.StopSignal);
+    }
+
+    [Fact]
+    public async Task InspectImageAsync_RecoversPerLayerSizes_FromTheLocalManifestBlob()
+    {
+        SeedLocalBlobStore();
+        var cli = new ScriptedCli(StatusJson(_appRoot), InspectJson(ManifestDigestHex));
+        var runtime = new AppleContainerRuntime(new AppleContainerOptions(), NullLogger<AppleContainerRuntime>.Instance, cli);
+
+        var detail = await runtime.InspectImageAsync(Reference, CancellationToken.None);
+
+        Assert.NotNull(detail);
+        Assert.Equal(new long[] { 111111, 222222 }, detail!.LayerSizes);
+    }
+
+    [Fact]
+    public async Task InspectImageAsync_LeavesLayerSizesEmpty_WhenTheLocalBlobStoreHasNothingToRecover()
+    {
+        // No SeedLocalBlobStore(): AppRoot resolves, but the manifest blob does not exist on disk.
+        var cli = new ScriptedCli(StatusJson(_appRoot), InspectJson(ManifestDigestHex));
+        var runtime = new AppleContainerRuntime(new AppleContainerOptions(), NullLogger<AppleContainerRuntime>.Instance, cli);
+
+        var detail = await runtime.InspectImageAsync(Reference, CancellationToken.None);
+
+        Assert.NotNull(detail);
+        Assert.Empty(detail!.LayerSizes);
     }
 
     [Fact]
