@@ -1,6 +1,7 @@
 using System.Globalization;
 using Cider.AppleContainer.Cli;
 using Cider.AppleContainer.Cli.Models;
+using Cider.AppleContainer.ContentStore;
 using Cider.Core.Ids;
 using Cider.Core.Runtime;
 using Microsoft.Extensions.Logging;
@@ -155,7 +156,7 @@ public sealed partial class AppleContainerRuntime
             return detail;
         }
 
-        var manifest = await TryReadLocalBlobAsync<AppleOciManifest>(appRoot, variant.Digest, ct).ConfigureAwait(false);
+        var manifest = await LocalBlobReader.TryReadBlobAsync<AppleOciManifest>(appRoot, variant.Digest, _logger, ct).ConfigureAwait(false);
         if (manifest?.Layers is not { Count: > 0 } layers)
         {
             return detail;
@@ -168,48 +169,15 @@ public sealed partial class AppleContainerRuntime
     /// <c>null</c> if either blob is missing, unreadable or malformed — recovery is best-effort.</summary>
     private async Task<AppleOciConfig?> TryReadLocalConfigAsync(string appRoot, string? manifestDigest, CancellationToken ct)
     {
-        var manifest = await TryReadLocalBlobAsync<AppleOciManifest>(appRoot, manifestDigest, ct).ConfigureAwait(false);
+        var manifest = await LocalBlobReader.TryReadBlobAsync<AppleOciManifest>(appRoot, manifestDigest, _logger, ct).ConfigureAwait(false);
         var configDigest = manifest?.Config?.Digest;
         if (string.IsNullOrEmpty(configDigest))
         {
             return null;
         }
 
-        var document = await TryReadLocalBlobAsync<AppleOciImageDocument>(appRoot, configDigest, ct).ConfigureAwait(false);
+        var document = await LocalBlobReader.TryReadBlobAsync<AppleOciImageDocument>(appRoot, configDigest, _logger, ct).ConfigureAwait(false);
         return document?.Config;
-    }
-
-    /// <summary>Reads and parses one blob from Apple's local content-addressed store
-    /// (<c>{appRoot}/content/blobs/{algorithm}/{hex}</c>). Never throws — any failure just means
-    /// nothing was recovered.</summary>
-    private async Task<T?> TryReadLocalBlobAsync<T>(string appRoot, string? digest, CancellationToken ct)
-        where T : class
-    {
-        if (string.IsNullOrEmpty(digest))
-        {
-            return null;
-        }
-
-        var colon = digest.IndexOf(':', StringComparison.Ordinal);
-        var algorithm = colon < 0 ? "sha256" : digest[..colon];
-        var hex = colon < 0 ? digest : digest[(colon + 1)..];
-        var path = Path.Combine(appRoot, "content", "blobs", algorithm, hex);
-
-        try
-        {
-            if (!File.Exists(path))
-            {
-                return null;
-            }
-
-            var text = await File.ReadAllTextAsync(path, ct).ConfigureAwait(false);
-            return AppleJson.Deserialize<T>(text);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
-        {
-            _logger.LogDebug(ex, "could not recover local OCI blob {Digest} from the content store", digest);
-            return null;
-        }
     }
 
     /// <summary>Apple's install-relative data root, cached after the first successful lookup — it does

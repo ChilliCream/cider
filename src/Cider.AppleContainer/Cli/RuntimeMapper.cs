@@ -1,4 +1,5 @@
 using Cider.AppleContainer.Cli.Models;
+using Cider.AppleContainer.ContentStore;
 using Cider.Core.Runtime;
 
 namespace Cider.AppleContainer.Cli;

@@ -21,9 +21,10 @@ namespace Cider.AppleContainer.Xpc;
 /// (<c>XpcContainerRuntime.Logs.cs</c>, <see cref="FollowingFileStream"/>); cider-ede.11 ports
 /// network/volume create/delete (<c>XpcContainerRuntime.Resources.cs</c>); cider-ede.12 ports
 /// <c>CopyFromContainerAsync</c>/<c>CopyToContainerAsync</c>/<c>ExportContainerAsync</c>
-/// (<c>XpcContainerRuntime.Archive.cs</c>). Every other <see cref="IContainerRuntime"/> member is
-/// listed in the <c>// FALLBACK</c> block at the bottom and delegates straight to the CLI runtime
-/// until later tasks (X7) port it.
+/// (<c>XpcContainerRuntime.Archive.cs</c>); cider-ede.10 ports every image operation
+/// (<c>XpcContainerRuntime.Images.cs</c>, <c>ProgressUpdateListener</c>). Every other
+/// <see cref="IContainerRuntime"/> member is listed in the <c>// FALLBACK</c> block at the bottom and
+/// delegates straight to the CLI runtime until a later task ports it.
 /// Mapping from the wire models to <c>Cider.Core.Runtime</c> types lives in the sibling
 /// <c>XpcContainerRuntime.Mapping.cs</c> file of this partial class.
 /// </summary>
@@ -76,8 +77,9 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     /// <param name="apiserver">One <see cref="XpcClient"/> for <c>com.apple.container.apiserver</c> —
     /// owned by this instance, disposed with it.</param>
     /// <param name="images">One <see cref="XpcClient"/> for
-    /// <c>com.apple.container.core.container-core-images</c> — not yet used by this task's read paths
-    /// (image routes are cider-ede.10), held here so later tasks do not need to re-plumb it.</param>
+    /// <c>com.apple.container.core.container-core-images</c>, wrapped as <see cref="_imagesClient"/> —
+    /// used by both container-creation preconditions (cider-ede.6) and every image operation
+    /// (cider-ede.10, <c>XpcContainerRuntime.Images.cs</c>).</param>
     public XpcContainerRuntime(
         IContainerRuntime cliFallback,
         XpcClient apiserver,
@@ -100,7 +102,7 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         _options = options;
         _logger = logger;
 
-        _imagesClient = new ImagesServiceClient(images);
+        _imagesClient = new ImagesServiceClient(images, options.PullTimeout);
         _kernelCache = new KernelCache(apiserver);
         _imageSnapshotEnsurer = new ImageSnapshotEnsurer(_imagesClient);
         _initImageResolver = new InitImageResolver(options, _imagesClient, logger);
@@ -491,32 +493,14 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     // cider-ede.11). CopyFromContainerAsync/CopyToContainerAsync/ExportContainerAsync are ported —
     // see XpcContainerRuntime.Archive.cs (task cider-ede.12). StartContainerAsync/WaitContainerAsync
     // are ported — see XpcContainerRuntime.Process.cs/XpcContainerProcess.cs (task cider-ede.7).
+    // ListImagesAsync/InspectImageAsync/PullImageAsync/PushImageAsync/TagImageAsync/
+    // RemoveImageAsync/SaveImagesAsync/LoadImagesAsync are ported — see XpcContainerRuntime.Images.cs
+    // (task cider-ede.10). BuildImageAsync stays on the CLI (classic builder, task's non-goals) and
+    // LoginAsync stays on the CLI (registry login stores credentials the images service reads, fix
+    // direction §2) — neither is this task's job.
 
     public Task<IContainerProcess> ExecAsync(string runtimeId, ExecSpec spec, CancellationToken ct) =>
         _cliFallback.ExecAsync(runtimeId, spec, ct);
-
-    public Task<IReadOnlyList<RuntimeImage>> ListImagesAsync(CancellationToken ct) => _cliFallback.ListImagesAsync(ct);
-
-    public Task<RuntimeImageDetail?> InspectImageAsync(string reference, CancellationToken ct) =>
-        _cliFallback.InspectImageAsync(reference, ct);
-
-    public Task PullImageAsync(string reference, string? platform, RegistryAuth? auth, IProgress<ProgressEvent> progress, CancellationToken ct) =>
-        _cliFallback.PullImageAsync(reference, platform, auth, progress, ct);
-
-    public Task PushImageAsync(string reference, RegistryAuth? auth, IProgress<ProgressEvent> progress, CancellationToken ct) =>
-        _cliFallback.PushImageAsync(reference, auth, progress, ct);
-
-    public Task TagImageAsync(string sourceReference, string targetReference, CancellationToken ct) =>
-        _cliFallback.TagImageAsync(sourceReference, targetReference, ct);
-
-    public Task RemoveImageAsync(string reference, bool force, CancellationToken ct) =>
-        _cliFallback.RemoveImageAsync(reference, force, ct);
-
-    public Task SaveImagesAsync(IReadOnlyList<string> references, Stream tarOutput, CancellationToken ct) =>
-        _cliFallback.SaveImagesAsync(references, tarOutput, ct);
-
-    public Task<IReadOnlyList<string>> LoadImagesAsync(Stream tarInput, CancellationToken ct) =>
-        _cliFallback.LoadImagesAsync(tarInput, ct);
 
     public Task<string> BuildImageAsync(BuildSpec spec, IProgress<ProgressEvent> progress, CancellationToken ct) =>
         _cliFallback.BuildImageAsync(spec, progress, ct);
