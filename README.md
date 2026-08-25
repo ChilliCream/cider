@@ -301,7 +301,10 @@ resolution time: it copies the same recipe Apple's own `container system dns cre
 uses for the identical problem — one `pf` anchor rule redirecting the container subnet's gateway
 address to `127.0.0.1`, all ports, one rule — under Cider's own anchor name
 (`com.chillicream.cider.hostloopback`), so it never touches or races Apple's `com.apple.container`
-anchor.
+anchor. Writing the anchor's rule file is not enough on its own for pf to ever evaluate it, so
+`enable` also registers `rdr-anchor`/`anchor`/`load anchor` lines for it in `/etc/pf.conf` (right
+alongside Apple's own `com.apple` anchor stanza, in the order pf.conf(5) requires) and reloads the
+main ruleset — the same wiring Apple's `PacketFilter.swift` does for `com.apple.container`.
 
 ```bash
 cider install --host-loopback     # opt in at install time, or:
@@ -323,8 +326,10 @@ turn it back off, and:
   and the daemon coming back up.
 - **Covers only the default `bridge` network's subnet.** A container on a different, user-created
   network is unaffected.
-- `disable` only flushes Cider's own anchor (`pfctl -a com.chillicream.cider.hostloopback -F all`) —
-  it never runs `pfctl -d` and never touches any other anchor, Apple's included.
+- `disable` only flushes Cider's own anchor (`pfctl -a com.chillicream.cider.hostloopback -F all`),
+  removes its three lines from `/etc/pf.conf` and releases pf via reference-counted `pfctl -X` (the
+  counterpart to `enable`'s `pfctl -E`) — it never runs `pfctl -d` and never touches any other
+  anchor, Apple's included.
 
 ## Limitations
 

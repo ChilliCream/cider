@@ -27,6 +27,13 @@ public static partial class PfRedirect
     /// <summary>Where the anchor's rule file is written; mirrors where Apple writes its own.</summary>
     public const string AnchorFilePath = "/etc/pf.anchors/" + AnchorName;
 
+    /// <summary>
+    /// The main pf ruleset. Writing the anchor file alone is not enough for pf to ever evaluate it —
+    /// the anchor also has to be declared and loaded from here, the same way Apple's own
+    /// <c>addAnchorToConfig()</c> registers <c>com.apple.container</c> (<c>PacketFilter.swift:102-142</c>).
+    /// </summary>
+    public const string PfConfPath = "/etc/pf.conf";
+
     /// <summary>Marker file recording that the feature is opted in, so a daemon restart reinstalls it.</summary>
     public const string StateFileName = "host-loopback.enabled";
 
@@ -102,6 +109,153 @@ public static partial class PfRedirect
         return $"rdr inet from {subnetCidr} to {gatewayIp} -> 127.0.0.1\n";
     }
 
+    internal static string RdrAnchorLine(string anchorName) => $"rdr-anchor \"{anchorName}\"";
+
+    internal static string AnchorLine(string anchorName) => $"anchor \"{anchorName}\"";
+
+    internal static string LoadAnchorLine(string anchorName, string anchorFilePath) =>
+        $"load anchor \"{anchorName}\" from \"{anchorFilePath}\"";
+
+    /// <summary>
+    /// Rank of the pf.conf anchor-declaration keyword <paramref name="line"/> starts with, in the
+    /// fixed relative order pf.conf(5) requires them in (<c>scrub-anchor</c>, <c>nat-anchor</c>,
+    /// <c>rdr-anchor</c>, <c>dummynet-anchor</c>, <c>anchor</c>, <c>load anchor</c>) — or -1 when the
+    /// line is none of these. <c>load anchor</c> is checked first since it would otherwise also match
+    /// the plain <c>anchor</c> prefix.
+    /// </summary>
+    private static int AnchorLineRank(string line)
+    {
+        var trimmed = line.TrimStart();
+        if (trimmed.StartsWith("load anchor", StringComparison.Ordinal))
+        {
+            return 5;
+        }
+
+        if (trimmed.StartsWith("scrub-anchor", StringComparison.Ordinal))
+        {
+            return 0;
+        }
+
+        if (trimmed.StartsWith("nat-anchor", StringComparison.Ordinal))
+        {
+            return 1;
+        }
+
+        if (trimmed.StartsWith("rdr-anchor", StringComparison.Ordinal))
+        {
+            return 2;
+        }
+
+        if (trimmed.StartsWith("dummynet-anchor", StringComparison.Ordinal))
+        {
+            return 3;
+        }
+
+        if (trimmed.StartsWith("anchor", StringComparison.Ordinal))
+        {
+            return 4;
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Returns <paramref name="pfConf"/> with the three lines that register <paramref name="anchorName"/>
+    /// with the main ruleset (<c>rdr-anchor</c> / <c>anchor</c> / <c>load anchor</c>) inserted in the
+    /// relative order pf.conf(5) requires, mirroring Apple's own <c>addAnchorToConfig()</c>
+    /// (<c>PacketFilter.swift:102-142</c>). Idempotent: content that already has all three lines is
+    /// returned unchanged.
+    /// </summary>
+    internal static string InsertAnchorLines(string pfConf, string anchorName, string anchorFilePath)
+    {
+        ArgumentNullException.ThrowIfNull(pfConf);
+        ArgumentException.ThrowIfNullOrEmpty(anchorName);
+        ArgumentException.ThrowIfNullOrEmpty(anchorFilePath);
+
+        var (lines, trailingNewline) = SplitPfConfLines(pfConf);
+
+        var toInsert = new[]
+        {
+            (Line: RdrAnchorLine(anchorName), Rank: 2),
+            (Line: AnchorLine(anchorName), Rank: 4),
+            (Line: LoadAnchorLine(anchorName, anchorFilePath), Rank: 5),
+        };
+
+        if (toInsert.All(t => lines.Contains(t.Line)))
+        {
+            return pfConf;
+        }
+
+        foreach (var (line, rank) in toInsert)
+        {
+            if (lines.Contains(line))
+            {
+                continue;
+            }
+
+            // Insert right after the last existing line whose keyword rank is <= this one's, so the
+            // relative keyword order pf.conf(5) requires is preserved regardless of what is already
+            // in the file (or, absent any anchor stanza at all, at the end of the file).
+            var insertAt = 0;
+            for (var i = 0; i < lines.Count; i++)
+            {
+                var r = AnchorLineRank(lines[i]);
+                if (r >= 0 && r <= rank)
+                {
+                    insertAt = i + 1;
+                }
+            }
+
+            lines.Insert(insertAt, line);
+        }
+
+        return JoinPfConfLines(lines, trailingNewline);
+    }
+
+    /// <summary>
+    /// Returns <paramref name="pfConf"/> with the three <paramref name="anchorName"/> lines (as added
+    /// by <see cref="InsertAnchorLines"/>) removed, restoring what the file looked like before.
+    /// Idempotent: content without them is returned unchanged.
+    /// </summary>
+    internal static string RemoveAnchorLines(string pfConf, string anchorName, string anchorFilePath)
+    {
+        ArgumentNullException.ThrowIfNull(pfConf);
+        ArgumentException.ThrowIfNullOrEmpty(anchorName);
+        ArgumentException.ThrowIfNullOrEmpty(anchorFilePath);
+
+        var (lines, trailingNewline) = SplitPfConfLines(pfConf);
+
+        var toRemove = new[]
+        {
+            RdrAnchorLine(anchorName),
+            AnchorLine(anchorName),
+            LoadAnchorLine(anchorName, anchorFilePath),
+        };
+
+        lines.RemoveAll(l => toRemove.Contains(l));
+
+        return JoinPfConfLines(lines, trailingNewline);
+    }
+
+    private static (List<string> Lines, bool TrailingNewline) SplitPfConfLines(string pfConf)
+    {
+        var normalized = pfConf.Replace("\r\n", "\n", StringComparison.Ordinal);
+        var trailingNewline = normalized.EndsWith('\n');
+        var lines = normalized.Split('\n').ToList();
+        if (trailingNewline && lines.Count > 0 && lines[^1].Length == 0)
+        {
+            lines.RemoveAt(lines.Count - 1);
+        }
+
+        return (lines, trailingNewline);
+    }
+
+    private static string JoinPfConfLines(List<string> lines, bool trailingNewline)
+    {
+        var result = string.Join('\n', lines);
+        return trailingNewline ? result + "\n" : result;
+    }
+
     /// <summary>The caveats every caller printing instructions or a result should show alongside them.</summary>
     public static string Caveats =>
         "This needs admin (root) and, per Apple's own docs for the identical trick, disables\n" +
@@ -118,25 +272,34 @@ public static partial class PfRedirect
         string subnetCidr,
         string gatewayIp,
         string anchorFilePath = AnchorFilePath,
-        string anchorName = AnchorName) => string.Join(
+        string anchorName = AnchorName,
+        string pfConfPath = PfConfPath) => string.Join(
         '\n',
         $"To make host.docker.internal reach 127.0.0.1-bound host services, run:",
         "",
         $"    echo 'rdr inet from {subnetCidr} to {gatewayIp} -> 127.0.0.1' | sudo tee {anchorFilePath} >/dev/null",
-        $"    sudo pfctl -e 2>/dev/null; sudo pfctl -a {anchorName} -f {anchorFilePath}",
+        $"    printf 'rdr-anchor \"%s\"\\nanchor \"%s\"\\nload anchor \"%s\" from \"%s\"\\n' '{anchorName}' '{anchorName}' '{anchorName}' '{anchorFilePath}' | sudo tee -a {pfConfPath} >/dev/null",
+        $"    sudo pfctl -n -f {pfConfPath} && sudo pfctl -E; sudo pfctl -f {pfConfPath}",
         "",
         Caveats,
         "",
-        $"To undo: sudo pfctl -a {anchorName} -F all && sudo rm -f {anchorFilePath}");
+        "To undo:",
+        $"    sudo pfctl -a {anchorName} -F all",
+        $"    sudo sed -i '' -e '\\|^{RdrAnchorLine(anchorName)}$|d' -e '\\|^{AnchorLine(anchorName)}$|d' -e '\\|^{LoadAnchorLine(anchorName, anchorFilePath)}$|d' {pfConfPath}",
+        $"    sudo pfctl -f {pfConfPath} && sudo pfctl -X && sudo rm -f {anchorFilePath}");
 
     /// <summary>Human-readable commands that remove the anchor by hand.</summary>
     public static string DisableInstructions(
         string anchorFilePath = AnchorFilePath,
-        string anchorName = AnchorName) => string.Join(
+        string anchorName = AnchorName,
+        string pfConfPath = PfConfPath) => string.Join(
         '\n',
         "To remove the host-loopback pf redirect, run:",
         "",
         $"    sudo pfctl -a {anchorName} -F all",
+        $"    sudo sed -i '' -e '\\|^{RdrAnchorLine(anchorName)}$|d' -e '\\|^{AnchorLine(anchorName)}$|d' -e '\\|^{LoadAnchorLine(anchorName, anchorFilePath)}$|d' {pfConfPath}",
+        $"    sudo pfctl -f {pfConfPath}",
+        $"    sudo pfctl -X",
         $"    sudo rm -f {anchorFilePath}");
 
     /// <summary>
@@ -152,7 +315,7 @@ public static partial class PfRedirect
         CancellationToken ct,
         string anchorFilePath = AnchorFilePath,
         string anchorName = AnchorName) =>
-        TryEnableCoreAsync(subnetCidr, gatewayIp, log, anchorFilePath, anchorName, SudoAsync, ct);
+        TryEnableCoreAsync(subnetCidr, gatewayIp, log, anchorFilePath, anchorName, SudoAsync, ct, PfConfPath);
 
     /// <summary>
     /// Flushes and removes the anchor via non-interactive <c>sudo</c>. Never prompts for a
@@ -163,7 +326,7 @@ public static partial class PfRedirect
         CancellationToken ct,
         string anchorFilePath = AnchorFilePath,
         string anchorName = AnchorName) =>
-        TryDisableCoreAsync(log, anchorFilePath, anchorName, SudoAsync, ct);
+        TryDisableCoreAsync(log, anchorFilePath, anchorName, SudoAsync, ct, PfConfPath);
 
     internal static async Task<InstallResult> TryEnableCoreAsync(
         string subnetCidr,
@@ -172,7 +335,8 @@ public static partial class PfRedirect
         string anchorFilePath,
         string anchorName,
         PrivilegedCommandRunner runner,
-        CancellationToken ct)
+        CancellationToken ct,
+        string pfConfPath = PfConfPath)
     {
         ArgumentNullException.ThrowIfNull(log);
         ArgumentNullException.ThrowIfNull(runner);
@@ -180,37 +344,83 @@ public static partial class PfRedirect
         var rule = BuildRule(subnetCidr, gatewayIp);
         var steps = new List<string>();
 
-        // sudo needs a source file it can read; write the rule to an unprivileged temp file first
-        // and have the privileged side only ever `cp`/`pfctl` it, never receive rule text on argv.
-        var tmp = Path.Combine(Path.GetTempPath(), $"cider-pf-{Guid.NewGuid():N}.conf");
+        // sudo needs a source file it can read; write the rule (and, if it needs changing, pf.conf)
+        // to unprivileged temp files first and have the privileged side only ever `cp`/`pfctl` them,
+        // never receive their content on argv.
+        var tmpAnchor = Path.Combine(Path.GetTempPath(), $"cider-pf-{Guid.NewGuid():N}.conf");
+        var tmpPfConf = Path.Combine(Path.GetTempPath(), $"cider-pfconf-{Guid.NewGuid():N}.conf");
         try
         {
-            await File.WriteAllTextAsync(tmp, rule, ct).ConfigureAwait(false);
+            await File.WriteAllTextAsync(tmpAnchor, rule, ct).ConfigureAwait(false);
 
-            var copy = await runner(["cp", tmp, anchorFilePath], ct).ConfigureAwait(false);
-            steps.Add($"{copy.Command} (exit {copy.ExitCode})");
+            var copyAnchor = await runner(["cp", tmpAnchor, anchorFilePath], ct).ConfigureAwait(false);
+            steps.Add($"{copyAnchor.Command} (exit {copyAnchor.ExitCode})");
             log.WriteLine(steps[^1]);
-            if (!copy.Succeeded)
+            if (!copyAnchor.Succeeded)
             {
                 var failure = $"Could not write {anchorFilePath} without an interactive password.";
                 steps.Add(failure);
-                return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName), steps);
+                return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName, pfConfPath), steps);
             }
 
-            // Harmless if pf is already enabled (`pfctl -e` then just reports that and exits 1);
-            // only the anchor load below decides success.
-            var enable = await runner(["pfctl", "-e"], ct).ConfigureAwait(false);
+            // Writing the anchor file is not enough: pf only ever evaluates it once it is declared
+            // and loaded from the main ruleset (see the type's remarks and PfConfPath's doc comment).
+            string currentPfConf;
+            try
+            {
+                currentPfConf = await File.ReadAllTextAsync(pfConfPath, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                var failure = $"Could not read {pfConfPath} to register the {anchorName} anchor: {ex.Message}";
+                steps.Add(failure);
+                return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName, pfConfPath), steps);
+            }
+
+            var updatedPfConf = InsertAnchorLines(currentPfConf, anchorName, anchorFilePath);
+            if (!string.Equals(updatedPfConf, currentPfConf, StringComparison.Ordinal))
+            {
+                await File.WriteAllTextAsync(tmpPfConf, updatedPfConf, ct).ConfigureAwait(false);
+
+                var copyPfConf = await runner(["cp", tmpPfConf, pfConfPath], ct).ConfigureAwait(false);
+                steps.Add($"{copyPfConf.Command} (exit {copyPfConf.ExitCode})");
+                log.WriteLine(steps[^1]);
+                if (!copyPfConf.Succeeded)
+                {
+                    var failure = $"Could not register the {anchorName} anchor in {pfConfPath} without an interactive password.";
+                    steps.Add(failure);
+                    return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName, pfConfPath), steps);
+                }
+
+                var validate = await runner(["pfctl", "-n", "-f", pfConfPath], ct).ConfigureAwait(false);
+                steps.Add($"{validate.Command} (exit {validate.ExitCode})");
+                log.WriteLine(steps[^1]);
+                if (!validate.Succeeded)
+                {
+                    var failure = $"{pfConfPath} failed pfctl validation after registering the {anchorName} anchor.";
+                    steps.Add(failure);
+                    return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName, pfConfPath), steps);
+                }
+            }
+
+            // Reference-counted per the /etc/pf.conf header ("each component ... responsible for
+            // enabling and disabling PF via -E and -X ... PF is disabled only when the last enable
+            // reference is released"); harmless if something else already enabled pf, and disable
+            // stays symmetric with `-X`.
+            var enable = await runner(["pfctl", "-E"], ct).ConfigureAwait(false);
             steps.Add($"{enable.Command} (exit {enable.ExitCode})");
             log.WriteLine(steps[^1]);
 
-            var load = await runner(["pfctl", "-a", anchorName, "-f", anchorFilePath], ct).ConfigureAwait(false);
-            steps.Add($"{load.Command} (exit {load.ExitCode})");
+            // Reloading the main ruleset is what actually (re)loads the anchor file's rule content,
+            // now that it is declared via the `load anchor` line above.
+            var reload = await runner(["pfctl", "-f", pfConfPath], ct).ConfigureAwait(false);
+            steps.Add($"{reload.Command} (exit {reload.ExitCode})");
             log.WriteLine(steps[^1]);
-            if (!load.Succeeded)
+            if (!reload.Succeeded)
             {
-                var failure = $"Could not load the {anchorName} pf anchor without an interactive password.";
+                var failure = $"Could not reload {pfConfPath} (which loads the {anchorName} anchor) without an interactive password.";
                 steps.Add(failure);
-                return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName), steps);
+                return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName, pfConfPath), steps);
             }
 
             var success = $"Loaded pf anchor {anchorName}: {subnetCidr} -> {gatewayIp} now redirects to 127.0.0.1.";
@@ -221,7 +431,16 @@ public static partial class PfRedirect
         {
             try
             {
-                File.Delete(tmp);
+                File.Delete(tmpAnchor);
+            }
+            catch (IOException)
+            {
+                // best-effort temp file cleanup.
+            }
+
+            try
+            {
+                File.Delete(tmpPfConf);
             }
             catch (IOException)
             {
@@ -235,7 +454,8 @@ public static partial class PfRedirect
         string anchorFilePath,
         string anchorName,
         PrivilegedCommandRunner runner,
-        CancellationToken ct)
+        CancellationToken ct,
+        string pfConfPath = PfConfPath)
     {
         ArgumentNullException.ThrowIfNull(log);
         ArgumentNullException.ThrowIfNull(runner);
@@ -243,25 +463,78 @@ public static partial class PfRedirect
         var steps = new List<string>();
 
         // Flush only cider's own anchor — never `pfctl -d`, which would disable pf globally and
-        // could drop rules that have nothing to do with cider.
+        // could drop rules that have nothing to do with cider. This is the load-bearing step: it is
+        // what actually stops pf from evaluating the redirect, so failure here fails the whole call.
         var flush = await runner(["pfctl", "-a", anchorName, "-F", "all"], ct).ConfigureAwait(false);
         steps.Add($"{flush.Command} (exit {flush.ExitCode})");
         log.WriteLine(steps[^1]);
 
-        var remove = await runner(["rm", "-f", anchorFilePath], ct).ConfigureAwait(false);
-        steps.Add($"{remove.Command} (exit {remove.ExitCode})");
-        log.WriteLine(steps[^1]);
-
-        if (!flush.Succeeded && !remove.Succeeded)
+        var tmpPfConf = Path.Combine(Path.GetTempPath(), $"cider-pfconf-{Guid.NewGuid():N}.conf");
+        try
         {
-            var failure = "Could not remove the pf anchor without an interactive password.";
-            steps.Add(failure);
-            return new InstallResult(false, DisableInstructions(anchorFilePath, anchorName), steps);
-        }
+            string? currentPfConf = null;
+            try
+            {
+                currentPfConf = await File.ReadAllTextAsync(pfConfPath, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                steps.Add($"Could not read {pfConfPath} to unregister the {anchorName} anchor: {ex.Message}");
+                log.WriteLine(steps[^1]);
+            }
 
-        var success = $"Removed pf anchor {anchorName}.";
-        steps.Add(success);
-        return new InstallResult(true, success, steps);
+            if (currentPfConf is not null)
+            {
+                var updatedPfConf = RemoveAnchorLines(currentPfConf, anchorName, anchorFilePath);
+                if (!string.Equals(updatedPfConf, currentPfConf, StringComparison.Ordinal))
+                {
+                    await File.WriteAllTextAsync(tmpPfConf, updatedPfConf, ct).ConfigureAwait(false);
+
+                    var copyPfConf = await runner(["cp", tmpPfConf, pfConfPath], ct).ConfigureAwait(false);
+                    steps.Add($"{copyPfConf.Command} (exit {copyPfConf.ExitCode})");
+                    log.WriteLine(steps[^1]);
+
+                    if (copyPfConf.Succeeded)
+                    {
+                        var reload = await runner(["pfctl", "-f", pfConfPath], ct).ConfigureAwait(false);
+                        steps.Add($"{reload.Command} (exit {reload.ExitCode})");
+                        log.WriteLine(steps[^1]);
+                    }
+                }
+            }
+
+            // Symmetric with the `-E` reference taken on enable: releases only cider's own reference,
+            // never forces pf off for other components relying on it (see /etc/pf.conf's own header).
+            var disableRef = await runner(["pfctl", "-X"], ct).ConfigureAwait(false);
+            steps.Add($"{disableRef.Command} (exit {disableRef.ExitCode})");
+            log.WriteLine(steps[^1]);
+
+            var remove = await runner(["rm", "-f", anchorFilePath], ct).ConfigureAwait(false);
+            steps.Add($"{remove.Command} (exit {remove.ExitCode})");
+            log.WriteLine(steps[^1]);
+
+            if (!flush.Succeeded)
+            {
+                var failure = "Could not remove the pf anchor without an interactive password.";
+                steps.Add(failure);
+                return new InstallResult(false, DisableInstructions(anchorFilePath, anchorName, pfConfPath), steps);
+            }
+
+            var success = $"Removed pf anchor {anchorName}.";
+            steps.Add(success);
+            return new InstallResult(true, success, steps);
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(tmpPfConf);
+            }
+            catch (IOException)
+            {
+                // best-effort temp file cleanup.
+            }
+        }
     }
 
     /// <summary>Outcome of one privileged command, plus the command line as it should be logged.</summary>

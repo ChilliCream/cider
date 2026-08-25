@@ -260,9 +260,16 @@ public static class Program
 
     private static async Task<bool> DisableHostLoopbackAsync(CiderOptions options)
     {
-        PfRedirect.MarkDisabled(options.DataDir);
         var result = await PfRedirect.TryDisableAsync(Console.Out, CancellationToken.None);
         Console.WriteLine(result.Message);
+
+        // Only clear the opt-in marker once the anchor is actually torn down; a failed flush must
+        // keep the daemon reinstalling the rule on every start rather than silently going quiet.
+        if (result.Success)
+        {
+            PfRedirect.MarkDisabled(options.DataDir);
+        }
+
         return result.Success;
     }
 

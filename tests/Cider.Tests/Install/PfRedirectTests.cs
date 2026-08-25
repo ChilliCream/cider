@@ -4,11 +4,12 @@ using Xunit;
 namespace Cider.Tests.Install;
 
 /// <summary>
-/// Covers rule generation, instruction text and the enable/disable flow against a fully fake
-/// privileged-command runner. Nothing here shells out to <c>pfctl</c> or <c>sudo</c> — the fake
-/// runner below simulates every step in plain C#, so these tests never touch the machine's real pf
-/// state (see the `PfRedirect.PrivilegedCommandRunner` seam SystemSocketLink already uses the same
-/// way for its own privileged calls).
+/// Covers rule generation, pf.conf line insertion/removal, instruction text and the enable/disable
+/// flow against a fully fake privileged-command runner. Nothing here shells out to <c>pfctl</c> or
+/// <c>sudo</c> — the fake runner below simulates every step in plain C#, and the pf.conf path itself
+/// is redirected to a fake file under a temp dir, so these tests never touch the machine's real pf
+/// state or its real <c>/etc/pf.conf</c> (see the `PfRedirect.PrivilegedCommandRunner` seam
+/// SystemSocketLink already uses the same way for its own privileged calls).
 /// </summary>
 public class PfRedirectTests : IDisposable
 {
@@ -18,6 +19,27 @@ public class PfRedirectTests : IDisposable
 
     /// <summary>Stand-in for /etc/pf.anchors/&lt;anchor&gt;.</summary>
     private string AnchorFile => Path.Combine(_root, "anchor.conf");
+
+    /// <summary>Stand-in for /etc/pf.conf.</summary>
+    private string PfConfFile => Path.Combine(_root, "pf.conf");
+
+    /// <summary>The stock content macOS ships in /etc/pf.conf, for the anchor registration tests.</summary>
+    private const string StockPfConf =
+        "#\n" +
+        "# Default PF configuration file.\n" +
+        "#\n" +
+        "# See pf.conf(5) for syntax.\n" +
+        "#\n" +
+        "\n" +
+        "#\n" +
+        "# com.apple anchor point\n" +
+        "#\n" +
+        "scrub-anchor \"com.apple/*\"\n" +
+        "nat-anchor \"com.apple/*\"\n" +
+        "rdr-anchor \"com.apple/*\"\n" +
+        "dummynet-anchor \"com.apple/*\"\n" +
+        "anchor \"com.apple/*\"\n" +
+        "load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"\n";
 
     private string DataDir => Path.Combine(_root, "data");
 
@@ -41,8 +63,8 @@ public class PfRedirectTests : IDisposable
     }
 
     // Simulates `sudo -n <argv>` entirely in-process: `cp`/`rm` are performed for real against the
-    // fake anchor path under _root (never /etc), and `pfctl` calls never spawn the real binary —
-    // they just report the canned outcome the test asked for.
+    // fake anchor/pf.conf paths under _root (never /etc), and `pfctl` calls never spawn the real
+    // binary — they just report the canned outcome the test asked for.
     private static PfRedirect.PrivilegedCommandRunner FakeRunner(
         bool copySucceeds = true,
         bool loadSucceeds = true,
@@ -61,14 +83,15 @@ public class PfRedirectTests : IDisposable
                     }
 
                     break;
-                case "pfctl" when argv.Contains("-f"):
-                    succeeded = loadSucceeds;
-                    break;
                 case "pfctl" when argv.Contains("-F"):
                     succeeded = flushSucceeds;
                     break;
+                case "pfctl" when argv.Contains("-f"):
+                    // Covers both `pfctl -n -f <path>` (validate) and `pfctl -f <path>` (reload).
+                    succeeded = loadSucceeds;
+                    break;
                 case "pfctl":
-                    // `pfctl -e`: harmless either way, TryEnableCoreAsync does not gate on it.
+                    // `pfctl -E`/`-X`: harmless either way, neither core method gates on them.
                     succeeded = true;
                     break;
                 case "rm":
@@ -120,16 +143,105 @@ public class PfRedirectTests : IDisposable
         Assert.Throws<ArgumentException>(() => PfRedirect.BuildRule("192.168.64.1", "192.168.64.1"));
     }
 
+    // ---- InsertAnchorLines / RemoveAnchorLines ----
+
+    [Fact]
+    public void InsertAnchorLines_AddsAllThreeLinesInPfConfKeywordOrder()
+    {
+        var updated = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+
+        var lines = updated.Split('\n');
+        var rdrIndex = Array.IndexOf(lines, $"rdr-anchor \"{PfRedirect.AnchorName}\"");
+        var anchorIndex = Array.IndexOf(lines, $"anchor \"{PfRedirect.AnchorName}\"");
+        var loadIndex = Array.IndexOf(lines, $"load anchor \"{PfRedirect.AnchorName}\" from \"{PfRedirect.AnchorFilePath}\"");
+
+        Assert.True(rdrIndex >= 0, "rdr-anchor line missing");
+        Assert.True(anchorIndex >= 0, "anchor line missing");
+        Assert.True(loadIndex >= 0, "load anchor line missing");
+
+        // Must not disturb Apple's own stanza, and must respect the fixed keyword order relative to
+        // it: rdr-anchor after com.apple's rdr-anchor but before its dummynet-anchor; anchor after
+        // com.apple's anchor but before any load anchor; load anchor after com.apple's load anchor.
+        var appleRdrIndex = Array.IndexOf(lines, "rdr-anchor \"com.apple/*\"");
+        var appleDummynetIndex = Array.IndexOf(lines, "dummynet-anchor \"com.apple/*\"");
+        var appleAnchorIndex = Array.IndexOf(lines, "anchor \"com.apple/*\"");
+        var appleLoadIndex = Array.IndexOf(lines, "load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"");
+
+        Assert.True(appleRdrIndex < rdrIndex && rdrIndex < appleDummynetIndex);
+        Assert.True(appleAnchorIndex < anchorIndex && anchorIndex < loadIndex);
+        Assert.True(appleLoadIndex < loadIndex);
+        Assert.True(rdrIndex < anchorIndex);
+    }
+
+    [Fact]
+    public void InsertAnchorLines_IsIdempotent()
+    {
+        var once = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+        var twice = PfRedirect.InsertAnchorLines(once, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+
+        Assert.Equal(once, twice);
+    }
+
+    [Fact]
+    public void InsertAnchorLines_OnAFileWithNoExistingAnchorStanza_AppendsAtTheEnd()
+    {
+        const string bare = "#\n# minimal pf.conf\n#\n";
+
+        var updated = PfRedirect.InsertAnchorLines(bare, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+
+        Assert.Contains($"rdr-anchor \"{PfRedirect.AnchorName}\"", updated, StringComparison.Ordinal);
+        Assert.Contains($"anchor \"{PfRedirect.AnchorName}\"", updated, StringComparison.Ordinal);
+        Assert.Contains(
+            $"load anchor \"{PfRedirect.AnchorName}\" from \"{PfRedirect.AnchorFilePath}\"",
+            updated,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RemoveAnchorLines_RestoresTheOriginalContent()
+    {
+        var updated = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+        var removed = PfRedirect.RemoveAnchorLines(updated, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+
+        Assert.Equal(StockPfConf, removed);
+    }
+
+    [Fact]
+    public void RemoveAnchorLines_IsIdempotent()
+    {
+        var once = PfRedirect.RemoveAnchorLines(StockPfConf, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+        var twice = PfRedirect.RemoveAnchorLines(once, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+
+        Assert.Equal(StockPfConf, once);
+        Assert.Equal(once, twice);
+    }
+
+    [Fact]
+    public void RemoveAnchorLines_NeverTouchesAppleSOwnAnchorLines()
+    {
+        var updated = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+        var removed = PfRedirect.RemoveAnchorLines(updated, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+
+        Assert.Contains("rdr-anchor \"com.apple/*\"", removed, StringComparison.Ordinal);
+        Assert.Contains("anchor \"com.apple/*\"", removed, StringComparison.Ordinal);
+        Assert.Contains("load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"", removed, StringComparison.Ordinal);
+    }
+
     // ---- Instructions ----
 
     [Fact]
-    public void Instructions_ContainsTheAnchorFileAndNonInteractiveSudoCommands()
+    public void Instructions_ContainsTheAnchorFileAndPfConfRegistrationAndReloadCommands()
     {
         var instructions = PfRedirect.Instructions("192.168.64.0/24", "192.168.64.1");
 
         Assert.Contains("rdr inet from 192.168.64.0/24 to 192.168.64.1 -> 127.0.0.1", instructions, StringComparison.Ordinal);
         Assert.Contains($"sudo tee {PfRedirect.AnchorFilePath}", instructions, StringComparison.Ordinal);
-        Assert.Contains($"sudo pfctl -a {PfRedirect.AnchorName} -f {PfRedirect.AnchorFilePath}", instructions, StringComparison.Ordinal);
+        Assert.Contains($"rdr-anchor \"%s\"", instructions, StringComparison.Ordinal);
+        Assert.Contains($"'{PfRedirect.AnchorName}'", instructions, StringComparison.Ordinal);
+        Assert.Contains($"sudo tee -a {PfRedirect.PfConfPath}", instructions, StringComparison.Ordinal);
+        Assert.Contains($"sudo pfctl -n -f {PfRedirect.PfConfPath}", instructions, StringComparison.Ordinal);
+        Assert.Contains("sudo pfctl -E", instructions, StringComparison.Ordinal);
+        Assert.Contains($"sudo pfctl -f {PfRedirect.PfConfPath}", instructions, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -143,19 +255,24 @@ public class PfRedirectTests : IDisposable
     }
 
     [Fact]
-    public void DisableInstructions_ContainsTheFlushAndRemoveCommands()
+    public void DisableInstructions_ContainsTheFlushPfConfCleanupReloadAndRemoveCommands()
     {
         var instructions = PfRedirect.DisableInstructions();
 
         Assert.Contains($"sudo pfctl -a {PfRedirect.AnchorName} -F all", instructions, StringComparison.Ordinal);
+        Assert.Contains($"{PfRedirect.PfConfPath}", instructions, StringComparison.Ordinal);
+        Assert.Contains($"sudo pfctl -f {PfRedirect.PfConfPath}", instructions, StringComparison.Ordinal);
+        Assert.Contains("sudo pfctl -X", instructions, StringComparison.Ordinal);
         Assert.Contains($"sudo rm -f {PfRedirect.AnchorFilePath}", instructions, StringComparison.Ordinal);
     }
 
     // ---- TryEnableCoreAsync ----
 
     [Fact]
-    public async Task TryEnableCoreAsync_WritesTheRuleAndLoadsTheAnchor_OnSuccess()
+    public async Task TryEnableCoreAsync_WritesTheRuleAndRegistersAndReloadsTheAnchor_OnSuccess()
     {
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
         var result = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
@@ -163,17 +280,52 @@ public class PfRedirectTests : IDisposable
             AnchorFile,
             PfRedirect.AnchorName,
             FakeRunner(),
-            CancellationToken.None);
+            CancellationToken.None,
+            PfConfFile);
 
         Assert.True(result.Success);
         Assert.Equal("rdr inet from 192.168.64.0/24 to 192.168.64.1 -> 127.0.0.1\n", await File.ReadAllTextAsync(AnchorFile));
+
+        // The anchor must actually be reachable from the main ruleset — not just written to disk.
+        var pfConf = await File.ReadAllTextAsync(PfConfFile);
+        Assert.Contains($"rdr-anchor \"{PfRedirect.AnchorName}\"", pfConf, StringComparison.Ordinal);
+        Assert.Contains($"anchor \"{PfRedirect.AnchorName}\"", pfConf, StringComparison.Ordinal);
+        Assert.Contains($"load anchor \"{PfRedirect.AnchorName}\" from \"{AnchorFile}\"", pfConf, StringComparison.Ordinal);
+
         Assert.Contains(result.Steps, s => s.StartsWith("sudo -n cp ", StringComparison.Ordinal));
-        Assert.Contains(result.Steps, s => s.StartsWith($"sudo -n pfctl -a {PfRedirect.AnchorName} -f {AnchorFile}", StringComparison.Ordinal));
+        Assert.Contains(result.Steps, s => s.StartsWith($"sudo -n pfctl -n -f {PfConfFile}", StringComparison.Ordinal));
+        Assert.Contains(result.Steps, s => s.StartsWith("sudo -n pfctl -E", StringComparison.Ordinal));
+        Assert.Contains(result.Steps, s => s == $"sudo -n pfctl -f {PfConfFile} (exit 0)");
+    }
+
+    [Fact]
+    public async Task TryEnableCoreAsync_IsIdempotent_DoesNotRewritePfConfWhenAlreadyRegistered()
+    {
+        var alreadyRegistered = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, AnchorFile);
+        await File.WriteAllTextAsync(PfConfFile, alreadyRegistered);
+
+        var result = await PfRedirect.TryEnableCoreAsync(
+            "192.168.64.0/24",
+            "192.168.64.1",
+            new StringWriter(),
+            AnchorFile,
+            PfRedirect.AnchorName,
+            FakeRunner(),
+            CancellationToken.None,
+            PfConfFile);
+
+        Assert.True(result.Success);
+        // No `cp` targeting pf.conf itself, since its content did not need to change.
+        Assert.DoesNotContain(result.Steps, s => s.Contains($"cp ", StringComparison.Ordinal) && s.Contains(PfConfFile, StringComparison.Ordinal));
+        // Still reloads, so a changed anchor rule is always picked up.
+        Assert.Contains(result.Steps, s => s == $"sudo -n pfctl -f {PfConfFile} (exit 0)");
     }
 
     [Fact]
     public async Task TryEnableCoreAsync_ReturnsInstructions_WhenCopyNeedsAPassword()
     {
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
         var result = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
@@ -181,7 +333,8 @@ public class PfRedirectTests : IDisposable
             AnchorFile,
             PfRedirect.AnchorName,
             FakeRunner(copySucceeds: false),
-            CancellationToken.None);
+            CancellationToken.None,
+            PfConfFile);
 
         Assert.False(result.Success);
         Assert.False(File.Exists(AnchorFile));
@@ -189,8 +342,10 @@ public class PfRedirectTests : IDisposable
     }
 
     [Fact]
-    public async Task TryEnableCoreAsync_ReturnsInstructions_WhenTheAnchorLoadNeedsAPassword()
+    public async Task TryEnableCoreAsync_ReturnsInstructions_WhenThePfConfReloadNeedsAPassword()
     {
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
         var result = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
@@ -198,24 +353,27 @@ public class PfRedirectTests : IDisposable
             AnchorFile,
             PfRedirect.AnchorName,
             FakeRunner(loadSucceeds: false),
-            CancellationToken.None);
+            CancellationToken.None,
+            PfConfFile);
 
         Assert.False(result.Success);
-        Assert.Contains($"sudo pfctl -a {PfRedirect.AnchorName} -f {AnchorFile}", result.Message, StringComparison.Ordinal);
+        Assert.Contains($"sudo pfctl -n -f {PfConfFile}", result.Message, StringComparison.Ordinal);
     }
 
     [Fact]
     public async Task TryEnableCoreAsync_NeverLeavesTheUnprivilegedTempRuleFileBehind()
     {
-        // Captures the unprivileged temp path the real (net10/net11, run-in-parallel) `cp` step
+        // Captures the unprivileged temp paths the real (net10/net11, run-in-parallel) `cp` steps
         // would read from, rather than diffing a directory listing shared with other concurrently
         // running test processes writing into the same OS temp dir.
-        string? capturedTmpPath = null;
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
+        var capturedTmpPaths = new List<string>();
         PfRedirect.PrivilegedCommandRunner capturing = (argv, ct) =>
         {
             if (argv[0] == "cp")
             {
-                capturedTmpPath = argv[1];
+                capturedTmpPaths.Add(argv[1]);
             }
 
             return FakeRunner()(argv, ct);
@@ -228,33 +386,42 @@ public class PfRedirectTests : IDisposable
             AnchorFile,
             PfRedirect.AnchorName,
             capturing,
-            CancellationToken.None);
+            CancellationToken.None,
+            PfConfFile);
 
-        Assert.NotNull(capturedTmpPath);
-        Assert.False(File.Exists(capturedTmpPath));
+        Assert.NotEmpty(capturedTmpPaths);
+        Assert.All(capturedTmpPaths, p => Assert.False(File.Exists(p)));
     }
 
     // ---- TryDisableCoreAsync ----
 
     [Fact]
-    public async Task TryDisableCoreAsync_FlushesTheAnchorAndRemovesTheFile_OnSuccess()
+    public async Task TryDisableCoreAsync_FlushesTheAnchorUnregistersFromPfConfAndRemovesTheFile_OnSuccess()
     {
         await File.WriteAllTextAsync(AnchorFile, "rdr inet from 192.168.64.0/24 to 192.168.64.1 -> 127.0.0.1\n");
+        var registered = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, AnchorFile);
+        await File.WriteAllTextAsync(PfConfFile, registered);
 
         var result = await PfRedirect.TryDisableCoreAsync(
             new StringWriter(),
             AnchorFile,
             PfRedirect.AnchorName,
             FakeRunner(),
-            CancellationToken.None);
+            CancellationToken.None,
+            PfConfFile);
 
         Assert.True(result.Success);
         Assert.False(File.Exists(AnchorFile));
+
+        var pfConf = await File.ReadAllTextAsync(PfConfFile);
+        Assert.Equal(StockPfConf, pfConf);
     }
 
     [Fact]
     public async Task TryDisableCoreAsync_NeverCallsPfctlDisable_OnlyFlushesItsOwnAnchor()
     {
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
         var seen = new List<IReadOnlyList<string>>();
         PfRedirect.PrivilegedCommandRunner recording = (argv, ct) =>
         {
@@ -262,29 +429,51 @@ public class PfRedirectTests : IDisposable
             return FakeRunner()(argv, ct);
         };
 
-        await PfRedirect.TryDisableCoreAsync(new StringWriter(), AnchorFile, PfRedirect.AnchorName, recording, CancellationToken.None);
+        await PfRedirect.TryDisableCoreAsync(new StringWriter(), AnchorFile, PfRedirect.AnchorName, recording, CancellationToken.None, PfConfFile);
 
         // `pfctl -d` disables pf globally; disabling host-loopback must only ever flush cider's
-        // own named anchor (`-a <name> -F all`), never the global switch.
+        // own named anchor (`-a <name> -F all`) and release its own `-E` reference via `-X`, never
+        // the global switch.
         Assert.DoesNotContain(seen, argv => argv[0] == "pfctl" && argv.Contains("-d"));
         Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-a", PfRedirect.AnchorName, "-F", "all"]));
+        Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-X"]));
     }
 
     [Fact]
-    public async Task TryDisableCoreAsync_ReturnsInstructions_WhenNeitherStepSucceeds()
+    public async Task TryDisableCoreAsync_Fails_WhenFlushFails_EvenIfRemoveSucceeds()
     {
         await File.WriteAllTextAsync(AnchorFile, "stale");
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
 
         var result = await PfRedirect.TryDisableCoreAsync(
             new StringWriter(),
             AnchorFile,
             PfRedirect.AnchorName,
-            FakeRunner(flushSucceeds: false, removeSucceeds: false),
-            CancellationToken.None);
+            FakeRunner(flushSucceeds: false, removeSucceeds: true),
+            CancellationToken.None,
+            PfConfFile);
 
         Assert.False(result.Success);
+        Assert.Contains("sudo pfctl -a", result.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TryDisableCoreAsync_Succeeds_OnlyWhenFlushSucceeds_RegardlessOfRemove()
+    {
+        await File.WriteAllTextAsync(AnchorFile, "stale");
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
+        var result = await PfRedirect.TryDisableCoreAsync(
+            new StringWriter(),
+            AnchorFile,
+            PfRedirect.AnchorName,
+            FakeRunner(flushSucceeds: true, removeSucceeds: false),
+            CancellationToken.None,
+            PfConfFile);
+
+        Assert.True(result.Success);
+        // `rm -f` failing on its own does not fail disable — flush is the load-bearing step.
         Assert.True(File.Exists(AnchorFile));
-        Assert.Contains("sudo rm -f", result.Message, StringComparison.Ordinal);
     }
 
     // ---- opt-in state marker ----
