@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using Cider.Core.DockerApi;
 using Cider.Core.Events;
@@ -24,6 +25,16 @@ public sealed class RestartSupervisor : IAsyncDisposable
 
     private CancellationTokenSource? _cts;
     private bool _running;
+
+    /// <summary>
+    /// The error text <see cref="MarkVanished"/> puts on <c>record.State.Error</c>, and the marker
+    /// <see cref="ContainerManager.HandleExitAsync"/> (ContainerManager.Lifecycle.cs) also stamps
+    /// when the started process itself reports the container gone rather than the start call
+    /// throwing (a warm tty cache can let <c>container start -a</c> spawn against a runtime id
+    /// Apple has already dropped — cider-msj). <see cref="OnStateChanged"/> treats either source of
+    /// this marker as terminal.
+    /// </summary>
+    public const string VanishedError = "container no longer exists in Apple container (removed outside cider)";
 
     /// <summary>Creates the supervisor.</summary>
     public RestartSupervisor(ContainerManager containers, EventBus events, ILogger<RestartSupervisor> logger)
@@ -120,6 +131,18 @@ public sealed class RestartSupervisor : IAsyncDisposable
     {
         if (!string.Equals(action, "die", StringComparison.Ordinal) || !_running)
         {
+            return;
+        }
+
+        // ContainerManager.HandleExitAsync already recognized (from the started process's own
+        // stderr) that the container itself is gone, even though the start call never threw —
+        // the same "give up for good" situation the NotFound catch in RestartAsync handles below,
+        // just discovered on the other side of a successful start. Status/Error/the "die" event
+        // are already set by the time this runs; only the scheduling decision is ours to make.
+        if (string.Equals(record.State.Error, VanishedError, StringComparison.Ordinal))
+        {
+            _attempts.TryRemove(record.Id, out _);
+            LogGivingUp(record);
             return;
         }
 
@@ -229,12 +252,19 @@ public sealed class RestartSupervisor : IAsyncDisposable
         _attempts.TryRemove(record.Id, out _);
 
         record.State.Status = "exited";
-        record.State.Error = "container no longer exists in Apple container (removed outside cider)";
+        record.State.Error = VanishedError;
+        record.State.FinishedAt ??= DateTimeOffset.UtcNow;
         _containers.PersistExternal(record);
-        _events.Publish(DockerEvents.Container("die", record));
+        _events.Publish(DockerEvents.Container("die", record, new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["exitCode"] = record.State.ExitCode.ToString(CultureInfo.InvariantCulture),
+        }));
 
+        LogGivingUp(record);
+    }
+
+    private void LogGivingUp(ContainerRecord record) =>
         _logger.LogWarning(
             "container {Container} no longer exists in Apple container (removed outside cider); giving up restarting it",
             record.Name);
-    }
 }

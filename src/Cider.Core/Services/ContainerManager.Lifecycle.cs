@@ -1,9 +1,11 @@
 using System.Globalization;
 using System.Net;
+using System.Text;
 using Cider.Core.DockerApi;
 using Cider.Core.DockerApi.Models;
 using Cider.Core.DockerApi.Streams;
 using Cider.Core.Ids;
+using Cider.Core.Restart;
 using Cider.Core.Runtime;
 using Cider.Core.State;
 using Microsoft.Extensions.Logging;
@@ -82,9 +84,16 @@ public sealed partial class ContainerManager
             handle.LogWriter = _logs.OpenWriter(record.Id);
             handle.Pumps.Clear();
             handle.Pumps.Add(PumpAsync(handle, process.Stdout, StdStream.Stdout));
+
+            // Kept only to recognize a vanished container the started process reports on its own
+            // stderr rather than the start call throwing (a warm tty cache — AppleContainerRuntime's
+            // `_ttyByContainer` — can let `container start -a` spawn against a runtime id Apple has
+            // already dropped; cider-msj). Discarded once HandleExitAsync has classified it.
+            StringBuilder? stderrTail = null;
             if (process.Stderr is { } stderr)
             {
-                handle.Pumps.Add(PumpAsync(handle, stderr, StdStream.Stderr));
+                stderrTail = new StringBuilder();
+                handle.Pumps.Add(PumpAsync(handle, stderr, StdStream.Stderr, stderrTail));
             }
 
             record.State.Status = "running";
@@ -102,7 +111,7 @@ public sealed partial class ContainerManager
             Persist(record);
 
             await BindAttachmentsAsync(handle);
-            handle.ExitHandling = Task.Run(() => HandleExitAsync(record.Id, handle, process), CancellationToken.None);
+            handle.ExitHandling = Task.Run(() => HandleExitAsync(record.Id, handle, process, stderrTail), CancellationToken.None);
 
             await AwaitStartupAndRegisterNetworkNamesAsync(record, process, ct);
 
@@ -514,7 +523,11 @@ public sealed partial class ContainerManager
 
     /// <summary><c>POST /containers/prune</c>: removes stopped containers.</summary>
 
-    private async Task PumpAsync(ContainerHandle handle, Stream source, StdStream stream)
+    /// <summary>Bound on how much of the stderr tail <see cref="HandleExitAsync"/> keeps around to
+    /// classify a vanished container against; the runtime's own error line is always near the end.</summary>
+    private const int StderrTailCapBytes = 4 * 1024;
+
+    private async Task PumpAsync(ContainerHandle handle, Stream source, StdStream stream, StringBuilder? stderrTail = null)
     {
         var buffer = new byte[PumpBufferSize];
         try
@@ -536,6 +549,11 @@ public sealed partial class ContainerManager
                 }
 
                 Broadcast(handle, stream, chunk);
+
+                if (stderrTail is not null)
+                {
+                    AppendCappedTail(stderrTail, chunk);
+                }
             }
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
@@ -548,7 +566,40 @@ public sealed partial class ContainerManager
         }
     }
 
-    private async Task HandleExitAsync(string id, ContainerHandle handle, IContainerProcess process)
+    private static void AppendCappedTail(StringBuilder tail, byte[] chunk)
+    {
+        tail.Append(Encoding.UTF8.GetString(chunk));
+        if (tail.Length > StderrTailCapBytes)
+        {
+            tail.Remove(0, tail.Length - StderrTailCapBytes);
+        }
+    }
+
+    /// <summary>
+    /// A small echo of <c>CliErrorMapper.NotFoundMarkers</c> (Cider.AppleContainer) for the started
+    /// process's own stderr — Cider.Core cannot reference that internal type, since AppleContainer
+    /// depends on Core, not the other way around. Scoped to blobs that also mention "container" so
+    /// an application's own "404 not found" logging does not trip it.
+    /// </summary>
+    private static bool LooksLikeVanishedContainer(string? stderrTail)
+    {
+        if (string.IsNullOrWhiteSpace(stderrTail))
+        {
+            return false;
+        }
+
+        var text = stderrTail.ToLowerInvariant();
+        if (!text.Contains("container", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return text.Contains("not found", StringComparison.Ordinal) ||
+            text.Contains("no such", StringComparison.Ordinal) ||
+            text.Contains("does not exist", StringComparison.Ordinal);
+    }
+
+    private async Task HandleExitAsync(string id, ContainerHandle handle, IContainerProcess process, StringBuilder? stderrTail = null)
     {
         var exitCode = -1;
         try
@@ -596,6 +647,18 @@ public sealed partial class ContainerManager
             record.State.ExitCode = exitCode;
             record.State.FinishedAt = DateTimeOffset.UtcNow;
             record.State.Pid = 0;
+
+            // A warm tty cache (AppleContainerRuntime._ttyByContainer) can let `container start -a`
+            // spawn even though Apple's own container table has already dropped the runtime id: the
+            // start call never throws, so RestartSupervisor never sees the NotFound it otherwise
+            // catches — only the attached process's own stderr says the container is gone. Stamp the
+            // same marker MarkVanished uses so OnStateChanged recognizes this and gives up instead of
+            // rescheduling into a tight loop (cider-msj).
+            if (exitCode != 0 && LooksLikeVanishedContainer(stderrTail?.ToString()))
+            {
+                record.State.Error = RestartSupervisor.VanishedError;
+            }
+
             if (record.State.Health is { } health)
             {
                 health.Status = "unhealthy";
