@@ -73,6 +73,9 @@ internal static class RuntimeMapper
                     Hostname = attachment.Hostname,
                     IPv4Address = StripCidr(attachment.Ipv4Address),
                     IPv4Gateway = StripCidr(attachment.Ipv4Gateway),
+                    // Apple reports the CIDR form (docs/spikes/xpc/02-apiserver-xpc-protocol.md §2.2,
+                    // e.g. "fd3e:...:33d1/64") but no per-attachment IPv6 gateway.
+                    Ipv6Address = StripCidr(attachment.Ipv6Address),
                     MacAddress = attachment.MacAddress,
                 });
             }

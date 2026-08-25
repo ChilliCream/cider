@@ -83,12 +83,15 @@ public sealed class NetworkManager
 
         var id = DockerId.New();
         var labels = new Dictionary<string, string>(request.Labels) { [ContainerIdentity.IdLabel] = id };
-        var subnet = request.IPAM?.Config?.FirstOrDefault()?.Subnet;
+        var configs = request.IPAM?.Config;
+        var subnet = configs?.FirstOrDefault(c => !IsIpv6Subnet(c.Subnet))?.Subnet;
+        var subnetV6 = configs?.FirstOrDefault(c => IsIpv6Subnet(c.Subnet))?.Subnet;
 
         var spec = new NetworkSpec
         {
             Name = RuntimeNameFor(request.Name),
             Subnet = subnet,
+            SubnetV6 = subnetV6,
             Internal = request.Internal,
             Labels = RuntimeSafeLabels(labels),
             Options = request.Options,
@@ -565,12 +568,7 @@ public sealed class NetworkManager
         {
             Name = BridgeName,
             Driver = "bridge",
-            IPAM = new Ipam
-            {
-                Config = runtimeNetwork?.Subnet is not null
-                    ? [new IpamConfig { Subnet = runtimeNetwork.Subnet, Gateway = runtimeNetwork.Gateway }]
-                    : [],
-            },
+            IPAM = new Ipam { Config = DefaultIpamConfig(runtimeNetwork) },
         };
 
         var record = new NetworkRecord
@@ -632,12 +630,7 @@ public sealed class NetworkManager
                     Name = runtimeNetwork.Name,
                     Driver = "bridge",
                     Internal = runtimeNetwork.Internal,
-                    IPAM = new Ipam
-                    {
-                        Config = runtimeNetwork.Subnet is not null
-                            ? [new IpamConfig { Subnet = runtimeNetwork.Subnet, Gateway = runtimeNetwork.Gateway }]
-                            : [],
-                    },
+                    IPAM = new Ipam { Config = DefaultIpamConfig(runtimeNetwork) },
                     Labels = new Dictionary<string, string>(runtimeNetwork.Labels),
                 },
                 Created = runtimeNetwork.Created ?? DateTimeOffset.UtcNow,
@@ -690,6 +683,31 @@ public sealed class NetworkManager
         return length > 0 ? address + "/" + length.ToString(CultureInfo.InvariantCulture) : address;
     }
 
+    /// <summary>One <see cref="Ipam"/> config entry list mixes IPv4 and IPv6 subnets; this is how they're told apart.</summary>
+    private static bool IsIpv6Subnet(string? subnet) => subnet is not null && subnet.Contains(':', StringComparison.Ordinal);
+
+    /// <summary>
+    /// The <see cref="Ipam"/> config for a network adopted straight from the runtime (the default
+    /// bridge, or one discovered by <see cref="ReconcileAsync"/>): an IPv4 entry when the runtime
+    /// reports a subnet, an IPv6 entry when it reports <see cref="RuntimeNetwork.SubnetV6"/> — Apple
+    /// reports no IPv6 gateway per network, so that entry carries no <c>Gateway</c>.
+    /// </summary>
+    private static List<IpamConfig> DefaultIpamConfig(RuntimeNetwork? runtimeNetwork)
+    {
+        var config = new List<IpamConfig>();
+        if (runtimeNetwork?.Subnet is not null)
+        {
+            config.Add(new IpamConfig { Subnet = runtimeNetwork.Subnet, Gateway = runtimeNetwork.Gateway });
+        }
+
+        if (runtimeNetwork?.SubnetV6 is not null)
+        {
+            config.Add(new IpamConfig { Subnet = runtimeNetwork.SubnetV6 });
+        }
+
+        return config;
+    }
+
     private static int PrefixLengthOf(string? subnet)
     {
         if (string.IsNullOrEmpty(subnet))
@@ -717,12 +735,19 @@ public sealed class NetworkManager
             }
         }
 
-        var subnet = runtimeNetwork?.Subnet ?? record.Request.IPAM?.Config?.FirstOrDefault()?.Subnet;
-        var gateway = runtimeNetwork?.Gateway ?? record.Request.IPAM?.Config?.FirstOrDefault()?.Gateway;
+        var configs = record.Request.IPAM?.Config;
+        var subnet = runtimeNetwork?.Subnet ?? configs?.FirstOrDefault(c => !IsIpv6Subnet(c.Subnet))?.Subnet;
+        var gateway = runtimeNetwork?.Gateway ?? configs?.FirstOrDefault(c => !IsIpv6Subnet(c.Subnet))?.Gateway;
+        var subnetV6 = runtimeNetwork?.SubnetV6 ?? configs?.FirstOrDefault(c => IsIpv6Subnet(c.Subnet))?.Subnet;
         var ipamConfig = new List<IpamConfig>();
         if (subnet is not null)
         {
             ipamConfig.Add(new IpamConfig { Subnet = subnet, Gateway = gateway });
+        }
+
+        if (subnetV6 is not null)
+        {
+            ipamConfig.Add(new IpamConfig { Subnet = subnetV6 });
         }
 
         var containers = new Dictionary<string, EndpointResource>();
@@ -750,6 +775,7 @@ public sealed class NetworkManager
             Created = DockerTime.Format(record.Created),
             Scope = "local",
             Driver = record.Name switch { HostName => "host", NoneName => "null", _ => "bridge" },
+            EnableIPv6 = subnetV6 is not null,
             IPAM = new Ipam { Config = ipamConfig },
             Internal = record.Request.Internal,
             Attachable = record.Request.Attachable,

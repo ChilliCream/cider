@@ -203,6 +203,9 @@ public sealed partial class ContainerManager
             settings.Gateway = first.Gateway;
             settings.MacAddress = first.MacAddress ?? "";
             settings.EndpointID = first.EndpointID;
+            settings.GlobalIPv6Address = first.GlobalIPv6Address;
+            settings.GlobalIPv6PrefixLen = first.GlobalIPv6PrefixLen;
+            settings.IPv6Gateway = first.IPv6Gateway;
         }
 
         return settings;
@@ -294,17 +297,17 @@ public sealed partial class ContainerManager
                 return "Created";
 
             case "running":
-            {
-                var uptime = HumanDuration(now - (state.StartedAt ?? now));
-                var health = state.Health?.Status;
-                return health switch
                 {
-                    "healthy" => $"Up {uptime} (healthy)",
-                    "unhealthy" => $"Up {uptime} (unhealthy)",
-                    "starting" => $"Up {uptime} (health: starting)",
-                    _ => $"Up {uptime}",
-                };
-            }
+                    var uptime = HumanDuration(now - (state.StartedAt ?? now));
+                    var health = state.Health?.Status;
+                    return health switch
+                    {
+                        "healthy" => $"Up {uptime} (healthy)",
+                        "unhealthy" => $"Up {uptime} (unhealthy)",
+                        "starting" => $"Up {uptime} (health: starting)",
+                        _ => $"Up {uptime}",
+                    };
+                }
 
             case "paused":
                 return $"Up {HumanDuration(now - (state.StartedAt ?? now))} (Paused)";

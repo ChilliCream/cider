@@ -119,6 +119,13 @@ public sealed class NetworkDnsTests(DaemonFixture daemon)
                 "inspect", "-f", "{{(index .NetworkSettings.Networks \"bridge\").IPAddress}}", container)).Stdout.Trim();
             Assert.False(string.IsNullOrEmpty(bridgeIp), "the container has no address on bridge");
 
+            // Apple assigns an IPv6 ULA address on every network (fd../64) even without an explicit
+            // --subnet-v6; cider-ede.21 plumbs it through to GlobalIPv6Address (docs/spikes/xpc/
+            // 03-limitations-audit-1.3.md's "IPv6 not handled" row).
+            var bridgeIpv6 = (await daemon.DockerAsync(
+                "inspect", "-f", "{{(index .NetworkSettings.Networks \"bridge\").GlobalIPv6Address}}", container)).Stdout.Trim();
+            Assert.StartsWith("fd", bridgeIpv6, StringComparison.OrdinalIgnoreCase);
+
             var connectedIp = (await daemon.DockerAsync(
                 "inspect", "-f", $"{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}", container)).Stdout.Trim();
             Assert.False(string.IsNullOrEmpty(connectedIp), "the container has no address on " + network);

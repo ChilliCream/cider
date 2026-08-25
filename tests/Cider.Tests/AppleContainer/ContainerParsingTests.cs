@@ -139,6 +139,7 @@ public class ContainerParsingTests
         var attachment = Assert.Single(container.Networks);
         Assert.Equal("192.168.64.20", attachment.IPv4Address);
         Assert.Equal("192.168.64.1", attachment.IPv4Gateway);
+        Assert.Equal("fd3e:bc7a:df05:1995:fc74:95ff:fe02:33d1", attachment.Ipv6Address);
         Assert.Equal("fe:74:95:02:33:d1", attachment.MacAddress);
         Assert.Equal("linux/arm64/v8", container.Platform);
         Assert.True(container.Tty);

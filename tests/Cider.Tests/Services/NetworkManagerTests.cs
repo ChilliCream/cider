@@ -163,6 +163,56 @@ public sealed class NetworkManagerTests
     }
 
     [Fact]
+    public async Task CreateAsync_WithIpv6Subnet_PassesSubnetV6ToTheRuntimeAndInspectShowsIt()
+    {
+        // `docker network create --ipv6 --subnet-v6 fd00::/64 n6` sends both an IPv4 and an IPv6
+        // entry in IPAM.Config; only the IPv6 one carries a colon, which is how they're told apart.
+        var (manager, runtime, _) = CreateManager();
+        var request = new NetworkCreateRequest
+        {
+            Name = "n6",
+            EnableIPv6 = true,
+            IPAM = new Ipam
+            {
+                Config =
+                [
+                    new IpamConfig { Subnet = "192.168.100.0/24", Gateway = "192.168.100.1" },
+                    new IpamConfig { Subnet = "fd00::/64" },
+                ],
+            },
+        };
+
+        await manager.CreateAsync(request, CancellationToken.None);
+
+        var runtimeNetwork = await runtime.InspectNetworkAsync("n6", CancellationToken.None);
+        Assert.Equal("fd00::/64", runtimeNetwork!.SubnetV6);
+        Assert.Equal("192.168.100.0/24", runtimeNetwork.Subnet);
+
+        var inspected = await manager.InspectAsync("n6", verbose: false, scope: null, CancellationToken.None);
+        Assert.True(inspected.EnableIPv6);
+        Assert.Contains(inspected.IPAM.Config, c => c.Subnet == "fd00::/64");
+        Assert.Contains(inspected.IPAM.Config, c => c.Subnet == "192.168.100.0/24");
+    }
+
+    [Fact]
+    public async Task CreateAsync_Ipv6SubnetOnly_StillMapsItToNetworkSpecSubnetV6()
+    {
+        var (manager, runtime, _) = CreateManager();
+        var request = new NetworkCreateRequest
+        {
+            Name = "n6only",
+            EnableIPv6 = true,
+            IPAM = new Ipam { Config = [new IpamConfig { Subnet = "fd00:1::/64" }] },
+        };
+
+        await manager.CreateAsync(request, CancellationToken.None);
+
+        var runtimeNetwork = await runtime.InspectNetworkAsync("n6only", CancellationToken.None);
+        Assert.Equal("fd00:1::/64", runtimeNetwork!.SubnetV6);
+        Assert.Null(runtimeNetwork.Subnet);
+    }
+
+    [Fact]
     public async Task CreateAsync_DuplicateName_Throws409()
     {
         var (manager, _, _) = CreateManager();

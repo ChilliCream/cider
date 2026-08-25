@@ -94,6 +94,7 @@ public sealed partial class FakeContainerRuntime
                 Mode = "nat",
                 Subnet = spec.Subnet,
                 Gateway = DeriveGateway(spec.Subnet),
+                SubnetV6 = spec.SubnetV6,
                 Internal = spec.Internal,
                 Labels = spec.Labels,
                 Created = DateTimeOffset.UtcNow,

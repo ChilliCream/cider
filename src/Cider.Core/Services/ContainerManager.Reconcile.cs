@@ -394,13 +394,29 @@ public sealed partial class ContainerManager
             endpoint.Gateway = attachment.IPv4Gateway ?? "";
             endpoint.MacAddress = attachment.MacAddress;
 
+            // Apple's attachment carries no per-attachment IPv6 gateway (docs/spikes/xpc/
+            // 02-apiserver-xpc-protocol.md §2.2's Attachment has no ipv6Gateway field), so
+            // Ipv6Gateway stays whatever RuntimeMapper set (currently always null/empty).
+            if (!string.IsNullOrEmpty(attachment.Ipv6Address))
+            {
+                endpoint.GlobalIPv6Address = attachment.Ipv6Address;
+                endpoint.IPv6Gateway = attachment.Ipv6Gateway ?? "";
+            }
+
             if (_networks.TryGetCachedRecord(dockerNetwork) is { } networkRecord)
             {
                 endpoint.NetworkID = networkRecord.Id;
-                var subnet = networkRecord.Request.IPAM?.Config?.FirstOrDefault()?.Subnet;
+                var configs = networkRecord.Request.IPAM?.Config;
+                var subnet = configs?.FirstOrDefault(c => !IsIpv6Subnet(c.Subnet))?.Subnet;
                 if (TryParsePrefixLength(subnet, out var prefixLen))
                 {
                     endpoint.IPPrefixLen = prefixLen;
+                }
+
+                var subnetV6 = configs?.FirstOrDefault(c => IsIpv6Subnet(c.Subnet))?.Subnet;
+                if (TryParsePrefixLength(subnetV6, out var prefixLenV6))
+                {
+                    endpoint.GlobalIPv6PrefixLen = prefixLenV6;
                 }
             }
 
@@ -437,6 +453,9 @@ public sealed partial class ContainerManager
 
         return allResolved;
     }
+
+    /// <summary>One <see cref="Ipam"/> config entry list mixes IPv4 and IPv6 subnets; this is how they're told apart.</summary>
+    private static bool IsIpv6Subnet(string? subnet) => subnet is not null && subnet.Contains(':', StringComparison.Ordinal);
 
     private static bool TryParsePrefixLength(string? cidr, out int prefixLength)
     {
