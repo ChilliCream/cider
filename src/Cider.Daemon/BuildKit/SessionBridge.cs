@@ -112,6 +112,7 @@ public sealed class SessionBridge
         {
             Invoker = handle.Cli.Invoker,
             Authority = "session",
+            HeaderRewrite = handle.Cli.BeginHeaderRewriteAsync,
         });
     }
 

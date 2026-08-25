@@ -43,6 +43,16 @@ public sealed class DuplexRequestContent(Stream requestBody, int maxChunk, IUpst
         var buffer = ArrayPool<byte>.Shared.Rent(_maxChunk);
         try
         {
+            // Flush before ever touching _requestBody: System.Net.Http buffers this content's HEADERS
+            // frame internally until SerializeToStreamAsync's stream sees its first write or flush, so
+            // an upstream target that legitimately speaks first on a duplex stream -- FileSync/DiffCopy's
+            // CLI-side server starts walking and replying the moment it sees the request, without ever
+            // waiting to read anything from the caller (buildkitd only sends a request message once it
+            // has something to say, sometimes never) -- would otherwise never even receive the request:
+            // its HEADERS frame stays stuck in .NET's buffer for as long as _requestBody.ReadAsync below
+            // has nothing to hand it, which can be indefinitely (cider-ger.18).
+            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+
             int read;
             while ((read = await _requestBody.ReadAsync(buffer.AsMemory(0, _maxChunk), cancellationToken).ConfigureAwait(false)) > 0)
             {

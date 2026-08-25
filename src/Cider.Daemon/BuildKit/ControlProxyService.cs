@@ -150,9 +150,17 @@ public sealed class ControlProxyService
         }
 
         var sharedKey = HeaderValue(context.RequestHeaders, BuildKitMethods.MetadataKeys.SessionSharedKey);
-        var methods = context.RequestHeaders
-            .Where(h => string.Equals(h.Key, BuildKitMethods.MetadataKeys.SessionGrpcMethod, StringComparison.Ordinal))
-            .Select(h => h.Value);
+
+        // Not context.RequestHeaders (Grpc.Core.Metadata): Grpc.AspNetCore.Server builds it by
+        // StringValues.ToString()-ing the raw Kestrel header dictionary, which comma-joins every
+        // repeated line under one name into a single bogus entry before this ever sees it -- the same
+        // System.Net.Http/Grpc.AspNetCore.Server limitation cider-ger.16 found for SessionBridge's own
+        // outgoing dial, just on this call's *receiving* side instead (cider-ger.18): buildx sends one
+        // x-docker-expose-session-grpc-method line per method (session/session.go:108), and the raw
+        // ASP.NET Core HttpContext this call runs on preserves that multiplicity correctly where the
+        // Metadata view does not.
+        var methods = context.GetHttpContext().Request.Headers[BuildKitMethods.MetadataKeys.SessionGrpcMethod]
+            .OfType<string>();
 
         var stream = new ServerSessionStream(requestStream, responseStream);
         CliSession cli;

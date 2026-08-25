@@ -103,22 +103,45 @@ public static class GrpcForwarder
         try
         {
             using var request = BuildRequest(http, target);
-            // HttpMessageInvoker.SendAsync (unlike HttpClient.SendAsync) has no buffering
-            // HttpCompletionOption: it hands the request straight to the handler, which already
-            // returns as soon as response headers arrive.
-            using var response = await target.Invoker
-                .SendAsync(request, http.RequestAborted)
-                .ConfigureAwait(false);
 
-            http.Response.StatusCode = (int)response.StatusCode;
-            CopyResponseHeaders(http.Response, response);
-            http.Response.DeclareTrailer("grpc-status");
-            committed = true;
+            // See ForwardTarget.HeaderRewrite's doc comment: queued before SendAsync so the target's
+            // duplex stream can substitute the HEADERS frame SendAsync is about to write, then
+            // released the moment SendAsync returns (or throws) -- never held past that, so it only
+            // ever blocks whichever other forward on the same connection is also mid-SendAsync, not
+            // this one's body/response.
+            var headerScope = target.HeaderRewrite is not null
+                ? await target.HeaderRewrite(BuildLiteralFields(http, target), http.RequestAborted).ConfigureAwait(false)
+                : null;
+            HttpResponseMessage response;
+            try
+            {
+                // HttpMessageInvoker.SendAsync (unlike HttpClient.SendAsync) has no buffering
+                // HttpCompletionOption: it hands the request straight to the handler, which already
+                // returns as soon as response headers arrive.
+                response = await target.Invoker
+                    .SendAsync(request, http.RequestAborted)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                if (headerScope is not null)
+                {
+                    await headerScope.DisposeAsync().ConfigureAwait(false);
+                }
+            }
 
-            await CopyResponseBodyAsync(response.Content, http.Response.Body, http.RequestAborted).ConfigureAwait(false);
+            using (response)
+            {
+                http.Response.StatusCode = (int)response.StatusCode;
+                CopyResponseHeaders(http.Response, response);
+                http.Response.DeclareTrailer("grpc-status");
+                committed = true;
 
-            status = CopyTrailers(http.Response, response);
-            await http.Response.CompleteAsync().ConfigureAwait(false);
+                await CopyResponseBodyAsync(response.Content, http.Response.Body, http.RequestAborted).ConfigureAwait(false);
+
+                status = CopyTrailers(http.Response, response);
+                await http.Response.CompleteAsync().ConfigureAwait(false);
+            }
         }
         catch (Exception ex)
         {
@@ -158,6 +181,11 @@ public static class GrpcForwarder
                 continue;
             }
 
+            // A genuinely repeated header (e.g. FileSync/DiffCopy's followpaths) gets comma-joined
+            // into one wire line right here by System.Net.Http.Headers.HttpHeaders regardless of how
+            // it is added -- harmless for a target with ForwardTarget.HeaderRewrite set (its own
+            // literal-encoded substitute is what actually reaches the wire; see BuildLiteralFields and
+            // ForwardAsync), but the one real defect this causes for a target without it.
             request.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
         }
 
@@ -169,6 +197,53 @@ public static class GrpcForwarder
 
         request.Content = content;
         return request;
+    }
+
+    /// <summary>
+    /// The exact <c>(name, value)</c> pairs <see cref="BuildRequest"/>'s <see cref="HttpRequestMessage"/>
+    /// is meant to carry on the wire -- pseudo-headers first (RFC 7540 §8.1.2.1), in the order
+    /// <see cref="BuildRequest"/> itself would have implied, then every regular header with its
+    /// original multiplicity preserved exactly as <see cref="HttpContext.Request"/> received it, name
+    /// lower-cased (RFC 7540 §8.1.2: HTTP/2 field names MUST be lowercase -- ASP.NET Core's
+    /// <see cref="IHeaderDictionary"/> re-cases a header it recognizes, e.g. buildkitd's own lowercase
+    /// <c>te</c>/<c>user-agent</c> come back as <c>TE</c>/<c>User-Agent</c> here; <c>HttpRequestMessage.Headers</c>
+    /// normally lower-cases for the wire on its own, which is why <see cref="BuildRequest"/> never
+    /// needed this, but this method feeds a hand-rolled HPACK encoder that does not). Used only for a
+    /// <see cref="ForwardTarget.HeaderRewrite"/> substitution -- see its doc comment.
+    /// </summary>
+    private static List<(string Name, string Value)> BuildLiteralFields(HttpContext http, ForwardTarget target)
+    {
+        var fields = new List<(string Name, string Value)>
+        {
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":authority", target.Authority),
+            (":path", http.Request.Path.Value ?? string.Empty),
+        };
+
+        if (!string.IsNullOrEmpty(http.Request.ContentType))
+        {
+            fields.Add(("content-type", http.Request.ContentType));
+        }
+
+        foreach (var header in http.Request.Headers)
+        {
+            if (header.Key.StartsWith(':') || ExcludedRequestHeaders.Contains(header.Key))
+            {
+                continue;
+            }
+
+            var name = header.Key.ToLowerInvariant();
+            foreach (var value in header.Value)
+            {
+                if (value is not null)
+                {
+                    fields.Add((name, value));
+                }
+            }
+        }
+
+        return fields;
     }
 
     private static void CopyResponseHeaders(HttpResponse response, HttpResponseMessage upstream)

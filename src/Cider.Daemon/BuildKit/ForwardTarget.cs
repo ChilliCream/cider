@@ -44,6 +44,23 @@ public sealed class ForwardTarget
     public IUpstreamPacer? Pacer { get; init; }
 
     /// <summary>
+    /// When set, called with the exact <c>(name, value)</c> pairs -- pseudo-headers first, then every
+    /// regular header with its original multiplicity preserved -- that this forward's outgoing HEADERS
+    /// frame must carry, before <see cref="Invoker"/>'s <c>SendAsync</c> is invoked. Needed for any
+    /// target whose connection is shared across multiple forwarded calls (<see cref="CliSession"/>):
+    /// <c>System.Net.Http.Headers.HttpHeaders</c> silently comma-joins repeated values under one
+    /// header name into a single wire line no HPACK decoder on the receiving end re-splits (the same
+    /// <c>System.Net.Http</c> limitation <see cref="LiteralHeadersRewriteStream"/> exists for --
+    /// cider-ger.16 -- also breaks a genuinely repeated header this generic forwarder relays
+    /// byte-for-byte, e.g. <c>FileSync/DiffCopy</c>'s repeated <c>followpaths</c> entries, which
+    /// silently degrades the sender's local-dir walk to zero matches instead of erroring -- cider-ger.18).
+    /// The returned scope must be disposed once <c>SendAsync</c> returns (or throws) -- not held for
+    /// the whole forward -- so unrelated concurrent calls on the same connection are not serialized
+    /// behind it, only whichever one is currently writing its own HEADERS frame.
+    /// </summary>
+    public Func<IReadOnlyList<(string Name, string Value)>, CancellationToken, Task<IAsyncDisposable>>? HeaderRewrite { get; init; }
+
+    /// <summary>
     /// Invoked once per failed forward -- after the client-facing error response has been produced,
     /// or the response aborted if headers were already committed -- so the caller can react (e.g.
     /// T5 invalidating a stale builder link).
