@@ -175,10 +175,12 @@ public sealed class StateSynchronizer
         {
             try
             {
-                if (await _dnsForwarder.EnsureAsync(network, ct).ConfigureAwait(false) is null)
-                {
-                    report.Warnings.Add($"no DNS forwarder available for network {network}");
-                }
+                // A null result is not itself a warning here: it is also what a daemon with DNS
+                // turned off by configuration always returns (NullDnsForwarderService), and the real
+                // service already logs its own warning when it has one (no gateway yet, the DNS
+                // server never bound, …) — duplicating that here would be misleading noise on a
+                // daemon that has DNS disabled on purpose.
+                await _dnsForwarder.EnsureAsync(network, ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is RuntimeException or IOException)
             {
