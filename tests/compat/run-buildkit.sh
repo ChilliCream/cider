@@ -50,9 +50,23 @@ record() {
 # correct primitive is "kill the job after N seconds if it's still alive".
 run_with_timeout() {
   local secs="$1"; shift
+  # Run the command under job control so it gets its own process group
+  # (pgid == pid, since it's a single simple command), then drop job
+  # control again so the rest of the function behaves as before. This lets
+  # the watcher kill the *whole group* on timeout, not just the direct
+  # child -- a hung buildx/docker build can spawn its own subprocesses
+  # (e.g. the CLI's transfer/progress helpers) that would otherwise
+  # survive past `trap stop_daemon EXIT`.
+  set -m
   "$@" &
   local pid=$!
-  ( sleep "$secs" 2>/dev/null; kill -9 "$pid" 2>/dev/null ) &
+  set +m
+  (
+    sleep "$secs" 2>/dev/null
+    kill -9 -- "-$pid" 2>/dev/null   # whole process group
+    pkill -9 -P "$pid" 2>/dev/null  # fallback: any direct children
+    kill -9 "$pid" 2>/dev/null      # fallback: the process itself
+  ) &
   local watcher=$!
   local status=0
   wait "$pid" 2>/dev/null || status=$?
@@ -218,7 +232,7 @@ fi
 
 # ---------- 10. buildx inspect/du/prune, builder prune ----------
 inspect_out=$(docker buildx inspect default --bootstrap 2>&1)
-if grep -q "running" <<<"$inspect_out" && grep -q "linux/arm64" <<<"$inspect_out" &&
+if grep -q "Status: running" <<<"$inspect_out" && grep -q "linux/arm64" <<<"$inspect_out" &&
    docker buildx du >/dev/null 2>&1 &&
    docker buildx prune -f >/dev/null 2>&1 &&
    docker builder prune -f >/dev/null 2>&1; then

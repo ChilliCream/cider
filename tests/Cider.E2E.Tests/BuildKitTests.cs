@@ -337,7 +337,7 @@ public sealed class BuildKitTests(DaemonFixture daemon)
         Assert.True(inspect.Ok, inspect.ToString());
 
         var output = inspect.Stdout + inspect.Stderr;
-        Assert.Contains("running", output, StringComparison.Ordinal);
+        Assert.Contains("Status: running", output, StringComparison.Ordinal);
         Assert.Contains("linux/arm64", output, StringComparison.Ordinal);
     }
 
