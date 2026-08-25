@@ -55,3 +55,4 @@ nuget.config.user
 ## python bytecode from the compat harness
 __pycache__/
 *.pyc
+.nitro/
