@@ -10,8 +10,9 @@ Hot Chocolate and Strawberry Shake.
 
 **Status: early.** A large surface is proven end to end against the real Apple runtime — Docker CLI
 tier-1/2 commands, `docker compose`, published ports, container DNS, Testcontainers (Ryuk included),
-.NET Aspire, and classic (non-BuildKit) `docker build`. A number of Docker behaviours are not
-supported or are emulated, and **BuildKit is not one of the things that works**. Read
+.NET Aspire, and `docker build` through both BuildKit (the default builder) and the classic builder.
+A number of Docker behaviours are not supported or are emulated — BuildKit here is single-platform
+and cannot export to a cache or a registry (see [Limitations](#limitations)). Read
 [Limitations](#limitations) before you rely on this for anything real, especially before making
 Cider your default engine for a day or two.
 
@@ -175,7 +176,8 @@ Then it is just Docker:
 docker run --rm alpine:3.22 echo hello
 docker run -d --name web -p 8080:80 nginx:alpine && curl localhost:8080
 docker compose up -d && docker compose ps && docker compose down -v
-DOCKER_BUILDKIT=0 docker build -t myimage .        # BuildKit is not supported, see Limitations
+docker build -t myimage .                          # BuildKit, the default builder
+DOCKER_BUILDKIT=0 docker build -t myimage .         # classic builder, see Limitations
 ```
 
 Testcontainers and .NET Aspire need no configuration beyond `DOCKER_HOST` (or the context) pointing
@@ -212,6 +214,9 @@ you want to override a default. Environment variables win over the file, and exp
 | `containerCliPath` | `CIDER_CONTAINER_CLI` | `container` | Path to, or `PATH`-resolved name of, the Apple `container` CLI |
 | `portPublishing` | `CIDER_PORT_PUBLISHING` | `proxy` | `proxy` (the daemon binds host ports and forwards itself) or `apple` (hand `-p` to Apple `container`). Anything other than `apple` means `proxy` |
 | `logLevel` | `CIDER_LOG_LEVEL` | `Information` | The daemon's own log verbosity |
+| `builder.enabled` | `CIDER_BUILDKIT` | `true` | Whether the daemon offers BuildKit through Apple's builder VM at all. `false` (or `CIDER_BUILDKIT=0`/`=false`) makes `/grpc` and `/session` answer 404 and drops `Builder-Version` on `/_ping` to `1`, which is what makes buildx report the default builder unsupported — see [Building images](#building-images) |
+| `builder.cpus` | — | Apple's own default (2) | vCPUs passed as `-c` to `container builder start` |
+| `builder.memory` | — | Apple's own default (2 GiB) | Memory (bytes) passed as `-m` to `container builder start` |
 | `defaultCpus` | — | `2` | CPUs given to containers that do not request a specific amount |
 | `defaultMemoryBytes` | — | `2147483648` (2 GiB) | Memory given to containers that do not request a specific amount |
 | `dns.enabled` | — | `true` | Whether the built-in DNS server and the per-network forwarders run |
@@ -222,7 +227,9 @@ you want to override a default. Environment variables win over the file, and exp
 | `pollIntervalSeconds` | — | `3` | How often the state poller reconciles against `container ls` |
 | `logMaxBytes` | — | `67108864` (64 MiB) | Cap on one container's captured log file before it is truncated |
 
-<!-- every key, default and env var: src/Cider.Core/Configuration/CiderOptions.cs (properties at :39-98, env reads in Load() at :122-176) -->
+<!-- every key, default and env var: src/Cider.Core/Configuration/CiderOptions.cs (properties at
+     :39-122, builder.* config.json overlay in ApplyFile() at :342-355, env reads in Load() at
+     :157-185 incl. CIDER_BUILDKIT at :181-185) -->
 
 Not configurable: the daemon advertises Docker API version `1.47` (accepting clients down to `1.24`)
 and reports engine version `29.0.0`.
@@ -237,28 +244,57 @@ and reports engine version `29.0.0`.
 | `docker attach`, `docker cp`, `docker wait`, `docker export` | Works |
 | `docker pull` / `push` / `tag` / `images` / `rmi` / `save` / `load` | Works |
 | `docker commit` / `docker import` | Works, flattened to a single layer (see Limitations) |
+| `docker build` (BuildKit, default builder) | Works — see [Building images](#building-images) |
 | `docker build` (classic builder) | Works with `DOCKER_BUILDKIT=0` — see [Building images](#building-images) |
+| `docker buildx build` / `du` / `prune` / `inspect` / `bake` | Works against the default builder — see [Building images](#building-images) |
 | `docker network` / `docker volume` | Works; network attachment is fixed once a container has started (see Limitations) |
 | `docker events` | Works |
 | Published ports (`-p`) | Works — the daemon binds the host port and forwards TCP/UDP itself, see [Port publishing](#port-publishing) |
-| `docker compose up` / `down` / `logs` / `ps` | Works (compose picks the classic builder automatically) |
+| `docker compose up` / `down` / `logs` / `ps` | Works |
+| `docker compose build` | Works — BuildKit by default (same `Builder-Version` signal as `docker build`), classic with `DOCKER_BUILDKIT=0` |
 | Testcontainers (.NET) | Works, including the Ryuk reaper: the daemon relays a bind mount targeting `/var/run/docker.sock` to its own socket, and in the default `proxy` mode Ryuk's published port is reachable |
 | .NET Aspire | Works — Aspire 13.5.0 AppHost + DCP, exercised end to end with a two-resource fixture (redis and postgres) and a consumer round-tripping through both over published ports |
 | Container-name DNS, `host.docker.internal` | Works via a per-network CoreDNS forwarder — see [DNS](#container-name-dns) |
 
 ### Building images
 
-`/_ping` advertises `Builder-Version: 1`, which steers `docker compose build` and modern compose
-tooling to the classic (non-BuildKit) `/build` endpoint automatically. A plain `docker build` from a
-recent docker CLI defaults to BuildKit, which Cider does not speak, so force the classic builder:
+`/_ping` advertises `Builder-Version: 2` by default (`builder.enabled: true`), which steers
+`docker build`, `docker buildx build`/`bake` and `docker compose build` at the default builder —
+BuildKit, run inside Apple's own builder VM — with nothing to opt into:
+
+```bash
+docker build -t myimage .
+docker buildx build -t myimage .
+docker buildx bake
+docker compose build
+```
+
+`docker buildx du`, `docker buildx prune` and `docker buildx inspect` work against the default
+builder too, and `docker buildx create` custom builders are unaffected — Cider only intercepts the
+*default* builder's `/grpc` and `/session`. `--push` works the way it always has on the docker
+driver: BuildKit's exporter never pushes directly for it, buildx loads the image locally first and
+then pushes it with an ordinary, separate `docker push` — which the daemon already serves.
+
+Set `builder.enabled: false` (or `CIDER_BUILDKIT=0`) to turn BuildKit off instead: `/grpc` and
+`/session` then answer 404 and `Builder-Version` on `/_ping` drops to `1`, which is what makes
+buildx report the default builder "unsupported" and steers `docker compose build` back to the
+classic (non-BuildKit) `/build` endpoint on its own — force the classic builder explicitly for a
+plain `docker build`:
 
 ```bash
 DOCKER_BUILDKIT=0 docker build -t myimage .
 ```
 
-A build without `-t` behaves like Docker's: the image shows up as `<none>:<none>`, counts as
-dangling, and is removed by `docker image prune`. (Apple `container` insists on a repo name for every
-build, so the daemon mints a private one and hides it everywhere a client could see it.)
+A build without `-t` behaves like Docker's in either builder: the image shows up as `<none>:<none>`,
+counts as dangling, and is removed by `docker image prune`. (Apple `container` insists on a repo
+name for every build, so the daemon mints a private one and hides it everywhere a client could see
+it.)
+
+BuildKit here is single platform (`linux/arm64` only) and cannot export to a cache or a registry —
+see [Limitations](#limitations) — because the daemon does not speak to buildkitd's real exporters at
+all; every `moby`-typed exporter buildx sends is rewritten in place to a `docker` (tar) exporter,
+captured over a daemon-owned buildkit session instead of uploaded anywhere, and loaded the same way
+`docker load` loads a tar. See [How it works](#how-it-works) for the mechanism.
 
 ### Port publishing
 
@@ -335,7 +371,7 @@ turn it back off, and:
 
 | Limitation | Detail |
 |---|---|
-| **No BuildKit / buildx** | `/grpc` and `/session` return 404; use `DOCKER_BUILDKIT=0`. Dockerfile features that need BuildKit — cache mounts, secret mounts, heredocs — therefore do not build at all. A spike settled the route: reaching Apple's *own* builder VM is a **no-go**, because its BuildKit is only reachable over Apple's private, unversioned, Swift-only XPC protocol. The intended path is instead to run our own BuildKit container under Apple `container` with `--publish-socket` and point `docker buildx create --driver remote unix://<path>` at it. That primitive is verified to work on this runtime; the recipe is not built or shipped yet |
+| **BuildKit is single-platform and cannot export to a cache or a registry** | `builder.enabled` defaults to `true` and `docker build`/`buildx build`/`bake`/`compose build` all reach BuildKit through `/grpc` + `/session` (see [Building images](#building-images)) — but only `linux/arm64`: a multi-platform `--platform` request fails at Solve time because the docker (tar) exporter every build is rewritten to cannot produce a manifest list. `--cache-to`/`--cache-from` are not supported (no cache export), and `--output type=docker,dest=<path>`/`type=oci` are rejected — buildx refuses both for the docker driver without a containerd snapshotter, and Apple's worker is made to look like it has none on purpose (see [How it works](#how-it-works)) so buildx does not enable exporters this proxy cannot serve. The build cache lives inside Apple's *own* builder VM, not on the host, and is wiped by `container builder delete`. Set `builder.enabled: false` (or `CIDER_BUILDKIT=0`) to turn BuildKit off entirely and force the classic builder with `DOCKER_BUILDKIT=0` |
 | No pause/unpause | `POST /containers/{id}/pause` and `/unpause` return 501 — Apple `container` has no equivalent |
 | No `--privileged` | Mapped to `--cap-add ALL --masked-path NONE --read-only-path NONE`, which is not a true privileged mode; Docker-in-Docker and some device access will not behave |
 | No `--network host` / `none` / `container:*` | Rejected with 400. A compose service using `network_mode: host` does not come up |
@@ -390,9 +426,45 @@ Both exist because Apple's own forwarder is refused by macOS Local Network priva
 and because host port 53 is already taken once Apple's network stack is up.
 
 Docker's two "hijacked" endpoints (`POST /exec/{id}/start`, which always carries a body Kestrel
-refuses to upgrade, and `POST /containers/{id}/attach`) are intercepted at the connection level
-before Kestrel's HTTP layer sees them, so the daemon can hold the raw stream open for the lifetime of
-the process instead of tearing it down the moment a client half-closes its write side.
+refuses to upgrade, and `POST /containers/{id}/attach`) — and BuildKit's two, `POST /grpc` and
+`POST /session` — are intercepted at the connection level before Kestrel's HTTP layer sees them, so
+the daemon can hold the raw stream open for the lifetime of the process instead of tearing it down
+the moment a client half-closes its write side. A request that actually carries the `h2c` upgrade
+still gets hijacked when `builder.enabled` is `false`, and is answered the same `404` a disabled
+BuildKit gives everywhere else; a plain (non-upgrade) POST to `/grpc` or `/session` is never
+recognized as a hijack at all, so it falls through to the ordinary Kestrel route instead, which
+answers a `400` diagnostic when BuildKit is enabled and the same `404` when it isn't.
+
+BuildKit's own two endpoints are hijacked the same way, but each becomes a different role once
+upgraded. `POST /grpc` is BuildKit's control-plane connection: buildx dials it, the daemon answers
+the `101` and hands the raw connection to Kestrel's own HTTP/2 engine as a *server* over an in-process
+tunnel, where `ControlProxyService` answers three RPCs itself — `Solve`, `ListWorkers`, `Session` —
+and forwards everything else (`Status`, `Info`, `DiskUsage`, `Prune`, build history, `LLBBridge`,
+`Content`, trace export — what `buildx du`/`prune`/`inspect` and BuildKit's own frontend rely on)
+untouched to buildkitd. `POST /session` runs the opposite direction — BuildKit is the gRPC *server*
+there — so the daemon dials out over that same connection instead and parks it in a session registry
+that a later `Solve` looks its session id up in (`bake` shares one session across its whole matrix of
+targets rather than opening one per target).
+
+Every call actually reaching buildkitd goes over one long-lived link the daemon keeps open into
+Apple's builder VM: `container exec -i buildkit buildctl dial-stdio`, with a gRPC channel run over
+that exec's own stdio, paced by a token bucket on what the daemon sends and watched by a stall
+detector — a call that stops making progress restarts the builder (`container builder start`) before
+the next dial, clearing a wedged exec the same way a hung one has to be cleared by hand (see
+[Troubleshooting](#troubleshooting)). The `buildkit` container this drives is started on demand and
+hidden from `docker ps`/`inspect` the same way the DNS forwarders are.
+
+`Solve` gets one rewrite before it reaches buildkitd: buildx's docker driver always asks for a
+`moby`-typed exporter, which stock buildkitd does not implement, so the daemon turns every one into
+a `docker` exporter (a tar) in place and arms a daemon-owned buildkit session
+(`SessionBridge`/`FileSendCapture`) to capture that export's `FileSend`/`DiffCopy` traffic by
+exporter id, rather than letting it go anywhere. Once the real Solve returns, the captured tar is
+handed to the same load path `docker load` and the `docker commit` export use, tagged with whatever
+name(s) the caller asked for (or a private synthetic tag for an untagged build, exactly like the
+classic builder), and a `build` event is published — and `ListWorkers` responses have
+`org.mobyproject.buildkit.worker.snapshotter` stripped from every worker record (that label is what
+tells buildx cache export, multi-platform and attestations might work, none of which do here) before
+they reach buildx.
 
 State (container, network and volume records) is persisted as JSON under `~/.cider/state`; captured
 container logs live under `~/.cider/logs`; the daemon's own launchd log is `~/.cider/daemon.log`.
@@ -402,7 +474,7 @@ container logs live under `~/.cider/logs`; the daemon's own launchd log is `~/.c
 | `src/Cider.Core` | Docker wire DTOs, the `IContainerRuntime` abstraction, state stores, managers (container/exec/image/network/volume/system), events, logs, health, restart supervision — no ASP.NET dependency |
 | `src/Cider.AppleContainer` | The `IContainerRuntime` implementation that drives the `container` CLI: process launching, pty handling, JSON parsing, error mapping |
 | `src/Cider.Dns` | Standalone DNS server (UDP + TCP), message codec, resolver interface — no dependency on Core |
-| `src/Cider.Daemon` | The `cider` executable: Kestrel hosting, the hijack interceptor, Docker API routes, and the `serve`/`install`/`uninstall`/`status`/`sync` verbs |
+| `src/Cider.Daemon` | The `cider` executable: Kestrel hosting, the hijack interceptor, Docker API routes, the BuildKit control proxy (`src/Cider.Daemon/BuildKit`), and the `serve`/`install`/`uninstall`/`status`/`sync` verbs |
 
 ## Troubleshooting
 
@@ -467,6 +539,26 @@ Ryuk to hit its 60 s init budget and throw. Re-run `cider install`.
 grep -A1 ProcessType ~/Library/LaunchAgents/com.chillicream.cider.daemon.plist
 ```
 
+### The builder VM won't start, or a build hangs
+
+`container builder status` shows whether Apple's builder VM (`buildkit`) exists and is running; the
+daemon runs `container builder start` itself whenever a build needs it and the VM isn't already up,
+so a manual `container builder start` is mostly for diagnosing why that failed. A build that hangs
+after an earlier one stalled is usually a wedged `container exec` into that VM: the daemon detects a
+call that stops making progress and restarts the builder itself before the next build (see
+[How it works](#how-it-works)), so this is normally self-healing. A `builder.cpus`/`builder.memory`
+change (see [Configuration](#configuration)) only takes effect the next time the VM starts from
+stopped — `container builder start` on an already-running VM is a no-op, so apply a resize with
+`container builder stop` (Apple's own CLI) and let the next build start it again.
+
+Custom builders created while experimenting with BuildKit before the default builder worked can be
+left behind as `buildx_buildkit_*` containers on the host's own container runtime (`docker buildx ls`
+shows them); they are unrelated to Cider's `buildkit` VM and are removed the ordinary way:
+
+```bash
+docker buildx rm <name>
+```
+
 ## Testing
 
 ```bash
@@ -474,8 +566,8 @@ dotnet test Cider.sln
 ```
 
 Unit and integration tests against a fake in-memory container runtime, plus — when the real `docker`
-CLI is on `PATH` — an in-process daemon over a temp socket: **766 passing and 3 skipped** in
-`Cider.Tests` (the 3 need the opt-in below) and **16** in `Cider.Dns.Tests`, on both target
+CLI is on `PATH` — an in-process daemon over a temp socket: **1058 passing and 12 skipped** in
+`Cider.Tests` (the 12 need the opt-in below) and **16** in `Cider.Dns.Tests`, on both target
 frameworks.
 
 Tests against the real Apple `container` runtime are opt-in and slower:

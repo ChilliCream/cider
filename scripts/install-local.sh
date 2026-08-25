@@ -15,6 +15,10 @@
 #   5. Verify: socket answers, `cider status`, a real `docker run` through the cider context, and
 #      -- unless --no-default-socket -- a plain `docker run` with no DOCKER_CONTEXT set.
 #
+# BuildKit (the default builder) works out of the box after step 3 -- `docker build`, `docker buildx
+# build` and `docker compose build` all reach it through /grpc + /session, no extra flag needed; set
+# builder.enabled: false in config.json (or CIDER_BUILDKIT=0) to fall back to the classic builder.
+#
 # Re-running is idempotent: it republishes over the same binary, `cider install` re-bootstraps the
 # existing launchd agent, and stage 4 is a no-op once /var/run/docker.sock already points at us.
 #
