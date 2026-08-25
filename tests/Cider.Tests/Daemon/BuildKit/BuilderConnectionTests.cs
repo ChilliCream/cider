@@ -347,6 +347,8 @@ public sealed class BuilderConnectionTests : IAsyncLifetime
 
         public Task StopContainerAsync(string runtimeId, int? timeoutSeconds, string? signal, CancellationToken ct) => throw new NotSupportedException();
 
+        public Task<(int ExitCode, DateTimeOffset ExitedAt)?> WaitContainerAsync(string runtimeId, CancellationToken ct) => Task.FromResult<(int ExitCode, DateTimeOffset ExitedAt)?>(null);
+
         public Task KillContainerAsync(string runtimeId, string signal, CancellationToken ct) => throw new NotSupportedException();
 
         public Task RemoveContainerAsync(string runtimeId, bool force, CancellationToken ct) => throw new NotSupportedException();
