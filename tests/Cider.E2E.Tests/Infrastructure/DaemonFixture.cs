@@ -58,6 +58,14 @@ public class DaemonFixture : IAsyncLifetime
     /// <summary>Overridable so the daemon-restart test can rebuild a daemon on the same data dir.</summary>
     protected virtual string InstanceSuffix => "";
 
+    /// <summary>
+    /// The state poller's interval, in seconds. Overridable so a test that specifically wants to
+    /// exercise <c>POST /_cider/sync</c> (rather than the separate automatic poller-drop behaviour —
+    /// see <see cref="Cider.Daemon.Routes.CiderRoutes"/>) can push it out far enough that the poller
+    /// never races the assertion.
+    /// </summary>
+    protected virtual int PollIntervalOverride => 2;
+
     /// <inheritdoc />
     public async Task InitializeAsync()
     {
@@ -73,7 +81,7 @@ public class DaemonFixture : IAsyncLifetime
             DataDir = $"/tmp/cider-e2e-{id}",
             SocketPath = $"/tmp/cider-e2e-{id}.sock",
             LogLevel = Environment.GetEnvironmentVariable("CIDER_E2E_LOGLEVEL") ?? "Information",
-            PollIntervalSeconds = 2,
+            PollIntervalSeconds = PollIntervalOverride,
             DnsEnabled = true,
 
             // `proxy` by default, like the real daemon; CIDER_PORT_PUBLISHING=apple runs the
