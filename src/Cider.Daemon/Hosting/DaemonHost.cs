@@ -14,6 +14,8 @@ using Cider.Daemon.Dns;
 using Cider.Daemon.Routes;
 using Cider.Daemon.Tunnel;
 using Cider.Dns;
+using Grpc.Health.V1;
+using Grpc.HealthCheck;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -67,6 +69,15 @@ public static class DaemonHost
         app.MapNetworkRoutes();
         app.MapVolumeRoutes();
         app.MapStubRoutes();
+
+        // The session leg of the BuildKit tunnel (cider-ger.9): the standard gRPC health check
+        // buildkitd polls every 5 s, then a fallback that hands FileSend/DiffCopy captures to
+        // SessionBridge and forwards everything else the CLI actually advertised
+        // (SessionBridge.SelectForwardTarget). No route is mapped yet for the control-plane leg
+        // (/grpc) -- that is cider-ger.10 (Solve rewrite, shared-session bridging, pass-through).
+        app.MapGrpcService<HealthServiceImpl>().RequireTunnel(TunnelKind.Session);
+        var sessionBridge = app.Services.GetRequiredService<SessionBridge>();
+        app.MapGrpcForwarder(TunnelKind.Session, http => sessionBridge.SelectForwardTarget(http));
 
         return app;
     }
@@ -212,6 +223,20 @@ public static class DaemonHost
             sp.GetRequiredService<IContainerRuntime>(),
             options,
             sp.GetRequiredService<ILogger<BuilderConnection>>()));
+
+        // The daemon's own Control/Session bridge into buildkitd (see SessionBridge), one per
+        // CliSession, dialed lazily the first time something attaches.
+        services.AddSingleton<SessionBridge>();
+
+        // Answers grpc.health.v1.Health/Check on the session tunnel (see BuildKitMethods.Health) --
+        // buildkitd polls this every 5 s while a session is attached. "" (the default service name)
+        // is marked Serving unconditionally: this proxy has no finer-grained health signal to report.
+        services.AddSingleton(_ =>
+        {
+            var health = new HealthServiceImpl();
+            health.SetStatus(string.Empty, HealthCheckResponse.Types.ServingStatus.Serving);
+            return health;
+        });
 
         services.AddGrpc(grpc =>
         {

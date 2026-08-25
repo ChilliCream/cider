@@ -9,11 +9,10 @@ using Cider.Daemon.Hosting;
 using Cider.Daemon.Tunnel;
 using Cider.Tests.Fakes;
 using Grpc.Core;
-using Grpc.Health.V1;
-using Grpc.HealthCheck;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Moby.Buildkit.V1;
 using Xunit;
 
 namespace Cider.Tests.Daemon.Tunnel;
@@ -44,9 +43,6 @@ public sealed class TunnelTransportTests : IAsyncLifetime
         };
         _options.EnsureDirectories();
 
-        var health = new HealthServiceImpl();
-        health.SetStatus(string.Empty, HealthCheckResponse.Types.ServingStatus.Serving);
-
         var settings = new DaemonHostSettings
         {
             DnsEnabled = false,
@@ -57,15 +53,16 @@ public sealed class TunnelTransportTests : IAsyncLifetime
                 services.AddSingleton<IRecordStore<NetworkRecord>>(new InMemoryRecordStore<NetworkRecord>());
                 services.AddSingleton<IRecordStore<VolumeRecord>>(new InMemoryRecordStore<VolumeRecord>());
                 services.AddSingleton<IDnsForwarderService>(NullDnsForwarderService.Instance);
-                services.AddSingleton(health);
             },
         };
 
         _app = DaemonHost.Create(_options, settings);
 
-        // The one gRPC service this suite maps: gated to the Control leg only, exactly like a real
-        // BuildKit service will be (T6/T7/T8) — a Session-kind tunnel must see it as unimplemented.
-        _app.MapGrpcService<HealthServiceImpl>().RequireTunnel(TunnelKind.Control);
+        // A marker gRPC service this suite maps itself, gated to the Control leg only, purely to
+        // prove RequireTunnel gates a mapped service correctly — a Session-kind tunnel must see it
+        // as unimplemented. Not Grpc.HealthCheck.HealthServiceImpl: DaemonHost.Create (cider-ger.9)
+        // now maps that one for real, on the Session leg, so mapping it again here would collide.
+        _app.MapGrpcService<TunnelGateMarkerService>().RequireTunnel(TunnelKind.Control);
 
         // Proves ErrorMiddleware really steps aside for tunnel requests (fix direction step 6):
         // this endpoint's exception must reach the client as whatever Kestrel does by default, never
@@ -115,10 +112,10 @@ public sealed class TunnelTransportTests : IAsyncLifetime
         var (channel, invoker, handler) = StreamHttp2Client.Create(client, "cider-tunnel");
         try
         {
-            var health = new Health.HealthClient(channel);
-            var response = await health.CheckAsync(new HealthCheckRequest(), deadline: DateTime.UtcNow.AddSeconds(10));
+            var control = new Control.ControlClient(channel);
+            var response = await control.InfoAsync(new InfoRequest(), deadline: DateTime.UtcNow.AddSeconds(10));
 
-            Assert.Equal(HealthCheckResponse.Types.ServingStatus.Serving, response.Status);
+            Assert.NotNull(response);
         }
         finally
         {
@@ -140,9 +137,9 @@ public sealed class TunnelTransportTests : IAsyncLifetime
         var (channel, invoker, handler) = StreamHttp2Client.Create(client, "cider-tunnel");
         try
         {
-            var health = new Health.HealthClient(channel);
+            var control = new Control.ControlClient(channel);
             var ex = await Assert.ThrowsAsync<RpcException>(() =>
-                health.CheckAsync(new HealthCheckRequest(), deadline: DateTime.UtcNow.AddSeconds(10)).ResponseAsync);
+                control.InfoAsync(new InfoRequest(), deadline: DateTime.UtcNow.AddSeconds(10)).ResponseAsync);
 
             Assert.Equal(StatusCode.Unimplemented, ex.StatusCode);
         }
@@ -220,5 +217,18 @@ public sealed class TunnelTransportTests : IAsyncLifetime
         var completed = await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(10)));
         Assert.Same(task, completed);
         await task;
+    }
+
+    /// <summary>
+    /// A trivial <see cref="Control.ControlBase"/> override, mapped only to answer <c>Info</c> --
+    /// this suite's own stand-in for "some gRPC service gated to one tunnel leg", picked because it
+    /// is already vendored and, unlike <c>Grpc.HealthCheck.HealthServiceImpl</c>, is not something
+    /// <see cref="DaemonHost.Create"/> itself maps (which would collide with this suite's own
+    /// mapping of the same service).
+    /// </summary>
+    private sealed class TunnelGateMarkerService : Control.ControlBase
+    {
+        public override Task<InfoResponse> Info(InfoRequest request, ServerCallContext context) =>
+            Task.FromResult(new InfoResponse());
     }
 }
