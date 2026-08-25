@@ -21,6 +21,10 @@ public sealed class ContainerManagerCreateTests
     [InlineData(null, "echo|hi", "echo|hi")]
     [InlineData("/init", null, "/init")]
     [InlineData("/init", "echo|hi", "/init|echo|hi")]
+    // Docker.DotNet/Testcontainers send Entrypoint:[] and Cmd:[] rather than omitting the fields
+    // (the ryuk container's own create request has this exact shape) — an empty request Cmd must
+    // inherit the image's Cmd exactly like a null one does, or the merged argv is empty.
+    [InlineData("", "", "/bin/sh")]
     public async Task Entrypoint_and_cmd_merge_for_an_image_without_an_entrypoint(string? entrypoint, string? cmd, string expected)
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

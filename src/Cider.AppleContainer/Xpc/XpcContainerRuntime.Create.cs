@@ -31,6 +31,20 @@ internal sealed partial class XpcContainerRuntime
     {
         ArgumentNullException.ThrowIfNull(spec);
 
+        // Every ContainerManager-merged spec sets Entrypoint = argv[0] (ContainerManager.Spec.cs,
+        // Create.cs's own entrypoint/cmd merge): a null/empty Entrypoint here provably means the
+        // caller is relying on the image's own entrypoint/cmd — something only the CLI can resolve,
+        // since the apiserver never reads an image config (§6) and ContainerConfigurationBuilder's
+        // SplitCommand would otherwise silently mis-split (Args[0] becomes the executable) or throw.
+        // Fall back before doing any of the client-side precondition work below (task fix direction
+        // §1).
+        if (string.IsNullOrEmpty(spec.Entrypoint))
+        {
+            WarnFallback("containerCreate", "spec has no merged entrypoint; relying on the image's own entrypoint/cmd, which only the CLI can resolve");
+            await _cliFallback.CreateContainerAsync(spec, ct).ConfigureAwait(false);
+            return;
+        }
+
         try
         {
             var targetPlatform = ContainerConfigurationBuilder.ResolveTargetPlatform(spec.Platform);
@@ -39,9 +53,10 @@ internal sealed partial class XpcContainerRuntime
             var kernel = await _kernelCache.GetAsync(ct).ConfigureAwait(false);
             var initImage = await _initImageResolver.ResolveAsync(ct).ConfigureAwait(false);
             var volumes = await ResolveVolumesAsync(spec, ct).ConfigureAwait(false);
+            var dnsDomain = await _dnsDomainResolver.ResolveAsync(ct).ConfigureAwait(false);
 
             var config = ContainerConfigurationBuilder.Build(
-                spec, image, new ContainerConfigurationBuilder.BuildContext(volumes, DnsDomain: null));
+                spec, image, new ContainerConfigurationBuilder.BuildContext(volumes, dnsDomain));
 
             using var request = new XpcMessage("containerCreate");
             request.SetData("containerConfig", XpcJson.SerializeToUtf8Bytes(config));
@@ -95,11 +110,18 @@ internal sealed partial class XpcContainerRuntime
     /// <summary>
     /// <c>containerStop{id, stopOptions:{timeoutInSeconds, signal}}</c> (§8.7) —
     /// <c>stopOptions</c> is mandatory (§8.11 gotcha 7); <paramref name="timeoutSeconds"/> defaults to
-    /// 10 when unset (Docker's own default, task fix direction §4); <paramref name="signal"/> is
-    /// normalized to <c>SIGxxx</c> when given, left <c>null</c> when not so the daemon applies its own
-    /// fallback chain (<c>configuration.stopSignal</c>, then <c>SIGTERM</c> — §2.2). No client-side
-    /// timeout (§1.4): a slow graceful stop must not be torn down by us mid-grace-period, matching the
-    /// CLI transport's own generous stop budget.
+    /// 10 when unset (Docker's own default, task fix direction §4). Doc decision (task fix direction
+    /// §6, stop-timeout parity): <c>AppleContainerRuntime.StopContainerAsync</c> (the CLI transport)
+    /// omits <c>-t</c> entirely when <paramref name="timeoutSeconds"/> is <c>null</c>, letting the CLI
+    /// apply whatever default it has; this XPC path always sends <c>10</c> instead, since
+    /// <c>stopOptions.timeoutInSeconds</c> is not itself optional on the wire (§8.11 gotcha 7) — there
+    /// is no "omit" to fall back to. The two transports agree in practice (10 is also the CLI's own
+    /// default) but that agreement is coincidental, not enforced; this divergence is deliberate and
+    /// accepted, not a bug to fix later. <paramref name="signal"/> is normalized to <c>SIGxxx</c> when
+    /// given, left <c>null</c> when not so the daemon applies its own fallback chain
+    /// (<c>configuration.stopSignal</c>, then <c>SIGTERM</c> — §2.2). No client-side timeout (§1.4): a
+    /// slow graceful stop must not be torn down by us mid-grace-period, matching the CLI transport's
+    /// own generous stop budget.
     /// </summary>
     public Task StopContainerAsync(string runtimeId, int? timeoutSeconds, string? signal, CancellationToken ct) => GuardAsync(async () =>
     {

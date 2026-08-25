@@ -16,15 +16,25 @@ internal sealed class ImageSnapshotEnsurer(ImagesServiceClient images)
 {
     /// <summary>
     /// <c>imageList</c> → match <paramref name="reference"/> → <c>snapshotGet</c>; on <c>notFound</c>
-    /// → <c>imageUnpack</c> then <c>snapshotGet</c> again (§3.2 item 3, §6). Throws
-    /// <see cref="RuntimeException"/> <see cref="RuntimeErrorKind.NotFound"/> when
-    /// <paramref name="reference"/> is not in <c>imageList</c> at all — this ensurer never pulls.
+    /// → <c>imageUnpack</c> then <c>snapshotGet</c> again (§3.2 item 3, §6). By the time this runs,
+    /// <c>ContainerManager.CreateAsync</c> has already ensured the image exists (via
+    /// <c>ImageManager.EnsureImageAsync</c>, before ever building a <see cref="ContainerSpec"/>), so a
+    /// failure to find <paramref name="reference"/> in <c>imageList</c> here is not "the image does
+    /// not exist" but a reference-normalization mismatch between cider's own resolution and
+    /// <see cref="Match"/>'s. Throws <see cref="RuntimeException"/>
+    /// <see cref="RuntimeErrorKind.Unavailable"/> in that case — the same classification
+    /// <see cref="InitImageResolver"/> uses for its own "can't resolve this over XPC" case
+    /// (task fix direction §5) — so <see cref="XpcContainerRuntime.CreateContainerAsync"/> falls back
+    /// to the CLI runtime, whose own image resolution degrades gracefully, instead of surfacing a
+    /// client-visible 404 for an image that plainly does exist.
     /// </summary>
     public async Task<ImageDescription> EnsureAsync(string reference, Platform platform, CancellationToken ct)
     {
         var descriptions = await images.ImageListAsync(ct).ConfigureAwait(false);
         var match = Match(descriptions, reference)
-            ?? throw RuntimeException.NotFound($"cider: image '{reference}' is not present locally");
+            ?? throw RuntimeException.Unavailable(
+                $"cider: image '{reference}' was not found in the apiserver's imageList (reference-normalization " +
+                "mismatch); falling back to the CLI");
 
         try
         {

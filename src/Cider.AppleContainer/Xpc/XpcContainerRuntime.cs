@@ -58,6 +58,10 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     /// <summary>Resolves + unpacks the vminit init image, once, cached — see <see cref="InitImageResolver"/>.</summary>
     private readonly InitImageResolver _initImageResolver;
 
+    /// <summary>Resolves <c>containerSystemConfig.dns.domain</c> for the attachment FQDN rule, once,
+    /// cached — see <see cref="SystemDnsDomainResolver"/>.</summary>
+    private readonly SystemDnsDomainResolver _dnsDomainResolver;
+
     /// <summary>Last time a fallback warning was logged for a given route, keyed by XPC route name —
     /// backs the "once per minute" throttle in <see cref="WarnFallback"/>.</summary>
     private readonly ConcurrentDictionary<string, DateTimeOffset> _lastFallbackWarnAt = new(StringComparer.Ordinal);
@@ -96,6 +100,7 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         _kernelCache = new KernelCache(apiserver);
         _imageSnapshotEnsurer = new ImageSnapshotEnsurer(_imagesClient);
         _initImageResolver = new InitImageResolver(options, _imagesClient, logger);
+        _dnsDomainResolver = new SystemDnsDomainResolver(options, logger);
     }
 
     // ---- system -------------------------------------------------------------------------------

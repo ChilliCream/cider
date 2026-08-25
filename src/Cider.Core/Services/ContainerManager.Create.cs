@@ -81,6 +81,11 @@ public sealed partial class ContainerManager
             // ---- entrypoint / cmd -------------------------------------------------------------
             // Docker distinguishes a missing Entrypoint (inherit the image's) from an explicitly
             // empty one (clear the image's), so the null check has to come before the count check.
+            // Cmd is different: dockerd inherits the image's Cmd whenever the request's Cmd is empty
+            // (Docker.DotNet/Testcontainers send `Cmd: []` rather than omitting the field — an empty
+            // array is not "explicitly cleared" the way an empty Entrypoint is); only a non-empty
+            // request Entrypoint suppresses that inheritance, since Entrypoint+Cmd are meant to be
+            // read together.
             List<string> entrypoint;
             List<string> cmd;
             if (request.Entrypoint is { Count: > 0 })
@@ -91,12 +96,12 @@ public sealed partial class ContainerManager
             else if (request.Entrypoint is { Count: 0 })
             {
                 entrypoint = [];
-                cmd = request.Cmd is null ? [.. imageConfig.Cmd] : [.. request.Cmd];
+                cmd = request.Cmd is { Count: > 0 } ? [.. request.Cmd] : [.. imageConfig.Cmd];
             }
             else
             {
                 entrypoint = [.. imageConfig.Entrypoint];
-                cmd = request.Cmd is null ? [.. imageConfig.Cmd] : [.. request.Cmd];
+                cmd = request.Cmd is { Count: > 0 } ? [.. request.Cmd] : [.. imageConfig.Cmd];
             }
 
             var argv = new List<string>(entrypoint);
@@ -107,7 +112,8 @@ public sealed partial class ContainerManager
             var workingDir = !string.IsNullOrEmpty(request.WorkingDir) ? request.WorkingDir : imageConfig.WorkingDir ?? "";
             var user = !string.IsNullOrEmpty(request.User) ? request.User : imageConfig.User ?? "";
             var stopSignal = !string.IsNullOrEmpty(request.StopSignal) ? request.StopSignal : imageConfig.StopSignal;
-            var hostname = !string.IsNullOrEmpty(request.Hostname) ? request.Hostname : DockerId.Short(id);
+            var explicitHostname = !string.IsNullOrEmpty(request.Hostname);
+            var hostname = explicitHostname ? request.Hostname! : DockerId.Short(id);
 
             var labels = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var (key, value) in imageConfig.Labels)
@@ -202,7 +208,13 @@ public sealed partial class ContainerManager
                 Init = hostConfig.Init ?? false,
                 Ulimits = [.. (hostConfig.Ulimits ?? []).Select(u => new UlimitSpec { Name = u.Name, Soft = u.Soft, Hard = u.Hard })],
                 Tmpfs = tmpfsSpecs,
-                Hostname = hostname,
+                // Null (not the resolved default) when the client sent no hostname, so the XPC
+                // transport's attachment FQDN rule (ContainerConfigurationBuilder.BuildNetworks) can
+                // tell "explicit --hostname" apart from "no hostname sent" — `hostname` itself (the
+                // resolved default) is still what gets written back into the stored request below and
+                // what BuildEndpoints uses, so record.Request.Hostname-based DNS registration
+                // (ContainerManager.Reconcile.cs) is unchanged.
+                Hostname = explicitHostname ? hostname : null,
                 Sysctls = hostConfig.Sysctls ?? new Dictionary<string, string>(),
                 StopSignal = stopSignal,
             };

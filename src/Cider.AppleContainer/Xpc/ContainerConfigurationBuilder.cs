@@ -75,9 +75,11 @@ internal static class ContainerConfigurationBuilder
     /// mount's on-disk configuration (keyed by volume name — resolved via <c>volumeInspect</c> by
     /// <see cref="XpcContainerRuntime.CreateContainerAsync"/> before calling <see cref="Build"/>, so
     /// this type never has to make an XPC call of its own), and the system DNS domain used only for
-    /// the attachment FQDN rule (§3.4) — always <c>null</c> for now (no route reads
-    /// <c>containerSystemConfig.dns.domain</c>; out of this task's verification scope, which does not
-    /// test FQDN naming — see <see cref="BuildNetworks"/>'s own doc comment).</summary>
+    /// the attachment FQDN rule (§3.4) — <see cref="SystemDnsDomainResolver"/> reads
+    /// <c>containerSystemConfig.dns.domain</c> (config.toml, else <c>container system property list</c>,
+    /// cached) the same way <see cref="InitImageResolver"/> reads the vminit reference; still
+    /// <c>null</c> whenever no domain is configured, which is the common case (confirmed live:
+    /// <c>"dns":{}</c>) — see <see cref="BuildNetworks"/>'s own doc comment.</summary>
     public readonly record struct BuildContext(IReadOnlyDictionary<string, VolumeConfiguration> Volumes, string? DnsDomain)
     {
         public static BuildContext Empty { get; } = new(new Dictionary<string, VolumeConfiguration>(), null);
@@ -348,10 +350,14 @@ internal static class ContainerConfigurationBuilder
     /// docs/spikes/xpc/02-apiserver-xpc-protocol.md §3.4: first attachment gets
     /// <c>"&lt;id&gt;.&lt;dnsDomain&gt;."</c>, or <c>"&lt;id&gt;."</c> when the id itself already
     /// contains a dot, or the bare id when there is no domain; every other attachment gets the bare
-    /// id). <paramref name="dnsDomain"/> is always <c>null</c> today (see <see cref="BuildContext"/>'s
-    /// doc comment) — this task's verification section never exercises FQDN naming, only the explicit
-    /// <c>--hostname</c> override, so every attachment's default (no explicit hostname) is simply the
-    /// bare container id, which is exactly what the CLI transport already produced before this task.
+    /// id). <paramref name="dnsDomain"/> comes from <see cref="SystemDnsDomainResolver"/> (see
+    /// <see cref="BuildContext"/>'s doc comment) — <c>null</c> on the common install with no domain
+    /// configured, in which case every attachment's default (no explicit hostname) is simply the bare
+    /// container id, exactly what the CLI transport already produced before this task.
+    /// <see cref="ContainerSpec.Hostname"/> is <c>null</c> (not the resolved default) whenever the
+    /// Docker client sent no <c>--hostname</c> — <c>ContainerManager.CreateAsync</c> keeps that
+    /// distinction explicit precisely so this FQDN rule can apply — so "set" here really means
+    /// "explicitly set", not "resolved to something".
     /// </summary>
     private static List<AttachmentConfiguration> BuildNetworks(ContainerSpec spec, string? dnsDomain)
     {

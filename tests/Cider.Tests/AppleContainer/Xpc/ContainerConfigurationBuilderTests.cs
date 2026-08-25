@@ -267,6 +267,59 @@ public class ContainerConfigurationBuilderTests
         Assert.All(config.Networks, n => Assert.Equal("db", n.Options.Hostname));
     }
 
+    // ---- attachment FQDN rule (§3.4): no explicit --hostname, dns.domain plumbed through --------
+
+    [Fact]
+    public void Build_applies_the_fqdn_rule_to_only_the_first_attachment_when_no_hostname_is_set()
+    {
+        var spec = PlainSpec() with { Hostname = null, Networks = ["default", "extra"] };
+        var context = new ContainerConfigurationBuilder.BuildContext(
+            new Dictionary<string, VolumeConfiguration>(), DnsDomain: "test");
+
+        var config = ContainerConfigurationBuilder.Build(spec, Image, context);
+
+        Assert.Equal(2, config.Networks.Count);
+        Assert.Equal("myapp.test.", config.Networks[0].Options.Hostname);
+        Assert.Equal("myapp", config.Networks[1].Options.Hostname);
+    }
+
+    [Fact]
+    public void Build_fqdn_rule_uses_the_bare_dotted_id_when_the_id_already_contains_a_dot()
+    {
+        var spec = PlainSpec("my.app") with { Hostname = null };
+        var context = new ContainerConfigurationBuilder.BuildContext(
+            new Dictionary<string, VolumeConfiguration>(), DnsDomain: "test");
+
+        var config = ContainerConfigurationBuilder.Build(spec, Image, context);
+
+        var attachment = Assert.Single(config.Networks);
+        Assert.Equal("my.app.", attachment.Options.Hostname);
+    }
+
+    [Fact]
+    public void Build_fqdn_rule_falls_back_to_the_bare_id_when_no_domain_is_configured()
+    {
+        var spec = PlainSpec() with { Hostname = null };
+
+        var config = ContainerConfigurationBuilder.Build(spec, Image, ContainerConfigurationBuilder.BuildContext.Empty);
+
+        var attachment = Assert.Single(config.Networks);
+        Assert.Equal("myapp", attachment.Options.Hostname);
+    }
+
+    [Fact]
+    public void Build_explicit_hostname_overrides_the_fqdn_rule_even_with_a_domain_configured()
+    {
+        var spec = PlainSpec() with { Hostname = "db" };
+        var context = new ContainerConfigurationBuilder.BuildContext(
+            new Dictionary<string, VolumeConfiguration>(), DnsDomain: "test");
+
+        var config = ContainerConfigurationBuilder.Build(spec, Image, context);
+
+        var attachment = Assert.Single(config.Networks);
+        Assert.Equal("db", attachment.Options.Hostname);
+    }
+
     [Theory]
     [InlineData("15", "SIGTERM")]
     [InlineData("TERM", "SIGTERM")]

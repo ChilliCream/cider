@@ -369,6 +369,10 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
             {
                 RuntimeId = containerId,
                 Image = _options.DnsForwarderImage,
+                // Self-contained: the coredns image's own entrypoint, so this create is a fully
+                // merged spec the XPC transport's fast path can take directly instead of relying on
+                // the entrypoint-less-spec CLI fallback forever (task fix direction §3).
+                Entrypoint = await ResolveForwarderEntrypointAsync(ct),
                 Args = ["-conf", "/etc/coredns/Corefile"],
                 Labels = new Dictionary<string, string>(StringComparer.Ordinal)
                 {
@@ -529,6 +533,16 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
 
         _logger.LogInformation("pulling the DNS forwarder image {Image}", image);
         await _runtime.PullImageAsync(image, null, null, new Progress<ProgressEvent>(), ct);
+    }
+
+    /// <summary>The coredns image's own entrypoint, read from the image config already ensured by
+    /// <see cref="EnsureImageAsync"/> — falls back to the documented <c>/coredns</c> entrypoint of
+    /// the official coredns image if the config somehow does not report one, so the forwarder's own
+    /// create never depends on the image-config-less CLI fallback (task fix direction §3).</summary>
+    private async Task<string> ResolveForwarderEntrypointAsync(CancellationToken ct)
+    {
+        var detail = await _runtime.InspectImageAsync(_options.DnsForwarderImage, ct);
+        return detail?.Config.Entrypoint is { Count: > 0 } entrypoint ? entrypoint[0] : "/coredns";
     }
 
     private async Task<IPAddress?> ReadAddressAsync(string containerId, CancellationToken ct)
