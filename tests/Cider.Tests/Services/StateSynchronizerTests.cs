@@ -111,6 +111,32 @@ public sealed class StateSynchronizerTests
     }
 
     [Fact]
+    public async Task SyncAsync_NeverDropsAContainerTheDaemonHolds_EvenAfterItVanishes()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var sync = NewSynchronizer(harness);
+
+        var record = await harness.RunShellAsync("sleep 30", "web");
+
+        // Apple's services restart and lose track of it (ARCHITECTURE §6/§9), but this daemon still
+        // holds the init process directly — it never went through RemoveContainerAsync.
+        harness.Runtime.VanishContainer("web");
+
+        var first = await sync.SyncAsync(default);
+
+        // Never dropped: the process is still held, so the runtime's missing listing is a transient
+        // gap, not a removal (mirrors StatePoller.IsHeldByUs).
+        Assert.DoesNotContain("web", first.Containers.Removed);
+        Assert.NotNull(harness.Store.Get(record.Id));
+        var stillThere = await harness.Containers.ResolveAsync("web", default);
+        Assert.Equal(record.Id, stillThere.Id);
+
+        var second = await sync.SyncAsync(default);
+
+        Assert.True(second.Containers.IsEmpty, "a second pass over unchanged state must report nothing");
+    }
+
+    [Fact]
     public async Task SyncAsync_EngineListFailure_ThrowsAndChangesNothing()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

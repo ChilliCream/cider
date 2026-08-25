@@ -12,7 +12,7 @@ namespace Cider.Core.Services;
 /// wedged — a resource removed by hand with the Apple CLI leaves a record <c>docker … ls</c> keeps
 /// showing and later creates fail against; one created directly is invisible to docker until
 /// restart. Safe to call while the daemon serves traffic (it takes the same per-resource gates the
-/// managers use) and safe to call twice in a row: the second pass reports an empty
+/// underlying manager helpers take) and safe to call twice in a row: the second pass reports an empty
 /// <see cref="SyncReport"/>. Never calls <c>container delete</c>/<c>stop</c> — it only ever touches
 /// cider's own records and cider-owned side processes (DNS forwarders, port proxies).
 /// </summary>
@@ -98,10 +98,20 @@ public sealed class StateSynchronizer
                 continue;
             }
 
+            // The daemon is holding this container's init process (a `container start -a` it
+            // launched), so the runtime not listing it yet is a transient gap, not a removal —
+            // mirrors StatePoller.IsHeldByUs.
+            if (_containers.HasHeldProcess(record.Id))
+            {
+                continue;
+            }
+
             try
             {
-                await _containers.ForgetVanishedAsync(record, ct).ConfigureAwait(false);
-                report.Containers.Removed.Add(record.Name);
+                if (await _containers.ForgetVanishedAsync(record, ct).ConfigureAwait(false))
+                {
+                    report.Containers.Removed.Add(record.Name);
+                }
             }
             catch (Exception ex) when (ex is DockerApiException or RuntimeException)
             {

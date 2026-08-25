@@ -326,7 +326,9 @@ public sealed partial class ContainerManager
     /// already in flight. Anonymous volumes are kept, exactly like <c>docker rm</c> without
     /// <c>-v</c>.
     /// </summary>
-    internal async Task ForgetVanishedAsync(ContainerRecord record, CancellationToken ct)
+    /// <returns><c>true</c> if the record was actually dropped; <c>false</c> if this call bailed out
+    /// because a start, remove or re-create raced in first, leaving the record untouched.</returns>
+    internal async Task<bool> ForgetVanishedAsync(ContainerRecord record, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(record);
         var handle = GetHandle(record.Id);
@@ -341,7 +343,7 @@ public sealed partial class ContainerManager
                 !string.Equals(current.RuntimeId, record.RuntimeId, StringComparison.Ordinal) ||
                 handle.Process is not null)
             {
-                return;
+                return false;
             }
 
             var wasRunning = current.State.Running;
@@ -373,6 +375,8 @@ public sealed partial class ContainerManager
 
             Publish(current, "destroy");
             RaiseStateChanged(current, "destroy");
+
+            return true;
         }
         finally
         {
