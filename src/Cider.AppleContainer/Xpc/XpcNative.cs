@@ -163,6 +163,13 @@ internal static unsafe partial class XpcNative
     [LibraryImport(Lib)]
     public static partial nint xpc_type_get_name(nint type);
 
+    /// <summary><c>xpc_object_t xpc_retain(xpc_object_t)</c> — bumps the reference count and
+    /// returns the same object. Used to pin a connection alive across a blocking sync send that the
+    /// caller-side timeout logic may abandon while <see cref="XpcClient.Dispose"/> concurrently
+    /// releases the client's own reference (see <c>XpcClient.SendSync</c>'s doc comment).</summary>
+    [LibraryImport(Lib)]
+    public static partial nint xpc_retain(nint obj);
+
     [LibraryImport(Lib)]
     public static partial void xpc_release(nint obj);
 

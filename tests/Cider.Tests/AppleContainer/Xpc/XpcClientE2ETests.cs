@@ -48,14 +48,20 @@ public class XpcClientE2ETests
     {
         using var client = NewClient();
 
-        // One warm-up call so connection setup isn't counted against the budget.
-        (await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default)).Dispose();
+        // One warm-up call so connection setup isn't counted against the budget. Uses NoTimeout,
+        // same as the timed samples below — see the comment on the loop for why.
+        (await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.NoTimeout)).Dispose();
 
         var samples = new List<double>(100);
         for (var i = 0; i < 100; i++)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            using var reply = await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default);
+            // NoTimeout, not Default: the 0.2ms budget this asserts comes from the spike's raw
+            // synchronous send (docs/spikes/xpc/04-dotnet-xpc-probe-report.md, ~25us/call) — it
+            // describes the transport, not the client's async timeout scaffolding around it
+            // (Task.Run scheduling, WaitAsync's own overhead) that XpcCallOptions.Default pulls in
+            // and that dominates at this sub-millisecond scale.
+            using var reply = await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.NoTimeout);
             samples.Add(sw.Elapsed.TotalMilliseconds);
         }
 
@@ -119,5 +125,61 @@ public class XpcClientE2ETests
 
         using var reply = await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default);
         Assert.False(string.IsNullOrEmpty(reply.GetString("apiServerVersion")));
+
+        // Regression coverage for the stale-generation bug: the cancelled connection's guaranteed
+        // terminal XPC_ERROR_CONNECTION_INVALID event (delivered asynchronously, some time after
+        // DebugCancelConnection above) must only ever mark *that* connection broken, never the
+        // fresh one the reconnect above already created. Send a few more pings and confirm the
+        // generation captured right after the reconnect never changes underneath them — if the
+        // stale event tore the fresh connection down, EnsureConnection would silently reconnect
+        // again here and this would fail.
+        var generationAfterReconnect = client.DebugConnectionGeneration;
+        for (var i = 0; i < 3; i++)
+        {
+            using var again = await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default);
+            Assert.False(string.IsNullOrEmpty(again.GetString("apiServerVersion")));
+            Assert.Same(generationAfterReconnect, client.DebugConnectionGeneration);
+        }
+    }
+
+    [E2EFact]
+    public async Task Cancelling_then_sending_immediately_does_not_break_the_reconnected_connection()
+    {
+        using var client = NewClient();
+
+        // Establish the connection.
+        (await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default)).Dispose();
+
+        // No delay this time (contrast the test above): cancel and send again immediately, so the
+        // cancelled connection's asynchronous XPC_ERROR_CONNECTION_INVALID event is still very
+        // likely to arrive *after* EnsureConnection has already reconnected — the exact interleaving
+        // the generation-scoped broken flag exists to survive.
+        client.DebugCancelConnection();
+
+        // The very first send right after cancelling can itself synchronously observe the
+        // cancelled connection — xpc_connection_cancel can take effect before its own asynchronous
+        // terminal event ever fires, so SendSync may see "connection invalid" directly and (like any
+        // other transport error) mark that connection broken right there. That is a real,
+        // independent race, not the one this test targets; tolerate it here; either way, the next
+        // send below is guaranteed to hit a healthy connection.
+        try
+        {
+            (await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default)).Dispose();
+        }
+        catch (XpcException)
+        {
+        }
+
+        using var reply = await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default);
+        Assert.False(string.IsNullOrEmpty(reply.GetString("apiServerVersion")));
+
+        var generationAfterReconnect = client.DebugConnectionGeneration;
+
+        // Give the stale connection's terminal event time to actually arrive, then prove the fresh
+        // connection survived it.
+        await Task.Delay(TimeSpan.FromMilliseconds(200));
+        using var again = await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default);
+        Assert.False(string.IsNullOrEmpty(again.GetString("apiServerVersion")));
+        Assert.Same(generationAfterReconnect, client.DebugConnectionGeneration);
     }
 }

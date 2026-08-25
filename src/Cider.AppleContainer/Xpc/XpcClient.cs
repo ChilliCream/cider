@@ -47,13 +47,29 @@ internal sealed class XpcClient : IDisposable
     /// (<c>XPCClient.swift:27</c>, §1.4).</summary>
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(60);
 
+    /// <summary>
+    /// One generation of the underlying native connection. Kept as its own object — rather than a
+    /// bare <c>nint</c> handle plus a client-wide "broken" flag — so that the terminal
+    /// <c>XPC_ERROR_CONNECTION_INVALID</c> event for a stale connection (which libxpc guarantees to
+    /// deliver exactly once, asynchronously, some time after <c>xpc_connection_cancel</c>) can only
+    /// ever mark *this* generation broken, never whatever generation happens to be current by the
+    /// time it arrives. Without that, a stale C1's guaranteed-terminal event landing after
+    /// <see cref="EnsureConnection"/> has already replaced it with a healthy C2 would tear C2 down
+    /// too — the same failure mode a timed-out/abandoned <see cref="SendSync"/> that finally returns
+    /// against a since-replaced connection would trigger.
+    /// </summary>
+    private sealed class Connection
+    {
+        public nint Handle;
+        public nint Block;
+        public volatile bool Broken;
+    }
+
     private readonly string _serviceName;
     private readonly ILogger _logger;
     private readonly Lock _connectionLock = new();
 
-    private nint _connection;
-    private nint _eventBlock;
-    private volatile bool _connectionBroken;
+    private Connection? _current;
     private bool _disposed;
 
     public XpcClient(string serviceName, ILogger logger)
@@ -95,7 +111,7 @@ internal sealed class XpcClient : IDisposable
     }
 
     private async Task<XpcDictionary> RunWithTimeoutAsync(
-        nint connection, XpcMessage request, TimeSpan? timeout, CancellationToken ct)
+        Connection connection, XpcMessage request, TimeSpan? timeout, CancellationToken ct)
     {
         var sendTask = Task.Run(() => SendSync(connection, request), ct);
         if (timeout is not { } budget)
@@ -103,29 +119,40 @@ internal sealed class XpcClient : IDisposable
             return await sendTask.ConfigureAwait(false);
         }
 
-        var winner = await Task.WhenAny(sendTask, Task.Delay(budget, ct)).ConfigureAwait(false);
-        if (winner == sendTask)
+        try
         {
-            return await sendTask.ConfigureAwait(false);
+            // WaitAsync races the budget (and ct) against the already-running sendTask without an
+            // extra Task.Delay allocation per call — a real cost at the sub-millisecond scale the
+            // raw sync send runs at (docs/spikes/xpc/04-dotnet-xpc-probe-report.md).
+            return await sendTask.WaitAsync(budget, ct).ConfigureAwait(false);
         }
-
-        // The delay can also "win" because the caller's own token fired, not the budget — that is
-        // cancellation, not a timeout, and must surface as such.
-        ct.ThrowIfCancellationRequested();
-
-        // Purely client-side, exactly like the Swift client (§1.4): the underlying sync send is
-        // still blocked in native code and is not cancelled — only observed, so its eventual
-        // fault (or success, which is simply discarded) can never surface as an unobserved
-        // exception once the caller has already moved on with a Timeout.
-        _ = sendTask.ContinueWith(
-            static t => t.Exception?.Handle(_ => true),
-            CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
-        throw XpcException.Timeout($"XPC timeout for request to {_serviceName}/{request.Route}");
+        catch (TimeoutException)
+        {
+            // Purely client-side, exactly like the Swift client (§1.4): the underlying sync send is
+            // still blocked in native code and is not cancelled — only observed, so its eventual
+            // fault (or success, which must still be disposed rather than leaked) can never surface
+            // as an unobserved exception, or leaked reply, once the caller has already moved on with
+            // a Timeout.
+            _ = sendTask.ContinueWith(
+                static t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        t.Exception!.Handle(_ => true);
+                    }
+                    else if (t.IsCompletedSuccessfully)
+                    {
+                        t.Result.Dispose();
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            throw XpcException.Timeout($"XPC timeout for request to {_serviceName}/{request.Route}");
+        }
     }
 
-    private Task<XpcDictionary> RunOnDedicatedThreadAsync(nint connection, XpcMessage request, CancellationToken ct) =>
+    private Task<XpcDictionary> RunOnDedicatedThreadAsync(Connection connection, XpcMessage request, CancellationToken ct) =>
         Task.Factory.StartNew(
             () => SendSync(connection, request),
             ct,
@@ -133,75 +160,94 @@ internal sealed class XpcClient : IDisposable
             TaskScheduler.Default);
 
     /// <summary>The blocking call itself — always run off whatever thread called <see cref="SendAsync"/>
-    /// (see <see cref="RunWithTimeoutAsync"/>/<see cref="RunOnDedicatedThreadAsync"/>).</summary>
-    private XpcDictionary SendSync(nint connection, XpcMessage request)
+    /// (see <see cref="RunWithTimeoutAsync"/>/<see cref="RunOnDedicatedThreadAsync"/>). Pins
+    /// <paramref name="connection"/> with an extra native retain for the duration of the blocking
+    /// call: <see cref="RunWithTimeoutAsync"/> can abandon this call (on timeout) and the client can
+    /// be disposed concurrently, either of which would otherwise drop the connection's only
+    /// reference — via <see cref="CancelAndReleaseConnection"/> — while
+    /// <c>xpc_connection_send_message_with_reply_sync</c> is still blocked on it. The extra retain
+    /// keeps the object alive for that call; cancellation still unblocks it promptly with an
+    /// <c>XPC_ERROR_CONNECTION_INVALID</c> reply.</summary>
+    private XpcDictionary SendSync(Connection connection, XpcMessage request)
     {
-        var replyPtr = request.Dictionary.Use(handle =>
-            XpcNative.xpc_connection_send_message_with_reply_sync(connection, handle));
-
-        if (replyPtr == 0)
+        XpcNative.xpc_retain(connection.Handle);
+        try
         {
-            MarkBroken();
-            throw XpcException.Interrupted(
-                $"xpc_connection_send_message_with_reply_sync returned NULL for {_serviceName}/{request.Route}");
-        }
+            var replyPtr = request.Dictionary.Use(handle =>
+                XpcNative.xpc_connection_send_message_with_reply_sync(connection.Handle, handle));
 
-        var type = XpcObject.TypeNameOf(replyPtr);
-        if (type == "error")
+            if (replyPtr == 0)
+            {
+                connection.Broken = true;
+                throw XpcException.Interrupted(
+                    $"xpc_connection_send_message_with_reply_sync returned NULL for {_serviceName}/{request.Route}");
+            }
+
+            var type = XpcObject.TypeNameOf(replyPtr);
+            if (type == "error")
+            {
+                var description = XpcObject.DescribeOf(replyPtr);
+                var invalid = replyPtr == XpcErrorSentinels.ConnectionInvalid;
+                XpcNative.xpc_release(replyPtr);
+                connection.Broken = true;
+                throw invalid ? XpcException.Invalid(description) : XpcException.Interrupted(description);
+            }
+
+            if (type != "dictionary")
+            {
+                var description = XpcObject.DescribeOf(replyPtr);
+                XpcNative.xpc_release(replyPtr);
+                throw XpcException.ApiServer("unknown", $"unexpected XPC reply type '{type}': {description}");
+            }
+
+            return new XpcDictionary(replyPtr);
+        }
+        finally
         {
-            var description = XpcObject.DescribeOf(replyPtr);
-            var invalid = replyPtr == XpcErrorSentinels.ConnectionInvalid;
-            XpcNative.xpc_release(replyPtr);
-            MarkBroken();
-            throw invalid ? XpcException.Invalid(description) : XpcException.Interrupted(description);
+            XpcNative.xpc_release(connection.Handle);
         }
-
-        if (type != "dictionary")
-        {
-            var description = XpcObject.DescribeOf(replyPtr);
-            XpcNative.xpc_release(replyPtr);
-            throw XpcException.ApiServer("unknown", $"unexpected XPC reply type '{type}': {description}");
-        }
-
-        return new XpcDictionary(replyPtr);
     }
 
-    private nint EnsureConnection()
+    private Connection EnsureConnection()
     {
         lock (_connectionLock)
         {
-            if (_connection != 0 && !_connectionBroken)
+            if (_current is { Broken: false } c)
             {
-                return _connection;
+                return c;
             }
 
-            if (_connection != 0)
+            if (_current is { } stale)
             {
-                CancelAndReleaseConnection(_connection);
+                CancelAndReleaseConnection(stale.Handle);
             }
 
-            var connection = XpcNative.xpc_connection_create_mach_service(_serviceName, 0, 0);
-            if (connection == 0)
+            var handle = XpcNative.xpc_connection_create_mach_service(_serviceName, 0, 0);
+            if (handle == 0)
             {
                 throw XpcException.Invalid($"xpc_connection_create_mach_service({_serviceName}) returned NULL");
             }
 
-            var block = XpcBlock.CreateEventHandler(OnConnectionEvent);
+            var connection = new Connection { Handle = handle };
+            var block = XpcBlock.CreateEventHandler((b, xpcObject) => OnConnectionEvent(connection, b, xpcObject));
+            connection.Block = block;
 
             // Order matters: the handler must be installed before activation, or an event racing
             // activation is dropped (and cancelling a connection whose handler was never installed
             // is unsafe — confirmed live while building this client).
-            XpcNative.xpc_connection_set_event_handler(connection, block);
-            XpcNative.xpc_connection_activate(connection);
+            XpcNative.xpc_connection_set_event_handler(handle, block);
+            XpcNative.xpc_connection_activate(handle);
 
-            _connection = connection;
-            _eventBlock = block;
-            _connectionBroken = false;
+            _current = connection;
             return connection;
         }
     }
 
-    private void OnConnectionEvent(nint block, nint xpcObject)
+    /// <summary>Marks only <paramref name="connection"/> broken — never touches <see cref="_current"/>
+    /// or any other generation, which is exactly what makes a stale connection's guaranteed-terminal
+    /// event, arriving after <see cref="EnsureConnection"/> has already moved on to a fresh
+    /// generation, harmless (see <see cref="Connection"/>'s own doc comment).</summary>
+    private void OnConnectionEvent(Connection connection, nint block, nint xpcObject)
     {
         if (xpcObject != XpcErrorSentinels.ConnectionInterrupted && xpcObject != XpcErrorSentinels.ConnectionInvalid)
         {
@@ -210,7 +256,7 @@ internal sealed class XpcClient : IDisposable
 
         var invalid = xpcObject == XpcErrorSentinels.ConnectionInvalid;
         _logger.LogDebug("xpc {Service} connection {State}", _serviceName, invalid ? "invalid" : "interrupted");
-        MarkBroken();
+        connection.Broken = true;
 
         if (invalid)
         {
@@ -222,8 +268,6 @@ internal sealed class XpcClient : IDisposable
         }
     }
 
-    private void MarkBroken() => _connectionBroken = true;
-
     /// <summary>
     /// Test-only: cancels the live connection out from under this client — the same libxpc call
     /// the verification scenario for this task drives directly — without disposing the client. The
@@ -234,22 +278,37 @@ internal sealed class XpcClient : IDisposable
     {
         lock (_connectionLock)
         {
-            if (_connection != 0)
+            if (_current is { } connection)
             {
-                XpcNative.xpc_connection_cancel(_connection);
+                XpcNative.xpc_connection_cancel(connection.Handle);
             }
         }
     }
 
-    /// <summary>Cancels and releases <paramref name="connection"/> without touching its event-handler
+    /// <summary>Test-only: identifies the current connection generation, purely by reference — does
+    /// not dereference the handle. Used to assert a reconnect only happened once (or not at all)
+    /// across a sequence of sends, without relying on native pointer values that could in principle
+    /// be reused after a release.</summary>
+    internal object? DebugConnectionGeneration
+    {
+        get
+        {
+            lock (_connectionLock)
+            {
+                return _current;
+            }
+        }
+    }
+
+    /// <summary>Cancels and releases <paramref name="handle"/> without touching its event-handler
     /// block — that block frees itself from <see cref="OnConnectionEvent"/> once the asynchronous,
     /// guaranteed-terminal <c>XPC_ERROR_CONNECTION_INVALID</c> actually arrives (see
     /// <see cref="XpcBlock.Free"/>'s doc comment for why freeing it here, synchronously, would race
     /// that event and segfault).</summary>
-    private static void CancelAndReleaseConnection(nint connection)
+    private static void CancelAndReleaseConnection(nint handle)
     {
-        XpcNative.xpc_connection_cancel(connection);
-        XpcNative.xpc_release(connection);
+        XpcNative.xpc_connection_cancel(handle);
+        XpcNative.xpc_release(handle);
     }
 
     public void Dispose()
@@ -267,11 +326,10 @@ internal sealed class XpcClient : IDisposable
             }
 
             _disposed = true;
-            if (_connection != 0)
+            if (_current is { } connection)
             {
-                CancelAndReleaseConnection(_connection);
-                _connection = 0;
-                _eventBlock = 0;
+                CancelAndReleaseConnection(connection.Handle);
+                _current = null;
             }
         }
     }

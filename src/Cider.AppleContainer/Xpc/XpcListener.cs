@@ -80,6 +80,8 @@ internal sealed class XpcListener : IDisposable
 
         _disposed = true;
         Endpoint.Dispose();
+        // No retain/release pin needed here (contrast XpcClient.SendSync): this connection never
+        // makes a blocking sync send that Dispose could race, only cancel/release.
         XpcNative.xpc_connection_cancel(_connection);
         XpcNative.xpc_release(_connection);
         _logger.LogDebug("xpc anonymous listener cancelled");
