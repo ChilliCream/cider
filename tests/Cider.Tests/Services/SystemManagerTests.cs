@@ -221,9 +221,27 @@ public sealed class SystemManagerTests : IDisposable
         var ping = manager.Ping();
 
         Assert.Equal("1.47", ping.ApiVersion);
-        Assert.Equal("1", ping.BuilderVersion);
+        Assert.Equal("2", ping.BuilderVersion);
         Assert.False(ping.Experimental);
         Assert.Equal("linux", ping.OsType);
         Assert.Equal("inactive", ping.Swarm);
+    }
+
+    [Fact]
+    public void Ping_ReportsBuilderVersion1_When_BuildKitDisabled()
+    {
+        var runtime = new FakeContainerRuntime();
+        var events = new EventBus();
+        var options = new CiderOptions { DataDir = _tmpDir, BuildKitEnabled = false };
+        var images = new ImageManager(runtime, events, options, NullLogger<ImageManager>.Instance);
+        var volumeStore = new InMemoryRecordStore<Cider.Core.State.VolumeRecord>();
+        var volumes = new VolumeManager(runtime, volumeStore, events, options, NullLogger<VolumeManager>.Instance);
+        var counts = new FakeContainerCounts { Total = 3, Running = 1, Exited = 2 };
+        var engineId = new EngineId(options);
+        var manager = new SystemManager(runtime, counts, images, volumes, options, engineId);
+
+        var ping = manager.Ping();
+
+        Assert.Equal("1", ping.BuilderVersion);
     }
 }

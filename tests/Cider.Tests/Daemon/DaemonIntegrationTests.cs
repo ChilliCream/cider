@@ -20,10 +20,21 @@ public sealed class DaemonIntegrationTests
         Assert.Equal(200, (int)response.StatusCode);
         Assert.Equal("OK", await response.Content.ReadAsStringAsync());
         Assert.Equal("1.47", Assert.Single(response.Headers.GetValues("API-Version")));
-        Assert.Equal("1", Assert.Single(response.Headers.GetValues("Builder-Version")));
+        Assert.Equal("2", Assert.Single(response.Headers.GetValues("Builder-Version")));
         Assert.Equal("false", Assert.Single(response.Headers.GetValues("Docker-Experimental")));
         Assert.Equal("linux", Assert.Single(response.Headers.GetValues("Ostype")));
         Assert.Equal("inactive", Assert.Single(response.Headers.GetValues("Swarm")));
+    }
+
+    [Fact]
+    public async Task Ping_reports_BuilderVersion_1_when_BuildKit_is_disabled()
+    {
+        await using var host = await DaemonTestHost.StartAsync(options => options.BuildKitEnabled = false);
+
+        using var response = await host.Client.GetAsync(new Uri("/_ping", UriKind.Relative));
+
+        Assert.Equal(200, (int)response.StatusCode);
+        Assert.Equal("1", Assert.Single(response.Headers.GetValues("Builder-Version")));
     }
 
     [Fact]
@@ -68,6 +79,10 @@ public sealed class DaemonIntegrationTests
         Assert.False(json.RootElement.GetProperty("Swarm").GetProperty("ControlAvailable").GetBoolean());
         Assert.Equal("apple-container", json.RootElement.GetProperty("Driver").GetString());
         Assert.Equal("linux", json.RootElement.GetProperty("OSType").GetString());
+
+        // Must stay empty: a [["driver-type","io.containerd.snapshotter.v1"]] entry would make
+        // buildx rewrite `docker build --load` to the oci exporter instead of loading the image.
+        Assert.Empty(json.RootElement.GetProperty("DriverStatus").EnumerateArray());
     }
 
     [Fact]

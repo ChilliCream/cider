@@ -1,4 +1,5 @@
 using System.Net;
+using Cider.Core.Configuration;
 using Cider.Core.DockerApi;
 using Cider.Daemon.Hosting;
 
@@ -61,11 +62,22 @@ public static class StubRoutes
         app.MapGet("/distribution/{**name}", (string name) =>
             Unsupported("cider: registry distribution inspection is not supported"));
 
-        // BuildKit's gRPC-over-HTTP2 session; `Builder-Version: 1` on /_ping steers docker/compose
-        // to the classic (non-BuildKit) /build endpoint, so clients should never actually reach these.
-        app.MapPost("/session", () => DockerResults.Error(new DockerApiException(HttpStatusCode.NotFound, "page not found")));
-        app.MapPost("/grpc", () => DockerResults.Error(new DockerApiException(HttpStatusCode.NotFound, "page not found")));
+        // BuildKit's gRPC-over-HTTP2 session. A real upgrade request (Connection: Upgrade,
+        // Upgrade: h2c) never reaches this Kestrel stub at all — DaemonHost's hijack middleware
+        // answers it (or 404s when BuildKit is disabled) before Kestrel's own routing runs; see
+        // MapFallback in DaemonHost. What lands here is only a plain, non-upgrade POST, from a
+        // client that either doesn't speak the h2c upgrade or hit the daemon with BuildKit off.
+        // When BuildKit is enabled, tell such a client what it's missing instead of a bare 404;
+        // when disabled, `Builder-Version: 1` on /_ping already steered it to legacy /build, so a
+        // plain 404 (as if the route didn't exist) is the right answer.
+        app.MapPost("/session", (CiderOptions options) => SessionOrGrpcResult(options));
+        app.MapPost("/grpc", (CiderOptions options) => SessionOrGrpcResult(options));
     }
+
+    private static IResult SessionOrGrpcResult(CiderOptions options) => options.BuildKitEnabled
+        ? DockerResults.Error(new DockerApiException(
+            HttpStatusCode.BadRequest, "cider: /grpc and /session require Connection: Upgrade, Upgrade: h2c"))
+        : DockerResults.Error(new DockerApiException(HttpStatusCode.NotFound, "page not found"));
 
     // ---- helpers ------------------------------------------------------
 

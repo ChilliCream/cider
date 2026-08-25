@@ -93,6 +93,7 @@ public sealed class ResourceRoutesTests : IAsyncLifetime
         builder.Services.AddSingleton(networks);
         builder.Services.AddSingleton(volumes);
         builder.Services.AddSingleton(containers);
+        builder.Services.AddSingleton(options);
 
         _app = builder.Build();
         _app.UseMiddleware<ErrorMiddleware>();
@@ -526,14 +527,74 @@ public sealed class ResourceRoutesTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Session_And_Grpc_ReturnPageNotFound()
+    public async Task Session_And_Grpc_Return400_OnPlainPost_When_BuildKitEnabled()
     {
+        // This fixture's CiderOptions.BuildKitEnabled defaults to true. A plain (non-upgrade) POST
+        // only ever reaches this Kestrel stub when a client skips the h2c upgrade the hijack
+        // middleware expects, so it gets a real diagnostic instead of a bare 404.
         var sessionResponse = await _client!.PostAsync("/session", content: null);
         var grpcResponse = await _client.PostAsync("/grpc", content: null);
 
-        Assert.Equal(HttpStatusCode.NotFound, sessionResponse.StatusCode);
-        Assert.Equal(HttpStatusCode.NotFound, grpcResponse.StatusCode);
-        Assert.Contains("page not found", await sessionResponse.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        Assert.Equal(HttpStatusCode.BadRequest, sessionResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, grpcResponse.StatusCode);
+        Assert.Contains(
+            "Connection: Upgrade, Upgrade: h2c", await sessionResponse.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Session_And_Grpc_ReturnPageNotFound_When_BuildKitDisabled()
+    {
+        var socketPath = $"/tmp/cider-rr-{Guid.NewGuid():N}"[..24] + ".sock";
+        if (File.Exists(socketPath))
+        {
+            File.Delete(socketPath);
+        }
+
+        var builder = WebApplication.CreateBuilder();
+        builder.Logging.ClearProviders();
+        builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        builder.WebHost.ConfigureKestrel(kestrel => kestrel.ListenUnixSocket(socketPath));
+        builder.Services.AddSingleton(new CiderOptions { BuildKitEnabled = false });
+
+        await using var app = builder.Build();
+        app.UseMiddleware<ErrorMiddleware>();
+        app.UseRouting();
+        app.MapStubRoutes();
+        await app.StartAsync();
+
+        try
+        {
+            using var handler = new SocketsHttpHandler
+            {
+                ConnectCallback = async (context, ct) =>
+                {
+                    var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                    try
+                    {
+                        await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath), ct);
+                        return new NetworkStream(socket, ownsSocket: true);
+                    }
+                    catch
+                    {
+                        socket.Dispose();
+                        throw;
+                    }
+                },
+            };
+            using var client = new HttpClient(handler) { BaseAddress = new Uri("http://cider-tests/") };
+
+            var sessionResponse = await client.PostAsync("/session", content: null);
+            var grpcResponse = await client.PostAsync("/grpc", content: null);
+
+            Assert.Equal(HttpStatusCode.NotFound, sessionResponse.StatusCode);
+            Assert.Equal(HttpStatusCode.NotFound, grpcResponse.StatusCode);
+            Assert.Contains("page not found", await sessionResponse.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            await app.StopAsync();
+            TryDelete(socketPath);
+        }
     }
 
     // ---- helpers ------------------------------------------------------

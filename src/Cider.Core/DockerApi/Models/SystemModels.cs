@@ -2,7 +2,10 @@ using System.Text.Json.Serialization;
 
 namespace Cider.Core.DockerApi.Models;
 
-/// <summary>Values advertised by <c>GET/HEAD /_ping</c> (returned as headers, never serialized).</summary>
+/// <summary>Values advertised by <c>GET/HEAD /_ping</c> (returned as headers, never serialized).
+/// <c>BuilderVersion</c> is "2" when BuildKit is enabled (advertises the h2c /grpc + /session upgrade
+/// path so docker/compose/buildx route builds to it) and "1" when disabled (falls back to legacy
+/// <c>POST /build</c>). See <see cref="Cider.Core.Services.SystemManager.Ping"/>.</summary>
 public sealed class PingInfo
 {
     public string ApiVersion { get; set; } = "1.47";
@@ -53,6 +56,8 @@ public sealed class SystemInfo
     public int ContainersStopped { get; set; }
     public int Images { get; set; }
     public string Driver { get; set; } = "apple-container";
+    // Must stay empty: a [["driver-type","io.containerd.snapshotter.v1"]] entry makes buildx rewrite
+    // `--load` to the oci exporter (buildx util/dockerutil/client.go:83-94), which cider does not want.
     public List<List<string>> DriverStatus { get; set; } = [];
     public string DockerRootDir { get; set; } = "";
     public PluginsInfo Plugins { get; set; } = new();

@@ -167,7 +167,7 @@ public sealed class SystemManager
     public PingInfo Ping() => new()
     {
         ApiVersion = _options.ApiVersion,
-        BuilderVersion = "1",
+        BuilderVersion = _options.BuildKitEnabled ? "2" : "1",
         Experimental = false,
         OsType = "linux",
         Swarm = "inactive",
