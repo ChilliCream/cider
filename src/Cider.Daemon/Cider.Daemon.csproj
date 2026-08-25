@@ -51,4 +51,33 @@
     <ProjectReference Include="..\Cider.Dns\Cider.Dns.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Grpc.AspNetCore" Version="2.83.0" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.83.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.83.0" PrivateAssets="all" />
+    <PackageReference Include="Google.Protobuf" Version="3.36.0" />
+    <!-- Ships the Grpc.Health.V1 generated types plus HealthServiceImpl; health.proto itself is
+         NOT vendored under protos/: BuildKit's grpc.health.v1.Health/Check is served from this
+         package, not from our own generated code. -->
+    <PackageReference Include="Grpc.HealthCheck" Version="2.83.0" />
+  </ItemGroup>
+
+  <!--
+    Vendored BuildKit/fsutil/vtprotobuf/googleapis protos under ../../protos (see
+    scripts/vendor-buildkit-protos.sh and BuildKit/Protos/README.md). GrpcServices="Both" only for
+    the two files whose services we implement/call directly (Control, FileSync/FileSend); every
+    other file here is messages-only support for those two, so it generates message classes alone.
+  -->
+  <ItemGroup>
+    <Protobuf Include="..\..\protos\github.com\moby\buildkit\api\services\control\control.proto" ProtoRoot="..\..\protos" GrpcServices="Both" />
+    <Protobuf Include="..\..\protos\github.com\moby\buildkit\session\filesync\filesync.proto" ProtoRoot="..\..\protos" GrpcServices="Both" />
+    <Protobuf Include="..\..\protos\github.com\moby\buildkit\api\types\worker.proto" ProtoRoot="..\..\protos" GrpcServices="None" />
+    <Protobuf Include="..\..\protos\github.com\moby\buildkit\solver\pb\ops.proto" ProtoRoot="..\..\protos" GrpcServices="None" />
+    <Protobuf Include="..\..\protos\github.com\moby\buildkit\sourcepolicy\pb\policy.proto" ProtoRoot="..\..\protos" GrpcServices="None" />
+    <Protobuf Include="..\..\protos\github.com\tonistiigi\fsutil\types\wire.proto" ProtoRoot="..\..\protos" GrpcServices="None" />
+    <Protobuf Include="..\..\protos\github.com\tonistiigi\fsutil\types\stat.proto" ProtoRoot="..\..\protos" GrpcServices="None" />
+    <Protobuf Include="..\..\protos\github.com\planetscale\vtprotobuf\vtproto\ext.proto" ProtoRoot="..\..\protos" GrpcServices="None" />
+    <Protobuf Include="..\..\protos\google\rpc\status.proto" ProtoRoot="..\..\protos" GrpcServices="None" />
+  </ItemGroup>
+
 </Project>
