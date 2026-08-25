@@ -60,9 +60,18 @@ public class DaemonFixture : IAsyncLifetime
     // (ContainerManager.Reconcile.cs), so `docker ps -aq` through it returns developer containers
     // the suite never created (e.g. a hand-started reference container, Apple's `buildkit` VM) right
     // alongside the suite's own. Teardown must never touch anything captured here.
+    //
+    // Residual: this only protects objects that existed at fixture startup. Anything created outside
+    // the suite after that point (e.g. a developer starting a container mid-run) is not covered —
+    // that would need label-based filtering of the suite's own objects instead of a startup snapshot.
     private readonly HashSet<string> _preExistingContainerIds = new(StringComparer.Ordinal);
     private readonly HashSet<string> _preExistingNetworkNames = new(StringComparer.Ordinal);
     private readonly HashSet<string> _preExistingVolumeNames = new(StringComparer.Ordinal);
+
+    // Set true only once all three pre-existing lists below have been captured successfully.
+    // Teardown refuses to remove anything unless this is true, so a failed snapshot can never
+    // fall back to the blanket delete it exists to prevent.
+    private bool _snapshotOk;
 
     /// <summary>Overridable so the daemon-restart test can rebuild a daemon on the same data dir.</summary>
     protected virtual string InstanceSuffix => "";
@@ -117,31 +126,51 @@ public class DaemonFixture : IAsyncLifetime
     /// </summary>
     private async Task SnapshotPreExistingDockerObjectsAsync()
     {
-        try
+        var containers = await DockerAsync(["ps", "-aq"], timeout: TimeSpan.FromSeconds(60));
+        if (!containers.Ok)
         {
-            var containers = await DockerAsync(["ps", "-aq"], timeout: TimeSpan.FromSeconds(60));
-            foreach (var id in containers.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                _preExistingContainerIds.Add(id);
-            }
-
-            var networks = await DockerAsync(["network", "ls", "--format", "{{.Name}}"], timeout: TimeSpan.FromSeconds(60));
-            foreach (var network in networks.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                _preExistingNetworkNames.Add(network);
-            }
-
-            var volumes = await DockerAsync(["volume", "ls", "--format", "{{.Name}}"], timeout: TimeSpan.FromSeconds(60));
-            foreach (var volume in volumes.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                _preExistingVolumeNames.Add(volume);
-            }
+            _log.Enqueue(containers.ToString());
+            throw new InvalidOperationException(
+                "failed to snapshot pre-existing containers; refusing to start the fixture, since " +
+                "teardown must never guess at what it may safely remove:\n" + containers);
         }
-        catch (Exception ex) when (ex is IOException or InvalidOperationException)
+
+        foreach (var id in containers.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            // Best-effort: if this fails, cleanup below still runs but with an empty snapshot, i.e.
-            // no worse than before this fix. It is not worth failing fixture startup over.
+            _preExistingContainerIds.Add(id);
         }
+
+        var networks = await DockerAsync(["network", "ls", "--format", "{{.Name}}"], timeout: TimeSpan.FromSeconds(60));
+        if (!networks.Ok)
+        {
+            _log.Enqueue(networks.ToString());
+            throw new InvalidOperationException(
+                "failed to snapshot pre-existing networks; refusing to start the fixture, since " +
+                "teardown must never guess at what it may safely remove:\n" + networks);
+        }
+
+        foreach (var network in networks.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            _preExistingNetworkNames.Add(network);
+        }
+
+        var volumes = await DockerAsync(["volume", "ls", "--format", "{{.Name}}"], timeout: TimeSpan.FromSeconds(60));
+        if (!volumes.Ok)
+        {
+            _log.Enqueue(volumes.ToString());
+            throw new InvalidOperationException(
+                "failed to snapshot pre-existing volumes; refusing to start the fixture, since " +
+                "teardown must never guess at what it may safely remove:\n" + volumes);
+        }
+
+        foreach (var volume in volumes.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            _preExistingVolumeNames.Add(volume);
+        }
+
+        // Only reached once all three lists above were captured successfully; teardown checks this
+        // before removing anything.
+        _snapshotOk = true;
     }
 
     /// <summary>Builds and starts the daemon on the current options, then waits for <c>/_ping</c>.</summary>
@@ -293,6 +322,14 @@ public class DaemonFixture : IAsyncLifetime
     /// </summary>
     protected async Task CleanupDockerObjectsAsync()
     {
+        if (!_snapshotOk)
+        {
+            _log.Enqueue(
+                $"{DateTime.Now:HH:mm:ss.fff} Warning DaemonFixture: teardown skipped: pre-existing " +
+                "snapshot unavailable, not removing any containers/volumes/networks");
+            return;
+        }
+
         try
         {
             var containers = await DockerAsync(["ps", "-aq"], timeout: TimeSpan.FromSeconds(60));
