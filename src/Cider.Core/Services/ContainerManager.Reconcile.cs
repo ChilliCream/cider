@@ -130,6 +130,16 @@ public sealed partial class ContainerManager
             }
 
             ReconcileStatus(record, runtimeContainer);
+
+            // task cider-ede.7 fix direction §4: a record the runtime still reports Running survived
+            // the restart with its real exit code recoverable — wait for it for real instead of
+            // settling for "exit code unknown (daemon restarted)" the way ReconcileStatus's own
+            // exited branch above has to. IsXpcTransport gates this because WaitContainerAsync always
+            // answers null on the CLI transport (no such call exists there) — nothing to wait for.
+            if (runtimeContainer.State == RuntimeContainerState.Running && _runtime.IsXpcTransport)
+            {
+                ReconcileWaitForExitAsync(record);
+            }
         }
 
         // Containers created directly with the Apple CLI are surfaced read-only.
@@ -232,6 +242,83 @@ public sealed partial class ContainerManager
         GetHandle(dockerId);
         return record;
     }
+
+    /// <summary>
+    /// task cider-ede.7 fix direction §4: for a record <see cref="ReconcileAsync"/> just found the
+    /// runtime still reports <see cref="RuntimeContainerState.Running"/> for, waits for its real exit
+    /// (<see cref="IContainerRuntime.WaitContainerAsync"/> — the XPC apiserver's own
+    /// <c>containerWait</c>, which blocks even for a container this daemon did not itself bootstrap)
+    /// and, once it lands, applies the same exit accounting <c>HandleExitAsync</c> applies for a
+    /// container the daemon started itself: real exit code, "die" event, restart supervisor,
+    /// auto-remove. Fired detached from <see cref="ReconcileAsync"/> on purpose — its own <c>ct</c> is
+    /// startup-scoped and must not cancel a wait that can legitimately run for the rest of the
+    /// container's life — so this uses <see cref="CancellationToken.None"/> throughout and re-reads
+    /// the record from <see cref="_store"/> once the wait completes rather than trusting the snapshot
+    /// captured at reconcile time: by then a user-issued stop/remove, or a restart-supervisor cycle
+    /// that already replaced <see cref="ContainerRecord.RuntimeId"/>, may have already accounted for
+    /// this container's exit through a different path, in which case this is a no-op.
+    /// </summary>
+    private void ReconcileWaitForExitAsync(ContainerRecord record) => _ = Task.Run(async () =>
+    {
+        (int ExitCode, DateTimeOffset ExitedAt)? result;
+        try
+        {
+            result = await _runtime.WaitContainerAsync(record.RuntimeId, CancellationToken.None);
+        }
+        catch (RuntimeException ex)
+        {
+            _logger.LogDebug(ex, "post-restart wait for container {Container} failed", record.Id);
+            return;
+        }
+
+        if (result is not { } exit)
+        {
+            // The transport could not wait, or the runtime says the process is already gone/never
+            // started — leave whatever ReconcileStatus already recorded (running or "exit code
+            // unknown") alone rather than guess.
+            return;
+        }
+
+        var current = _store.Get(record.Id);
+        if (current is null ||
+            !string.Equals(current.RuntimeId, record.RuntimeId, StringComparison.Ordinal) ||
+            !current.State.Running)
+        {
+            return;
+        }
+
+        current.State.Status = "exited";
+        current.State.ExitCode = exit.ExitCode;
+        current.State.FinishedAt = exit.ExitedAt;
+        current.State.Error = null;
+        current.State.Pid = 0;
+        if (current.State.Health is { } health)
+        {
+            health.Status = "unhealthy";
+        }
+
+        Persist(current);
+
+        _names.Unregister(current.Id);
+        UnpublishPorts(current.Id);
+        Publish(current, "die", new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["exitCode"] = exit.ExitCode.ToString(CultureInfo.InvariantCulture),
+        });
+        RaiseStateChanged(current, "die");
+
+        if (current.AutoRemove)
+        {
+            try
+            {
+                await RemoveAsync(current.Id, force: true, removeVolumes: true, CancellationToken.None);
+            }
+            catch (Exception ex) when (ex is DockerApiException or RuntimeException)
+            {
+                _logger.LogDebug(ex, "auto-removing container {Container} failed", current.Id);
+            }
+        }
+    }, CancellationToken.None);
 
     /// <summary>Called by <see cref="Restart.RestartSupervisor"/> right before it restarts a container.</summary>
     internal void MarkRestarting(ContainerRecord record)

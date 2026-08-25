@@ -199,6 +199,61 @@ internal static class Libc
     [DllImport(LibSystem, EntryPoint = "close", SetLastError = true)]
     public static extern int Close(int fd);
 
+    /// <summary><c>fcntl</c>'s <c>F_SETFD</c> command (set the descriptor flags — just <c>FD_CLOEXEC</c>
+    /// in practice).</summary>
+    private const int F_SETFD = 2;
+
+    /// <summary>The one descriptor flag <c>F_SETFD</c> ever needs to set here: close-on-exec.</summary>
+    private const int FD_CLOEXEC = 1;
+
+    [DllImport(LibSystem, EntryPoint = "pipe", SetLastError = true)]
+    private static extern int PipeCore(int[] fds);
+
+    [DllImport(LibSystem, EntryPoint = "fcntl", SetLastError = true)]
+    private static extern int FcntlSetFd(int fd, int cmd, int arg);
+
+    /// <summary>
+    /// <c>pipe(2)</c> with <c>FD_CLOEXEC</c> set on both ends — Darwin has no <c>pipe2</c>, so the
+    /// flag has to be applied with a separate <c>fcntl(F_SETFD)</c> per end right after the pipe is
+    /// created (cider-ede.7: the daemon-owned stdio pipes handed to <c>containerBootstrap</c> must
+    /// never leak into an unrelated child the .NET process later spawns, e.g. a CLI-fallback
+    /// invocation). Returns <c>0</c> on success and leaves no descriptor behind on failure, matching
+    /// <see cref="OpenPty"/>'s own contract.
+    /// </summary>
+    public static int Pipe(out int readFd, out int writeFd, out string? error)
+    {
+        readFd = -1;
+        writeFd = -1;
+        error = null;
+
+        var fds = new int[2];
+        if (PipeCore(fds) != 0)
+        {
+            error = Describe("pipe");
+            return -1;
+        }
+
+        if (FcntlSetFd(fds[0], F_SETFD, FD_CLOEXEC) != 0)
+        {
+            error = Describe("fcntl(F_SETFD, read end)");
+            Close(fds[0]);
+            Close(fds[1]);
+            return -1;
+        }
+
+        if (FcntlSetFd(fds[1], F_SETFD, FD_CLOEXEC) != 0)
+        {
+            error = Describe("fcntl(F_SETFD, write end)");
+            Close(fds[0]);
+            Close(fds[1]);
+            return -1;
+        }
+
+        readFd = fds[0];
+        writeFd = fds[1];
+        return 0;
+    }
+
     /// <summary>
     /// Names a just-failed step for <see cref="OpenPty"/>'s <c>error</c> output. Must be called
     /// before any other P/Invoke into this class — including <see cref="Close"/> — since every one

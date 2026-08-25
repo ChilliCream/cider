@@ -489,13 +489,8 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     // XpcContainerRuntime.Logs.cs (task cider-ede.9). CreateNetworkAsync/RemoveNetworkAsync/
     // CreateVolumeAsync/RemoveVolumeAsync are ported — see XpcContainerRuntime.Resources.cs (task
     // cider-ede.11). CopyFromContainerAsync/CopyToContainerAsync/ExportContainerAsync are ported —
-    // see XpcContainerRuntime.Archive.cs (task cider-ede.12).
-
-    public Task<IContainerProcess> StartContainerAsync(string runtimeId, StartOptions options, CancellationToken ct) =>
-        _cliFallback.StartContainerAsync(runtimeId, options, ct);
-
-    public Task<(int ExitCode, DateTimeOffset ExitedAt)?> WaitContainerAsync(string runtimeId, CancellationToken ct) =>
-        _cliFallback.WaitContainerAsync(runtimeId, ct);
+    // see XpcContainerRuntime.Archive.cs (task cider-ede.12). StartContainerAsync/WaitContainerAsync
+    // are ported — see XpcContainerRuntime.Process.cs/XpcContainerProcess.cs (task cider-ede.7).
 
     public Task<IContainerProcess> ExecAsync(string runtimeId, ExecSpec spec, CancellationToken ct) =>
         _cliFallback.ExecAsync(runtimeId, spec, ct);

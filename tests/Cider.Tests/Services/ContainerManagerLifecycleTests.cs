@@ -3,7 +3,10 @@ using Cider.Core.DockerApi;
 using Cider.Core.DockerApi.Models;
 using Cider.Core.DockerApi.Streams;
 using Cider.Core.Logs;
+using Cider.Core.Runtime;
 using Cider.Core.Services;
+using Cider.Core.State;
+using Cider.Tests.Fakes;
 using Xunit;
 
 namespace Cider.Tests.Services;
@@ -603,6 +606,102 @@ public sealed class ContainerManagerLifecycleTests
         var error = await Assert.ThrowsAsync<DockerApiException>(() =>
             harness.Containers.UpdateAsync(record.Id, new ContainerUpdateRequest { Memory = 1024 }, default));
         Assert.Equal(System.Net.HttpStatusCode.NotImplemented, error.Status);
+    }
+
+    /// <summary>
+    /// task cider-ede.7 fix direction §4: a daemon restart leaves a persisted <c>State.Running</c>
+    /// record with no in-memory process — exactly what a fresh <see cref="ContainerManager"/> that
+    /// never itself called <c>StartAsync</c> for this id, reconciling against a runtime that still
+    /// reports the container <see cref="RuntimeContainerState.Running"/>, reproduces without actually
+    /// restarting a process. Under <see cref="IContainerRuntime.IsXpcTransport"/> the real exit code
+    /// must be recovered (via the fake's own genuinely-blocking <c>WaitContainerAsync</c>) instead of
+    /// settling for "exit code unknown (daemon restarted)".
+    /// </summary>
+    [Fact]
+    public async Task Reconcile_recovers_the_real_exit_code_of_a_container_still_running_after_a_restart()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await using var events = await harness.CollectEventsAsync();
+        harness.Runtime.IsXpcTransport = true;
+
+        const string runtimeId = "survivor";
+        harness.Runtime.SeedContainer(new RuntimeContainer
+        {
+            RuntimeId = runtimeId,
+            State = RuntimeContainerState.Running,
+            ImageReference = "alpine",
+            Argv = ["sh", "-c", "sleep 0.05; exit 7"],
+        });
+
+        // The process is running on the (fake) engine already — attached directly, the way a
+        // container this daemon bootstrapped before an earlier process's restart would already be
+        // running when the new process comes up, with nothing in this ContainerManager's own
+        // in-memory handles pointing at it yet.
+        var process = new FakeProcess(["sh", "-c", "sleep 0.05; exit 7"], [], tty: false, openStdin: false);
+        harness.Runtime.GetContainer(runtimeId)!.Process = process;
+
+        var record = new ContainerRecord
+        {
+            Id = "survivor-id",
+            Name = "survivor",
+            RuntimeId = runtimeId,
+            Managed = true,
+            Request = new ContainerCreateRequest { Image = "alpine" },
+            State = new ContainerState { Status = "running", StartedAt = DateTimeOffset.UtcNow },
+        };
+        harness.Store.Upsert(record.Id, record);
+
+        await harness.Containers.ReconcileAsync(default);
+
+        // ReconcileAsync itself must return promptly — the wait for the real exit code runs detached.
+        Assert.Equal("running", harness.Store.Get(record.Id)!.State.Status);
+
+        await ContainerTestHarness.WaitUntilAsync(
+            () => harness.Store.Get(record.Id)!.State.Status == "exited",
+            "the reconciled container to report its real exit");
+
+        var settled = harness.Store.Get(record.Id)!;
+        Assert.Equal(7, settled.State.ExitCode);
+        Assert.Null(settled.State.Error);
+
+        await events.WaitForAsync("die");
+        var die = events.First("die");
+        Assert.Equal("7", die.Actor.Attributes["exitCode"]);
+    }
+
+    /// <summary>The CLI transport has no <c>containerWait</c> equivalent — the fake's own
+    /// <see cref="IContainerRuntime.IsXpcTransport"/> default (<c>false</c>) must leave a still-running
+    /// record exactly as reconcile always has (untouched, still "running"), never spin up a wait that
+    /// can only ever answer <c>null</c>.</summary>
+    [Fact]
+    public async Task Reconcile_does_not_wait_for_exit_on_the_cli_transport()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        const string runtimeId = "survivor-cli";
+        harness.Runtime.SeedContainer(new RuntimeContainer
+        {
+            RuntimeId = runtimeId,
+            State = RuntimeContainerState.Running,
+            ImageReference = "alpine",
+            Argv = ["sh", "-c", "sleep 300"],
+        });
+
+        var record = new ContainerRecord
+        {
+            Id = "survivor-cli-id",
+            Name = "survivor-cli",
+            RuntimeId = runtimeId,
+            Managed = true,
+            Request = new ContainerCreateRequest { Image = "alpine" },
+            State = new ContainerState { Status = "running", StartedAt = DateTimeOffset.UtcNow },
+        };
+        harness.Store.Upsert(record.Id, record);
+
+        await harness.Containers.ReconcileAsync(default);
+
+        Assert.DoesNotContain("WaitContainerAsync:" + runtimeId, harness.Runtime.Calls);
+        Assert.Equal("running", harness.Store.Get(record.Id)!.State.Status);
     }
 
     private static string Text(OutputChunk chunk) => Encoding.UTF8.GetString(chunk.Data.Span);
