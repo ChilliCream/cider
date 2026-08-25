@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using Cider.Core.Runtime;
 using Grpc.Core;
 using Grpc.Net.Client;
@@ -40,7 +41,12 @@ public sealed class BuilderLink : IAsyncDisposable
     /// <summary>The gRPC channel dialed over the exec pipe.</summary>
     public GrpcChannel Channel { get; }
 
-    /// <summary>The raw invoker backing <see cref="Channel"/>, for <see cref="GrpcForwarder"/>.</summary>
+    /// <summary>
+    /// The raw invoker backing <see cref="Channel"/>. <see cref="Target"/>'s
+    /// <see cref="ForwardTarget.Invoker"/> wraps this one in <see cref="ActivityTrackingHttpInvoker"/>
+    /// rather than exposing it directly, so <see cref="GrpcForwarder"/> always calls through the
+    /// tracked wrapper; this property remains the plain invoker for anything else that needs it.
+    /// </summary>
     public HttpMessageInvoker Invoker { get; }
 
     /// <summary>
@@ -52,9 +58,11 @@ public sealed class BuilderLink : IAsyncDisposable
     public CallInvoker CallInvoker { get; }
 
     /// <summary>
-    /// <see cref="Invoker"/> plus <c>"buildkit"</c> plus a <see cref="TokenBucketPacer"/> plus
-    /// <see cref="ForwardTarget.OnFailure"/> wired to invalidate this link — ready to hand to
-    /// <see cref="GrpcForwarder.ForwardAsync"/> or <see cref="GrpcForwarder.MapGrpcForwarder"/>.
+    /// <see cref="Invoker"/> wrapped in <see cref="ActivityTrackingHttpInvoker"/> (so forwarded calls
+    /// bump <see cref="Tracker"/> just like <see cref="CallInvoker"/> ones do) plus <c>"buildkit"</c>
+    /// plus a <see cref="TokenBucketPacer"/> plus <see cref="ForwardTarget.OnFailure"/> wired to
+    /// invalidate this link — ready to hand to <see cref="GrpcForwarder.ForwardAsync"/> or
+    /// <see cref="GrpcForwarder.MapGrpcForwarder"/>.
     /// </summary>
     public ForwardTarget Target { get; }
 
@@ -282,5 +290,189 @@ internal sealed class ActivityTrackingCallInvoker(CallInvoker inner, BuilderLink
         }
 
         public Task CompleteAsync() => inner.CompleteAsync();
+    }
+}
+
+/// <summary>
+/// Wraps a raw <see cref="HttpMessageInvoker"/> (a <see cref="BuilderLink"/>'s <see cref="BuilderLink.Invoker"/>,
+/// straight off <see cref="Tunnel.StreamHttp2Client.Create"/>) so every call reports into a
+/// <see cref="BuilderLinkTracker"/> the same way <see cref="ActivityTrackingCallInvoker"/> does for
+/// <see cref="BuilderLink.CallInvoker"/> -- except here the caller is <see cref="GrpcForwarder"/>'s raw
+/// byte forwarding rather than a generated client stub, so there are no messages to hook, only a call
+/// scope open for the request's lifetime and a response body to watch. This is what
+/// <see cref="BuilderLink.Target"/>'s <see cref="ForwardTarget.Invoker"/> is set to (see
+/// <see cref="BuilderConnection.EstablishLinkAsync"/>) so a stalled forwarded call -- upload or
+/// download -- is visible to the stall watchdog exactly like a stalled <see cref="BuilderLink.CallInvoker"/>
+/// call already is.
+/// </summary>
+internal static class ActivityTrackingHttpInvoker
+{
+    /// <summary>
+    /// Wraps <paramref name="inner"/> in a new <see cref="HttpMessageInvoker"/> that tracks calls
+    /// against <paramref name="tracker"/>. The returned invoker owns none of <paramref name="inner"/>'s
+    /// resources -- disposing it never disposes <paramref name="inner"/> or the handler backing it.
+    /// </summary>
+    public static HttpMessageInvoker Wrap(HttpMessageInvoker inner, BuilderLinkTracker tracker) =>
+        new(new TrackingHandler(inner, tracker), disposeHandler: false);
+
+    private sealed class TrackingHandler(HttpMessageInvoker inner, BuilderLinkTracker tracker) : DelegatingHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var scope = tracker.BeginCall();
+            try
+            {
+                var response = await inner.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                response.Content = new TrackingContent(response.Content, tracker, scope);
+                return response;
+            }
+            catch
+            {
+                scope.Dispose();
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stands in for the upstream response's own <see cref="HttpContent"/>, so that whatever reads it
+    /// -- <see cref="GrpcForwarder"/>'s <c>CopyResponseBodyAsync</c>, in practice -- reads through
+    /// <see cref="TrackingReadStream"/> instead, and so that the call scope opened in
+    /// <see cref="TrackingHandler"/> is disposed exactly once the response (this content) is disposed,
+    /// matching what happens to the request/response pair's own <c>using</c> block in
+    /// <see cref="GrpcForwarder.ForwardAsync"/>.
+    /// </summary>
+    private sealed class TrackingContent : HttpContent
+    {
+        private readonly HttpContent _inner;
+        private readonly BuilderLinkTracker _tracker;
+        private readonly IDisposable _scope;
+        private int _scopeDisposed;
+
+        public TrackingContent(HttpContent inner, BuilderLinkTracker tracker, IDisposable scope)
+        {
+            _inner = inner;
+            _tracker = tracker;
+            _scope = scope;
+
+            foreach (var header in inner.Headers)
+            {
+                Headers.TryAddWithoutValidation(header.Key, header.Value);
+            }
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync() =>
+            CreateContentReadStreamAsync(CancellationToken.None);
+
+        protected override async Task<Stream> CreateContentReadStreamAsync(CancellationToken cancellationToken)
+        {
+            var stream = await _inner.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            return new TrackingReadStream(stream, _tracker);
+        }
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            _inner.CopyToAsync(stream);
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken) =>
+            _inner.CopyToAsync(stream, cancellationToken);
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _inner.Dispose();
+                if (Interlocked.Exchange(ref _scopeDisposed, 1) == 0)
+                {
+                    _scope.Dispose();
+                }
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+
+    /// <summary>
+    /// The upstream response body stream, wrapped so every successful read (a positive byte count --
+    /// EOF and zero-length reads make no progress) bumps <see cref="BuilderLinkTracker.RecordProgress"/>.
+    /// Read-only: <see cref="GrpcForwarder"/> only ever reads a response body.
+    /// </summary>
+    private sealed class TrackingReadStream(Stream inner, BuilderLinkTracker tracker) : Stream
+    {
+        public override bool CanRead => inner.CanRead;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = inner.Read(buffer, offset, count);
+            if (read > 0)
+            {
+                tracker.RecordProgress();
+            }
+
+            return read;
+        }
+
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            var read = await inner.ReadAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false);
+            if (read > 0)
+            {
+                tracker.RecordProgress();
+            }
+
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var read = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (read > 0)
+            {
+                tracker.RecordProgress();
+            }
+
+            return read;
+        }
+
+        public override void Flush() => inner.Flush();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            await inner.DisposeAsync().ConfigureAwait(false);
+            await base.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }

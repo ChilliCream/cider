@@ -94,8 +94,7 @@ public sealed class BuilderConnection : IBuilderConnection, IAsyncDisposable
 
             if (existing is not null)
             {
-                ClearCurrentIfSame(existing);
-                await DisposeQuietlyAsync(existing).ConfigureAwait(false);
+                InvalidateCore(existing, reason: null, forceRestart: existing.Tracker.IsStalled(_stallThreshold));
             }
 
             var link = await DialNewLinkAsync(cancellationToken).ConfigureAwait(false);
@@ -153,17 +152,6 @@ public sealed class BuilderConnection : IBuilderConnection, IAsyncDisposable
         lock (_stateLock)
         {
             return _current;
-        }
-    }
-
-    private void ClearCurrentIfSame(BuilderLink link)
-    {
-        lock (_stateLock)
-        {
-            if (ReferenceEquals(_current, link))
-            {
-                _current = null;
-            }
         }
     }
 
@@ -225,7 +213,7 @@ public sealed class BuilderConnection : IBuilderConnection, IAsyncDisposable
         BuilderLink? linkBox = null;
         var target = new ForwardTarget
         {
-            Invoker = invoker,
+            Invoker = ActivityTrackingHttpInvoker.Wrap(invoker, tracker),
             Authority = "buildkit",
             Pacer = pacer,
             OnFailure = ex =>
