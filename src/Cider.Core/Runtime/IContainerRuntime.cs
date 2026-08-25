@@ -91,4 +91,25 @@ public interface IContainerRuntime
     Task RemoveVolumeAsync(string name, bool force, CancellationToken ct);
 
     Task<RuntimeDiskUsage> GetDiskUsageAsync(CancellationToken ct);
+
+    // ---- builder ------------------------------------------------------------
+
+    /// <summary>Current state of the Apple builder VM (<c>container builder status</c>); <c>null</c>
+    /// when no builder has ever been started on this machine.</summary>
+    Task<BuilderStatus?> GetBuilderStatusAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Starts the Apple builder VM (<c>container builder start</c>), tolerating "already running".
+    /// <paramref name="cpus"/>/<paramref name="memoryBytes"/> are passed through as <c>-c</c>/<c>-m</c>
+    /// only when set; <c>null</c> leaves Apple's own defaults (2 vCPU / 2 GiB) in place.
+    /// </summary>
+    Task StartBuilderAsync(int? cpus, long? memoryBytes, CancellationToken ct);
+
+    /// <summary>
+    /// Opens a raw duplex byte pipe to buildkitd: <c>container exec -i buildkit buildctl dial-stdio</c>.
+    /// The caller must keep <see cref="IContainerProcess.Stderr"/> drained (it is not read here), must
+    /// not call <see cref="IContainerProcess.CloseStdinAsync"/> while output is still expected, and
+    /// disposing the returned process is what terminates the dial.
+    /// </summary>
+    Task<IContainerProcess> DialBuilderAsync(CancellationToken ct);
 }

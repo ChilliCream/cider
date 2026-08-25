@@ -324,6 +324,27 @@ internal static class ArgBuilder
         return args;
     }
 
+    /// <summary><c>container builder start [-c &lt;cpus&gt;] [-m &lt;MiB&gt;M]</c>; both flags are
+    /// omitted when the value is unset, leaving Apple's own defaults (2 vCPU / 2 GiB) in place.</summary>
+    public static List<string> BuilderStart(int? cpus, long? memoryBytes)
+    {
+        var args = new List<string> { "builder", "start" };
+
+        if (cpus is > 0)
+        {
+            args.Add("-c");
+            args.Add(cpus.Value.ToString(CultureInfo.InvariantCulture));
+        }
+
+        if (memoryBytes is > 0)
+        {
+            args.Add("-m");
+            args.Add(FormatMebibytes(memoryBytes.Value));
+        }
+
+        return args;
+    }
+
     /// <summary><c>container network create …</c>.</summary>
     public static List<string> CreateNetwork(NetworkSpec spec)
     {

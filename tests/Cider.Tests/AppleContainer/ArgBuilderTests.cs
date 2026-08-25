@@ -230,6 +230,19 @@ public class ArgBuilderTests
     }
 
     [Fact]
+    public void Builder_start_omits_flags_when_unset()
+    {
+        Assert.Equal(new[] { "builder", "start" }, ArgBuilder.BuilderStart(null, null));
+    }
+
+    [Fact]
+    public void Builder_start_passes_cpus_and_memory_when_set()
+    {
+        var args = ArgBuilder.BuilderStart(4, 4L * 1024 * 1024 * 1024);
+        Assert.Equal(new[] { "builder", "start", "-c", "4", "-m", "4096M" }, args);
+    }
+
+    [Fact]
     public void Network_create_maps_the_spec()
     {
         var args = ArgBuilder.CreateNetwork(new NetworkSpec

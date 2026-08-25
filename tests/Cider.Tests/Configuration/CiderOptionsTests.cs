@@ -23,6 +23,9 @@ public sealed class CiderOptionsTests : IDisposable
         Assert.Equal("docker.io/coredns/coredns:1.14.7", options.DnsForwarderImage);
         Assert.Equal(3, options.PollIntervalSeconds);
         Assert.Equal(64L * 1024 * 1024, options.LogMaxBytes);
+        Assert.True(options.BuildKitEnabled);
+        Assert.Null(options.BuilderCpus);
+        Assert.Null(options.BuilderMemoryBytes);
         Assert.Equal("1.47", options.ApiVersion);
         Assert.Equal("1.24", options.MinApiVersion);
         Assert.Equal("29.0.0", options.EngineVersion);
@@ -51,7 +54,8 @@ public sealed class CiderOptionsTests : IDisposable
               "defaultCpus": 6,
               "pollIntervalSeconds": 9,
               "logLevel": "Debug",
-              "dns": { "enabled": false, "listen": "127.0.0.1:5353", "upstream": ["8.8.4.4:53"] }
+              "dns": { "enabled": false, "listen": "127.0.0.1:5353", "upstream": ["8.8.4.4:53"] },
+              "builder": { "enabled": false, "cpus": 4, "memory": 4294967296 }
             }
             """);
 
@@ -63,6 +67,9 @@ public sealed class CiderOptionsTests : IDisposable
         Assert.False(options.DnsEnabled);
         Assert.Equal("127.0.0.1:5353", options.DnsListen);
         Assert.Equal(["8.8.4.4:53"], options.DnsUpstreams);
+        Assert.False(options.BuildKitEnabled);
+        Assert.Equal(4, options.BuilderCpus);
+        Assert.Equal(4294967296L, options.BuilderMemoryBytes);
         Assert.Equal("Warning", options.LogLevel);
         Assert.Equal(Path.Combine(_root, "custom.sock"), options.SocketPath);
 
@@ -81,6 +88,45 @@ public sealed class CiderOptionsTests : IDisposable
         var options = CiderOptions.Load(_root, null, null);
 
         Assert.Equal("container", options.ContainerCliPath);
+    }
+
+    [Theory]
+    [InlineData("0", false)]
+    [InlineData("false", false)]
+    [InlineData("FALSE", false)]
+    [InlineData("1", true)]
+    [InlineData("true", true)]
+    public void CIDER_BUILDKIT_overrides_the_file_and_the_default(string envValue, bool expectedEnabled)
+    {
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(
+            Path.Combine(_root, CiderOptions.ConfigFileName),
+            """{ "builder": { "enabled": false } }""");
+
+        Environment.SetEnvironmentVariable("CIDER_BUILDKIT", envValue);
+        try
+        {
+            var options = CiderOptions.Load(_root, null, null);
+            Assert.Equal(expectedEnabled, options.BuildKitEnabled);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CIDER_BUILDKIT", null);
+        }
+    }
+
+    [Fact]
+    public void Builder_cpus_and_memory_are_only_applied_when_positive()
+    {
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(
+            Path.Combine(_root, CiderOptions.ConfigFileName),
+            """{ "builder": { "cpus": 0, "memory": -1 } }""");
+
+        var options = CiderOptions.Load(_root, null, null);
+
+        Assert.Null(options.BuilderCpus);
+        Assert.Null(options.BuilderMemoryBytes);
     }
 
     [Fact]

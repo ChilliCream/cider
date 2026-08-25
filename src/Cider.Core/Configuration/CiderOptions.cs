@@ -76,6 +76,21 @@ public sealed partial class CiderOptions
     /// <summary>Optional <c>--dns-search</c> domain handed to containers.</summary>
     public string DnsSearchDomain { get; set; } = "";
 
+    /// <summary>Whether the daemon offers BuildKit through the Apple builder VM at all.</summary>
+    public bool BuildKitEnabled { get; set; } = true;
+
+    /// <summary>
+    /// vCPUs passed as <c>-c</c> to <c>container builder start</c>; <c>null</c> (the default) leaves
+    /// Apple's own default (2) in place rather than passing the flag.
+    /// </summary>
+    public int? BuilderCpus { get; set; }
+
+    /// <summary>
+    /// Memory passed as <c>-m</c> to <c>container builder start</c>; <c>null</c> (the default) leaves
+    /// Apple's own default (2 GiB) in place rather than passing the flag.
+    /// </summary>
+    public long? BuilderMemoryBytes { get; set; }
+
     /// <summary>
     /// How published ports carry traffic: <see cref="ProxyPortPublishing"/> (the daemon binds the
     /// host port itself and proxies to the container's VM address) or <see cref="ApplePortPublishing"/>
@@ -161,6 +176,12 @@ public sealed partial class CiderOptions
         if (!string.IsNullOrEmpty(envPortPublishing))
         {
             options.PortPublishing = envPortPublishing;
+        }
+
+        var envBuildKit = Environment.GetEnvironmentVariable("CIDER_BUILDKIT");
+        if (!string.IsNullOrEmpty(envBuildKit))
+        {
+            options.BuildKitEnabled = !IsFalsy(envBuildKit);
         }
 
         if (!string.IsNullOrEmpty(socketOverride))
@@ -318,6 +339,21 @@ public sealed partial class CiderOptions
             }
         }
 
+        if (model.Builder is not null)
+        {
+            BuildKitEnabled = model.Builder.Enabled ?? BuildKitEnabled;
+
+            if (model.Builder.Cpus is > 0)
+            {
+                BuilderCpus = model.Builder.Cpus;
+            }
+
+            if (model.Builder.Memory is > 0)
+            {
+                BuilderMemoryBytes = model.Builder.Memory;
+            }
+        }
+
         if (!string.IsNullOrEmpty(model.PortPublishing))
         {
             PortPublishing = model.PortPublishing;
@@ -338,6 +374,11 @@ public sealed partial class CiderOptions
             LogLevel = model.LogLevel;
         }
     }
+
+    /// <summary><c>CIDER_BUILDKIT=0</c>/<c>=false</c> (case-insensitive) disables; anything else enables.</summary>
+    private static bool IsFalsy(string value) =>
+        string.Equals(value, "0", StringComparison.Ordinal) ||
+        string.Equals(value, "false", StringComparison.OrdinalIgnoreCase);
 
     private static string FirstNonEmpty(params string?[] candidates)
     {
@@ -390,6 +431,7 @@ public sealed partial class CiderOptions
         public double? DefaultCpus { get; set; }
         public long? DefaultMemoryBytes { get; set; }
         public DnsModel? Dns { get; set; }
+        public BuilderModel? Builder { get; set; }
         public string? PortPublishing { get; set; }
         public int? PollIntervalSeconds { get; set; }
         public long? LogMaxBytes { get; set; }
@@ -410,6 +452,12 @@ public sealed partial class CiderOptions
                 Upstream = options.DnsUpstreams,
                 SearchDomain = options.DnsSearchDomain,
             },
+            Builder = new BuilderModel
+            {
+                Enabled = options.BuildKitEnabled,
+                Cpus = options.BuilderCpus,
+                Memory = options.BuilderMemoryBytes,
+            },
             PortPublishing = options.PortPublishing,
             PollIntervalSeconds = options.PollIntervalSeconds,
             LogMaxBytes = options.LogMaxBytes,
@@ -423,5 +471,12 @@ public sealed partial class CiderOptions
         public string? Listen { get; set; }
         public string[]? Upstream { get; set; }
         public string? SearchDomain { get; set; }
+    }
+
+    private sealed class BuilderModel
+    {
+        public bool? Enabled { get; set; }
+        public int? Cpus { get; set; }
+        public long? Memory { get; set; }
     }
 }

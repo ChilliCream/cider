@@ -139,8 +139,27 @@ public class OrphanReaperTests
     [InlineData("mycontainer start -a c1", false)]
     [InlineData("container", false)]
     [InlineData("", false)]
+    [InlineData("container exec -i buildkit buildctl dial-stdio", true)] // ArgBuilder.Exec(DialBuilderAsync's spec)
+    [InlineData("/usr/local/bin/container exec -i buildkit buildctl dial-stdio", true)]
+    [InlineData("container exec -i -t buildkit sh", false)] // an ordinary exec must not be reaped
+    [InlineData("container exec -i buildkit sh", false)] // exec into buildkit, but not the dial itself
     public void Only_the_held_start_shapes_match(string command, bool expected) =>
         Assert.Equal(expected, OrphanReaper.IsHeldContainerChild(command));
+
+    /// <summary>
+    /// A crashed daemon leaving a held <c>exec -i buildkit buildctl dial-stdio</c> running poisons the
+    /// builder for every later exec until <c>container builder start</c> is run again; it must be
+    /// reaped exactly like a held container.
+    /// </summary>
+    [Fact]
+    public void An_orphaned_builder_dial_is_reaped()
+    {
+        var (reaper, killed) = Create(
+            Row(5001, 1, "container exec -i buildkit buildctl dial-stdio" + M));
+
+        Assert.Equal(1, reaper.ReapOrphanedHeldProcesses());
+        Assert.Equal([5001], killed);
+    }
 
     [Fact]
     public void The_logged_command_never_contains_the_environment()

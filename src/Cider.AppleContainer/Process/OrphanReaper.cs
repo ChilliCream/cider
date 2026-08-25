@@ -117,8 +117,12 @@ internal sealed class OrphanReaper
 
     /// <summary>
     /// <c>true</c> for the child shapes the daemon holds per container: <c>container start -a …</c>
-    /// (with or without <c>-i</c>). Deliberately anchored to the start of the argv so an unrelated
-    /// process merely mentioning the words (an editor, a grep) is never matched.
+    /// (with or without <c>-i</c>), and <c>container exec -i buildkit buildctl dial-stdio</c> — the
+    /// builder dial held for the lifetime of a BuildKit session. Deliberately anchored to the start of
+    /// the argv so an unrelated process merely mentioning the words (an editor, a grep) is never
+    /// matched. A crashed daemon leaving the dial-stdio child running poisons the builder for every
+    /// exec until <c>container builder start</c> is run again, which is why it is reaped like a held
+    /// container even though it is not one.
     /// </summary>
     internal static bool IsHeldContainerChild(string command, string cliBasename = "container")
     {
@@ -141,7 +145,8 @@ internal sealed class OrphanReaper
         var rest = trimmed[(firstSpace + 1)..].TrimStart();
         return rest.StartsWith("start -a", StringComparison.Ordinal) ||
             rest.StartsWith("start -i -a", StringComparison.Ordinal) ||
-            rest.StartsWith("start --attach", StringComparison.Ordinal);
+            rest.StartsWith("start --attach", StringComparison.Ordinal) ||
+            rest.StartsWith("exec -i buildkit buildctl dial-stdio", StringComparison.Ordinal);
     }
 
     private static IReadOnlyList<ProcessRow> ListHostProcesses()
