@@ -89,6 +89,7 @@ The other verbs:
 ```bash
 cider serve [--socket PATH] [--data-dir DIR] [--log-level LEVEL] [--no-dns]   # the default verb
 cider status [--socket PATH]        # socket / launchd / Apple container status
+cider sync [--socket PATH] [--data-dir DIR] [--json]   # resync cider's state with Apple container
 cider uninstall [--data-dir DIR]    # unload the agent, drop the context, restore the system socket
 cider version
 ```
@@ -360,9 +361,23 @@ container logs live under `~/.cider/logs`; the daemon's own launchd log is `~/.c
 | `src/Cider.Core` | Docker wire DTOs, the `IContainerRuntime` abstraction, state stores, managers (container/exec/image/network/volume/system), events, logs, health, restart supervision — no ASP.NET dependency |
 | `src/Cider.AppleContainer` | The `IContainerRuntime` implementation that drives the `container` CLI: process launching, pty handling, JSON parsing, error mapping |
 | `src/Cider.Dns` | Standalone DNS server (UDP + TCP), message codec, resolver interface — no dependency on Core |
-| `src/Cider.Daemon` | The `cider` executable: Kestrel hosting, the hijack interceptor, Docker API routes, and the `serve`/`install`/`uninstall`/`status` verbs |
+| `src/Cider.Daemon` | The `cider` executable: Kestrel hosting, the hijack interceptor, Docker API routes, and the `serve`/`install`/`uninstall`/`status`/`sync` verbs |
 
 ## Troubleshooting
+
+### cider's records disagree with Apple `container`
+
+A container/network/volume deleted with the Apple CLI directly, Apple services restarted, or a
+hard-killed daemon (below) can all leave cider's own records out of sync with what Apple `container`
+actually has — `docker ps`/`docker network ls` keep showing something that is gone, or don't show
+something you created with the Apple CLI. Resync on demand:
+
+```bash
+cider sync
+```
+
+This only ever fixes cider's own records and cider-owned side processes (DNS forwarders); it never
+deletes anything on the Apple side. Pass `--json` for the raw report.
 
 ### A hard-killed daemon can wedge the Apple runtime
 
@@ -388,6 +403,7 @@ container ls -a                          # find the leaked containers…
 container stop <name> && container delete <name>
 container network ls                     # …then the networks they were holding
 container network delete <name>
+cider sync                               # then bring cider's own records back in line
 ```
 
 Orphaned `cider-dns-*` CoreDNS forwarders come from the same mechanism and are removed the same way
