@@ -1,0 +1,18 @@
+XpcProbe on .NET 10.0.10, pid 15440, macOS 26.6.2 Arm64
+block layout: Literal size=32 (isa@0,flags@8,reserved@12,invoke@16,descriptor@24), Descriptor size=16, _NSConcreteGlobalBlock=0x1f65ebc30
+connection created + activated; remote pid before first message = 0
+
+==== getDefaultKernel ====
+kernel JSON (253 bytes): {"path":"file:\/\/\/Users\/michael\/Library\/Application%20Support\/com.apple.container\/kernels\/vmlinux-6.18.15-186","platform":{"os":"linux","architecture":"arm64"},"commandLine":{"initArgs":[],"kernelArgs":["console=hvc0","tsc=reliable","panic=0"]}}
+
+==== containerCreate + containerDelete x10 (full config copied from `container inspect xpcprobe-ref`) ====
+  verify after create: `container ls -a` CONTAINS xpcprobe-1
+  verify via XPC containerList: ids = [xpcprobe-1, buildkit, cider-dns-bridge-bf58c86d]
+  verify after delete: `container ls -a` no longer contains xpcprobe-1
+  containerCreate (XPC): n=10 min=7.712 median=11.341 p99=17.000 max=17.000 mean=12.081 ms
+  containerDelete (XPC, forceDelete=true): n=10 min=0.640 median=0.839 p99=1.371 max=1.371 mean=0.944 ms
+  create+delete cycle (XPC): n=10 min=8.677 median=12.180 p99=17.826 max=17.826 mean=13.025 ms
+
+==== cleanup ====
+  no xpcprobe-* leftovers (xpcprobe-ref is the CLI-made reference, removed by the shell)
+  xpc connection events seen: 0 (last: none)

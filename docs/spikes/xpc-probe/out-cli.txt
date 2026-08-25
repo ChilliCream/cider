@@ -1,0 +1,13 @@
+XpcProbe on .NET 10.0.10, pid 15454, macOS 26.6.2 Arm64
+block layout: Literal size=32 (isa@0,flags@8,reserved@12,invoke@16,descriptor@24), Descriptor size=16, _NSConcreteGlobalBlock=0x1f65ebc30
+connection created + activated; remote pid before first message = 0
+
+==== CLI comparison: `container create --name xpcprobe-cli alpine:3.20 sleep 60` + `container delete xpcprobe-cli` x10 ====
+  container create (CLI): n=10 min=41.266 median=47.472 p99=89.596 max=89.596 mean=51.200 ms
+  container delete (CLI): n=10 min=17.735 median=19.030 p99=21.553 max=21.553 mean=19.159 ms
+  create+delete cycle (CLI): n=10 min=59.001 median=65.727 p99=109.276 max=109.276 mean=70.359 ms
+  container ls -a (CLI): n=10 min=18.540 median=19.040 p99=21.121 max=21.121 mean=19.361 ms
+
+==== cleanup ====
+  no xpcprobe-* leftovers (xpcprobe-ref is the CLI-made reference, removed by the shell)
+  xpc connection events seen: 0 (last: none)

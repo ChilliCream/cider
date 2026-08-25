@@ -1,0 +1,38 @@
+
+==== getDefaultKernel ====
+kernel JSON (253 bytes): {"path":"file:\/\/\/Users\/michael\/Library\/Application%20Support\/com.apple.container\/kernels\/vmlinux-6.18.15-186","platform":{"os":"linux","architecture":"arm64"},"commandLine":{"initArgs":[],"kernelArgs":["console=hvc0","tsc=reliable","panic=0"]}}
+
+==== server-side validation experiments ====
+- minimal config {id,image,initProcess} + kernel, no containerOptions
+  sending containerConfig = {"id":"xpcprobe-min","image":{"reference":"docker.io/library/alpine:3.20","descriptor":{"digest":"sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc","mediaType":"application/vnd.oci.image.index.v1\u002Bjson","size":9226}},"initProcess":{"executable":"sleep","arguments":["60"],"environment":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],"workingDirectory":"/","terminal":false,"user":{"id":{"uid":0,"gid":0}},"supplementalGroups":[],"rlimits":[]}}
+  accepted; `container ls -a` shows it
+  server-filled defaults: networks=[], resources={"cpuOverhead":1,"cpus":4,"memoryInBytes":1073741824}, platform={"architecture":"arm64","os":"linux","variant":"v8"}, creationDate=1970-01-01T00:00:00Z
+  -> OK (accepted)
+- missing kernel key
+  -> error JSON: {"message":"kernel cannot be empty","code":"invalidArgument"}
+- creationDate as ISO-8601 string (as printed by `container inspect`)
+  -> error JSON: {"message":"DecodingError.typeMismatch: expected value of type Double. Path: creationDate. Debug description: Expected to decode Double but found a string instead.","code":"unknown"}
+- invalid container id "xpc probe!"
+  -> error JSON: {"message":"container ID xpc probe! is not a valid container ID","code":"invalidArgument"}
+- memory below 200 MiB
+  -> error JSON: {"message":"minimum memory amount allowed is 200 MiB (got 104857600 bytes)","code":"invalidArgument"}
+- unknown image reference (not in local store)
+  -> error JSON: {"message":"image docker.io\/library\/alpine:9.99 not found","code":"notFound"}
+- duplicate create of an existing id (xpcprobe-dup created first, then created again)
+  -> error JSON: {"message":"container already exists: xpcprobe-dup","code":"exists"}
+- duplicate hostname (xpcprobe-h1 with hostname xpcprobe-h1, then xpcprobe-h2 with the same hostname)
+  -> error JSON: {"message":"hostname(s) already exist: [\"xpcprobe-h1\"]","code":"exists"}
+- delete of a non-existent id
+  -> error JSON: {"message":"container with ID xpcprobe-nope not found","code":"notFound"}
+- unknown route "bogusRoute" (server drops the message without replying; timed)
+  returned after 0.222 ms; events so far=0 last=none
+  -> XpcTransportException: XPC transport error: Connection interrupted
+- ping on the same connection right after the unknown route
+  apiServerVersion = "container-apiserver version 1.3.0 (build: release, commit: d6de569)"; remote pid = 89583
+  -> OK (accepted)
+- message without a route key
+  -> error JSON: {"message":"invalid request","code":"invalidArgument"}
+
+==== cleanup ====
+  no xpcprobe-* leftovers (xpcprobe-ref is the CLI-made reference, removed by the shell)
+  xpc connection events seen: 0 (last: none)

@@ -1,0 +1,17 @@
+XpcProbe on .NET 10.0.10, pid 15432, macOS 26.6.2 Arm64
+block layout: Literal size=32 (isa@0,flags@8,reserved@12,invoke@16,descriptor@24), Descriptor size=16, _NSConcreteGlobalBlock=0x1f65ebc30
+connection created + activated; remote pid before first message = 0
+
+==== containerList ====
+reply keys: containers:data
+[no listFilters] containers payload: 3513 bytes, 2 containers
+  ids: buildkit, cider-dns-bridge-bf58c86d
+  first 500 chars: [{"configuration":{"rosetta":true,"capAdd":["ALL"],"ssh":false,"platform":{"os":"linux","variant":"v8","architecture":"arm64"},"runtimeHandler":"container-runtime-linux","creationDate":809343921.910427,"useInit":false,"id":"buildkit","capDrop":[],"labels":{"com.apple.container.resource.role":"builder","com.apple.container.plugin":"builder"},"publishedSockets":[],"resources":{"memoryInBytes":2147483648,"cpuOverhead":1,"cpus":2},"sysctls":{},"virtualization":false,"initProcess":{"workingDirectory"
+[listFilters={"ids":[],"labels":{}}] containers payload: 3513 bytes, 2 containers
+  ids: buildkit, cider-dns-bridge-bf58c86d
+  first 500 chars: [{"configuration":{"rosetta":true,"capAdd":["ALL"],"ssh":false,"platform":{"os":"linux","variant":"v8","architecture":"arm64"},"runtimeHandler":"container-runtime-linux","creationDate":809343921.910427,"useInit":false,"id":"buildkit","capDrop":[],"labels":{"com.apple.container.resource.role":"builder","com.apple.container.plugin":"builder"},"publishedSockets":[],"resources":{"memoryInBytes":2147483648,"cpuOverhead":1,"cpus":2},"sysctls":{},"virtualization":false,"initProcess":{"workingDirectory"
+  containerList (no filters): n=100 min=0.090 median=0.104 p99=0.175 max=0.474 mean=0.111 ms
+
+==== cleanup ====
+  no xpcprobe-* leftovers (xpcprobe-ref is the CLI-made reference, removed by the shell)
+  xpc connection events seen: 0 (last: none)
