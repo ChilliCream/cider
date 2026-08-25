@@ -14,11 +14,16 @@ internal readonly record struct XpcCallOptions
     /// (<c>containerWait/Stop/Kill/Delete/Logs/Dial/Stats/Export/StartProcess/Resize</c>, §1.4).</summary>
     public TimeSpan? Timeout { get; init; }
 
-    /// <summary>When <c>true</c>, the blocking sync send runs on a dedicated thread instead of a
-    /// thread-pool thread, so a long call never starves the pool. Only <c>containerWait</c> needs
-    /// this today — it both blocks until the process exits and, per <see cref="Timeout"/>, carries
-    /// no client-side budget either.</summary>
-    public bool LongRunning { get; init; }
+    /// <summary>When <c>true</c>, this call runs on its own single-use native XPC connection and a
+    /// dedicated managed thread, instead of the client's shared connection and the thread pool.
+    /// Reserved for <c>containerWait</c>/<c>Logs</c>/<c>Dial</c> — the routes that can legitimately
+    /// block indefinitely (§1.4's "no timeout" row) — so that a per-call timeout or cancellation on
+    /// one of these calls only ever tears down *that* call's own throwaway connection, never the
+    /// shared connection every other concurrent call (list, ping, kill, stop, …) depends on. Task's
+    /// binding ruling (2026-08-25): a per-call timeout/cancel must never tear down the shared
+    /// connection — only a real connection-level error, observed reactively, may do that; see
+    /// <see cref="RunWithTimeoutAsync"/> vs. <see cref="SendOnDedicatedConnectionAsync"/>.</summary>
+    public bool DedicatedConnection { get; init; }
 
     /// <summary>The Swift client's default for everything on <c>ContainerClient</c> (§1.4).</summary>
     public static XpcCallOptions Default { get; } = new() { Timeout = XpcClient.DefaultTimeout };
@@ -26,20 +31,24 @@ internal readonly record struct XpcCallOptions
     /// <summary><c>containerList</c>'s own override (§1.4).</summary>
     public static XpcCallOptions List { get; } = new() { Timeout = TimeSpan.FromSeconds(10) };
 
-    /// <summary>No client-side timeout at all (§1.4's "no timeout" row).</summary>
+    /// <summary>No client-side timeout at all (§1.4's "no timeout" row), on the shared connection.</summary>
     public static XpcCallOptions NoTimeout { get; } = new() { Timeout = null };
 
-    /// <summary><c>containerWait</c>: no timeout, dedicated thread.</summary>
-    public static XpcCallOptions LongRunningNoTimeout { get; } = new() { Timeout = null, LongRunning = true };
+    /// <summary><c>containerWait</c>/<c>Logs</c>/<c>Dial</c>: no client-side timeout (they block
+    /// until the process exits / the stream ends / the dial completes) and a dedicated per-call
+    /// connection + thread (see <see cref="DedicatedConnection"/>).</summary>
+    public static XpcCallOptions LongRunning { get; } = new() { Timeout = null, DedicatedConnection = true };
 }
 
 /// <summary>
 /// One XPC client connection to a single mach service — one instance per service, as the task's
-/// fix direction calls for. Connections are created lazily on first send, are safe to call
-/// concurrently from multiple callers, and self-heal: the event handler block notices
+/// fix direction calls for. The shared connection is created lazily on first send, is safe to call
+/// concurrently from multiple callers, and self-heals: the event handler block notices
 /// <c>XPC_ERROR_CONNECTION_INTERRUPTED</c>/<c>XPC_ERROR_CONNECTION_INVALID</c> and marks the
 /// connection stale, so the next <see cref="SendAsync"/> transparently recreates it (the apiserver
 /// restarting is invisible to the caller past one call) rather than reusing a dead connection.
+/// Calls flagged <see cref="XpcCallOptions.DedicatedConnection"/> bypass the shared connection
+/// entirely — see <see cref="SendOnDedicatedConnectionAsync"/>.
 /// </summary>
 internal sealed class XpcClient : IDisposable
 {
@@ -55,8 +64,8 @@ internal sealed class XpcClient : IDisposable
     /// ever mark *this* generation broken, never whatever generation happens to be current by the
     /// time it arrives. Without that, a stale C1's guaranteed-terminal event landing after
     /// <see cref="EnsureConnection"/> has already replaced it with a healthy C2 would tear C2 down
-    /// too — the same failure mode a timed-out/abandoned <see cref="SendSync"/> that finally returns
-    /// against a since-replaced connection would trigger.
+    /// too. Also doubles as the single-use handle+block pair for a
+    /// <see cref="SendOnDedicatedConnectionAsync"/> call, where <see cref="Broken"/> is never read.
     /// </summary>
     private sealed class Connection
     {
@@ -95,16 +104,15 @@ internal sealed class XpcClient : IDisposable
         var stopwatch = Stopwatch.StartNew();
         try
         {
-            // Checked before EnsureConnection: EnsureConnection hands out a caller-owned retain
-            // that only SendSync ever releases (via RunWithTimeoutAsync/RunOnDedicatedThreadAsync
-            // below). If ct were already cancelled, bailing out here means that retain is never
-            // taken in the first place, so there is nothing for SendSync to have to balance.
+            // Checked up front: for the shared-connection path, EnsureConnection hands out a
+            // caller-owned retain that only SendSync ever releases (via RunWithTimeoutAsync below).
+            // If ct were already cancelled, bailing out here means that retain is never taken in
+            // the first place, so there is nothing to have to balance.
             ct.ThrowIfCancellationRequested();
-            var connection = EnsureConnection();
 
-            var replyDict = options.LongRunning
-                ? await RunOnDedicatedThreadAsync(connection, request, ct).ConfigureAwait(false)
-                : await RunWithTimeoutAsync(connection, request, options.Timeout, ct).ConfigureAwait(false);
+            var replyDict = options.DedicatedConnection
+                ? await SendOnDedicatedConnectionAsync(request, options.Timeout, ct).ConfigureAwait(false)
+                : await RunWithTimeoutAsync(EnsureConnection(), request, options.Timeout, ct).ConfigureAwait(false);
 
             return new XpcMessage(replyDict);
         }
@@ -136,105 +144,144 @@ internal sealed class XpcClient : IDisposable
             // raw sync send runs at (docs/spikes/xpc/04-dotnet-xpc-probe-report.md).
             return await sendTask.WaitAsync(budget, ct).ConfigureAwait(false);
         }
-        catch (TimeoutException)
+        catch (Exception ex) when (ex is TimeoutException || ex is OperationCanceledException)
         {
             // Purely client-side, exactly like the Swift client (§1.4): the underlying sync send is
-            // still blocked in native code. Cancelling the connection here releases that blocked
-            // thread promptly with an XPC_ERROR_CONNECTION_INVALID reply instead of leaving it
-            // hanging until the daemon eventually replies (or never does); EnsureConnection then
-            // transparently reconnects on the next call. The abandoned task is only observed, never
-            // awaited further, so its eventual fault (or success, which must still be disposed
-            // rather than leaked) can never surface as an unobserved exception, or leaked reply,
-            // once the caller has already moved on with a Timeout.
-            connection.Broken = true;
-            XpcNative.xpc_connection_cancel(connection.Handle);
-            _ = sendTask.ContinueWith(
-                static t =>
-                {
-                    if (t.IsFaulted)
-                    {
-                        t.Exception!.Handle(_ => true);
-                    }
-                    else if (t.IsCompletedSuccessfully)
-                    {
-                        t.Result.Dispose();
-                    }
-                },
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
-            throw XpcException.Timeout($"XPC timeout for request to {_serviceName}/{request.Route}");
+            // still blocked in native code, on the SHARED connection every other concurrent call may
+            // depend on. Task's binding ruling (2026-08-25): a per-call timeout/cancel must NEVER
+            // tear that connection down — only a real connection-level error, observed reactively in
+            // SendSync/OnConnectionEvent, may mark it broken. So unlike
+            // SendOnDedicatedConnectionAsync below, this deliberately leaves the connection alone:
+            // the abandoned sync send's native thread stays blocked until the daemon eventually
+            // replies (or the connection is later torn down for an unrelated reason) — a bounded,
+            // accepted leak (pre-cb184d0 behavior for this path). The abandoned task is only
+            // observed, never awaited further, so its eventual fault (or success, which must still
+            // be disposed rather than leaked) can never surface as an unobserved exception, or leaked
+            // reply, once the caller has already moved on with an exception of its own. Rethrowing
+            // (not wrapping) preserves the original exception type/identity for the caller.
+            ObserveAbandoned(sendTask);
+
+            if (ex is TimeoutException)
+            {
+                throw XpcException.Timeout($"XPC timeout for request to {_serviceName}/{request.Route}");
+            }
+
+            throw;
         }
     }
 
-    private Task<XpcDictionary> RunOnDedicatedThreadAsync(Connection connection, XpcMessage request, CancellationToken ct) =>
-        // CancellationToken.None, not ct, for the same reason as RunWithTimeoutAsync above: SendSync
-        // must always run so it always releases EnsureConnection's caller-owned retain. Cancellation
-        // is not supported on this long-running path anyway — the sync send itself is never
-        // interrupted by ct.
-        Task.Factory.StartNew(
-            () => SendSync(connection, request),
+    /// <summary>Sends on a fresh, single-use native connection — never <see cref="_current"/> —
+    /// created and torn down entirely within this one call. Because nothing else ever touches this
+    /// connection, cancelling it on timeout/<paramref name="ct"/> cancellation is always safe: there
+    /// is no shared connection to collateral-damage, unlike <see cref="RunWithTimeoutAsync"/>. This
+    /// is what <see cref="XpcCallOptions.DedicatedConnection"/> requests for
+    /// <c>containerWait</c>/<c>Logs</c>/<c>Dial</c> (task's binding ruling, 2026-08-25).</summary>
+    private async Task<XpcDictionary> SendOnDedicatedConnectionAsync(XpcMessage request, TimeSpan? timeout, CancellationToken ct)
+    {
+        var handle = XpcNative.xpc_connection_create_mach_service(_serviceName, 0, 0);
+        if (handle == 0)
+        {
+            throw XpcException.Invalid($"xpc_connection_create_mach_service({_serviceName}) returned NULL");
+        }
+
+        // Global/immortal block, no captured state (XpcBlock's own doc comment) — safe to build
+        // with a static lambda that only ever touches the sentinel + the block's own address it is
+        // handed back, never this Connection or client instance.
+        var block = XpcBlock.CreateEventHandler(static (self, xpcObject) =>
+        {
+            if (xpcObject == XpcErrorSentinels.ConnectionInvalid)
+            {
+                // Guaranteed terminal, guaranteed last event for this connection — safe to stop
+                // routing now. Leaked, not freed: see XpcBlock.Detach's doc comment.
+                XpcBlock.Detach(self);
+            }
+        });
+
+        // Order matters, same as EnsureConnection below: the handler must be installed before
+        // activation, or an event racing activation is dropped.
+        XpcNative.xpc_connection_set_event_handler(handle, block);
+        XpcNative.xpc_connection_activate(handle);
+
+        var connection = new Connection { Handle = handle, Block = block };
+
+        // LongRunning, not the thread pool: these calls (wait/logs/dial) can legitimately block for
+        // a long time, and unlike RunWithTimeoutAsync's Task.Run there is no shared-retain balancing
+        // concern forcing CancellationToken.None here either way — SendSyncDedicated always cancels
+        // and releases this single-use connection itself, in its own finally, however it completes.
+        var sendTask = Task.Factory.StartNew(
+            () => SendSyncDedicated(connection, request),
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
 
+        if (timeout is null && !ct.CanBeCanceled)
+        {
+            return await sendTask.ConfigureAwait(false);
+        }
+
+        try
+        {
+            return timeout is { } budget
+                ? await sendTask.WaitAsync(budget, ct).ConfigureAwait(false)
+                : await sendTask.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is TimeoutException || ex is OperationCanceledException)
+        {
+            // Safe unconditionally, unlike RunWithTimeoutAsync's shared connection: nothing else
+            // ever sends on this connection, so cancelling it here can never race or
+            // collateral-damage a concurrent call. SendSyncDedicated's own finally will also cancel
+            // (idempotent) and release it once the abandoned send actually returns.
+            XpcNative.xpc_connection_cancel(handle);
+            ObserveAbandoned(sendTask);
+
+            if (ex is TimeoutException)
+            {
+                throw XpcException.Timeout($"XPC timeout for request to {_serviceName}/{request.Route}");
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>Fires and forgets an abandoned (timed-out/cancelled) send task: observes its fault
+    /// so it can never surface as an unobserved-task-exception, and disposes its reply if it ends up
+    /// completing successfully after the caller already moved on — used by both
+    /// <see cref="RunWithTimeoutAsync"/> and <see cref="SendOnDedicatedConnectionAsync"/>.</summary>
+    private static void ObserveAbandoned(Task<XpcDictionary> sendTask) =>
+        _ = sendTask.ContinueWith(
+            static t =>
+            {
+                if (t.IsFaulted)
+                {
+                    t.Exception!.Handle(_ => true);
+                }
+                else if (t.IsCompletedSuccessfully)
+                {
+                    t.Result.Dispose();
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
     /// <summary>The blocking call itself — always run off whatever thread called <see cref="SendAsync"/>
-    /// (see <see cref="RunWithTimeoutAsync"/>/<see cref="RunOnDedicatedThreadAsync"/>). Runs against
-    /// a <paramref name="connection"/> that already carries a caller-owned native retain, taken by
-    /// <see cref="EnsureConnection"/> under <c>_connectionLock</c> at hand-out time — not here — so
-    /// the retain and the lookup that hands the connection out can never be split by a concurrent
-    /// <see cref="Dispose"/> or reconnect landing in between. This method releases that retain when
-    /// the blocking call completes: <see cref="RunWithTimeoutAsync"/> can abandon this call (on
-    /// timeout) and the client can be disposed concurrently, either of which would otherwise drop
-    /// the connection's only remaining reference — via <see cref="CancelAndReleaseConnection"/> —
-    /// while <c>xpc_connection_send_message_with_reply_sync</c> is still blocked on it. On a
-    /// client-side timeout, <see cref="RunWithTimeoutAsync"/> now also cancels the connection so
-    /// this blocked thread is released promptly with an <c>XPC_ERROR_CONNECTION_INVALID</c> reply.</summary>
+    /// (see <see cref="RunWithTimeoutAsync"/>). Runs against a <paramref name="connection"/> that
+    /// already carries a caller-owned native retain, taken by <see cref="EnsureConnection"/> under
+    /// <c>_connectionLock</c> at hand-out time — not here — so the retain and the lookup that hands
+    /// the connection out can never be split by a concurrent <see cref="Dispose"/> or reconnect
+    /// landing in between. This method releases that retain when the blocking call completes:
+    /// <see cref="RunWithTimeoutAsync"/> can abandon this call (on timeout/cancel, deliberately
+    /// without touching the connection — see its own doc comment) and the client can be disposed
+    /// concurrently, either of which would otherwise drop the connection's only remaining reference
+    /// — via <see cref="CancelAndReleaseConnection"/> — while
+    /// <c>xpc_connection_send_message_with_reply_sync</c> is still blocked on it.</summary>
     private XpcDictionary SendSync(Connection connection, XpcMessage request)
     {
         try
         {
             var replyPtr = request.Dictionary.Use(handle =>
                 XpcNative.xpc_connection_send_message_with_reply_sync(connection.Handle, handle));
-
-            if (replyPtr == 0)
-            {
-                connection.Broken = true;
-                throw XpcException.Interrupted(
-                    $"xpc_connection_send_message_with_reply_sync returned NULL for {_serviceName}/{request.Route}");
-            }
-
-            var type = XpcObject.TypeNameOf(replyPtr);
-            if (type == "error")
-            {
-                var description = XpcObject.DescribeOf(replyPtr);
-                var invalid = replyPtr == XpcErrorSentinels.ConnectionInvalid;
-                XpcNative.xpc_release(replyPtr);
-                connection.Broken = true;
-                throw invalid ? XpcException.Invalid(description) : XpcException.Interrupted(description);
-            }
-
-            if (type != "dictionary")
-            {
-                var description = XpcObject.DescribeOf(replyPtr);
-                XpcNative.xpc_release(replyPtr);
-                throw XpcException.ApiServer("unknown", $"unexpected XPC reply type '{type}': {description}");
-            }
-
-            var reply = new XpcDictionary(replyPtr);
-
-            // §1.3: apiserver errors ride inside an ordinary reply dictionary, never as a separate
-            // XPC error object — every dictionary reply must be checked for the envelope. The route
-            // ran and the daemon rejected the call, so unlike the two branches above this leaves the
-            // connection itself un-broken; only this one call failed.
-            var envelope = reply.GetData(XpcMessage.ErrorKey);
-            if (envelope is not null)
-            {
-                reply.Dispose();
-                throw XpcErrorMapper.Decode(envelope);
-            }
-
-            return reply;
+            return DecodeReply(replyPtr, request.Route, connection);
         }
         finally
         {
@@ -242,8 +289,72 @@ internal sealed class XpcClient : IDisposable
         }
     }
 
-    /// <summary>Returns the connection to send on, creating one if the current one is missing or
-    /// broken. The returned <see cref="Connection"/> carries a caller-owned native retain — taken
+    /// <summary>The dedicated-connection counterpart of <see cref="SendSync"/>: same blocking call
+    /// and the same reply decoding (<see cref="DecodeReply"/>), but <paramref name="connection"/> is
+    /// single-use, so unlike <see cref="SendSync"/> this always cancels it — not just releases the
+    /// retain — regardless of outcome, since nothing will ever send on it again.</summary>
+    private XpcDictionary SendSyncDedicated(Connection connection, XpcMessage request)
+    {
+        try
+        {
+            var replyPtr = request.Dictionary.Use(handle =>
+                XpcNative.xpc_connection_send_message_with_reply_sync(connection.Handle, handle));
+            return DecodeReply(replyPtr, request.Route, connection);
+        }
+        finally
+        {
+            CancelAndReleaseConnection(connection.Handle);
+        }
+    }
+
+    /// <summary>Interprets a raw <c>xpc_connection_send_message_with_reply_sync</c> reply — shared
+    /// by <see cref="SendSync"/> and <see cref="SendSyncDedicated"/>. Marks
+    /// <paramref name="connection"/> broken on a transport-level failure (meaningless for a
+    /// single-use dedicated connection, but harmless: it is discarded either way).</summary>
+    private XpcDictionary DecodeReply(nint replyPtr, string route, Connection connection)
+    {
+        if (replyPtr == 0)
+        {
+            connection.Broken = true;
+            throw XpcException.Interrupted(
+                $"xpc_connection_send_message_with_reply_sync returned NULL for {_serviceName}/{route}");
+        }
+
+        var type = XpcObject.TypeNameOf(replyPtr);
+        if (type == "error")
+        {
+            var description = XpcObject.DescribeOf(replyPtr);
+            var invalid = replyPtr == XpcErrorSentinels.ConnectionInvalid;
+            XpcNative.xpc_release(replyPtr);
+            connection.Broken = true;
+            throw invalid ? XpcException.Invalid(description) : XpcException.Interrupted(description);
+        }
+
+        if (type != "dictionary")
+        {
+            var description = XpcObject.DescribeOf(replyPtr);
+            XpcNative.xpc_release(replyPtr);
+            throw XpcException.ApiServer("unknown", $"unexpected XPC reply type '{type}': {description}");
+        }
+
+        var reply = new XpcDictionary(replyPtr);
+
+        // §1.3: apiserver errors ride inside an ordinary reply dictionary, never as a separate
+        // XPC error object — every dictionary reply must be checked for the envelope. The route
+        // ran and the daemon rejected the call, so unlike the two branches above this leaves the
+        // connection itself un-broken; only this one call failed.
+        var envelope = reply.GetData(XpcMessage.ErrorKey);
+        if (envelope is not null)
+        {
+            reply.Dispose();
+            throw XpcErrorMapper.Decode(envelope);
+        }
+
+        return reply;
+    }
+
+    /// <summary>Returns the shared connection to send on, creating one if the current one is missing
+    /// or broken. The returned <see cref="Connection"/> carries a caller-owned native retain — taken
     /// here, under <see cref="_connectionLock"/>, on top of the client's own reference — so the
     /// hand-out and the retain can never be split by a concurrent <see cref="Dispose"/> or reconnect.
     /// <see cref="SendSync"/> is the one place that releases it.</summary>
@@ -305,17 +416,17 @@ internal sealed class XpcClient : IDisposable
         {
             // XPC_ERROR_CONNECTION_INVALID is Apple's documented "safe to release everything now"
             // signal: it is guaranteed to be the last event this connection's handler ever
-            // receives, which is exactly what makes freeing the block from inside its own callback
-            // safe here and unsafe everywhere else (see XpcBlock.Free's doc comment).
-            XpcBlock.Free(block);
+            // receives. This runs on the block's own currently-executing invoke, which is exactly
+            // what makes Detach (leak, not free) the right call here — see its doc comment.
+            XpcBlock.Detach(block);
         }
     }
 
     /// <summary>
-    /// Test-only: cancels the live connection out from under this client — the same libxpc call
-    /// the verification scenario for this task drives directly — without disposing the client. The
-    /// next <see cref="SendAsync"/> must recreate the connection and succeed transparently, exactly
-    /// as it would after a real apiserver restart.
+    /// Test-only: cancels the live shared connection out from under this client — the same libxpc
+    /// call the verification scenario for this task drives directly — without disposing the client.
+    /// The next <see cref="SendAsync"/> must recreate the connection and succeed transparently,
+    /// exactly as it would after a real apiserver restart.
     /// </summary>
     internal void DebugCancelConnection()
     {
@@ -328,10 +439,10 @@ internal sealed class XpcClient : IDisposable
         }
     }
 
-    /// <summary>Test-only: identifies the current connection generation, purely by reference — does
-    /// not dereference the handle. Used to assert a reconnect only happened once (or not at all)
-    /// across a sequence of sends, without relying on native pointer values that could in principle
-    /// be reused after a release.</summary>
+    /// <summary>Test-only: identifies the current shared-connection generation, purely by
+    /// reference — does not dereference the handle. Used to assert a reconnect only happened once
+    /// (or not at all) across a sequence of sends, without relying on native pointer values that
+    /// could in principle be reused after a release.</summary>
     internal object? DebugConnectionGeneration
     {
         get
@@ -344,10 +455,11 @@ internal sealed class XpcClient : IDisposable
     }
 
     /// <summary>Cancels and releases <paramref name="handle"/> without touching its event-handler
-    /// block — that block frees itself from <see cref="OnConnectionEvent"/> once the asynchronous,
-    /// guaranteed-terminal <c>XPC_ERROR_CONNECTION_INVALID</c> actually arrives (see
-    /// <see cref="XpcBlock.Free"/>'s doc comment for why freeing it here, synchronously, would race
-    /// that event and segfault).</summary>
+    /// block — that block detaches itself from <see cref="OnConnectionEvent"/> (shared connection)
+    /// or the dedicated-connection handler above once the asynchronous, guaranteed-terminal
+    /// <c>XPC_ERROR_CONNECTION_INVALID</c> actually arrives (see <see cref="XpcBlock.Detach"/>'s doc
+    /// comment for why detaching here, synchronously, before that event fires would be premature —
+    /// cancellation is asynchronous and the event can still be in flight).</summary>
     private static void CancelAndReleaseConnection(nint handle)
     {
         XpcNative.xpc_connection_cancel(handle);

@@ -13,10 +13,11 @@ namespace Cider.AppleContainer.Xpc;
 /// Event-handler-before-activate ordering matters here as much as it does for <see cref="XpcClient"/>:
 /// cancelling a connection that was never given an event handler and never activated hangs the
 /// process (confirmed live while building this listener) — <see cref="Create"/> always does both
-/// before returning. The block itself frees on the terminal
+/// before returning. The block itself detaches on the terminal
 /// <c>XPC_ERROR_CONNECTION_INVALID</c> event rather than synchronously in <see cref="Dispose"/>,
-/// for the same reason <see cref="XpcClient"/>'s does (see <see cref="XpcBlock.Free"/>'s doc
-/// comment: freeing eagerly races cancellation's asynchronous terminal event and segfaults libxpc).
+/// for the same reason <see cref="XpcClient"/>'s does (see <see cref="XpcBlock.Detach"/>'s doc
+/// comment: freeing eagerly, from inside the block's own invoke, is undefined behavior — this
+/// leaks the block instead).
 /// </summary>
 internal sealed class XpcListener : IDisposable
 {
@@ -58,7 +59,7 @@ internal sealed class XpcListener : IDisposable
             onMessage(xpcObject);
             if (xpcObject == XpcErrorSentinels.ConnectionInvalid)
             {
-                XpcBlock.Free(self);
+                XpcBlock.Detach(self);
             }
         });
 

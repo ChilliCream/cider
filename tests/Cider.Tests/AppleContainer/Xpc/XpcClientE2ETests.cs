@@ -207,4 +207,41 @@ public class XpcClientE2ETests
         Assert.False(string.IsNullOrEmpty(again.GetString("apiServerVersion")));
         Assert.Same(generationAfterReconnect, client.DebugConnectionGeneration);
     }
+
+    [E2EFact]
+    public async Task LongRunning_option_sends_and_replies_without_ever_touching_the_shared_connection()
+    {
+        using var client = NewClient();
+
+        // XpcCallOptions.LongRunning (containerWait/Logs/Dial's option, task's binding ruling
+        // 2026-08-25) always runs on its own single-use native connection, never the shared one —
+        // DebugConnectionGeneration stays null since no shared connection was ever created.
+        using var reply = await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.LongRunning);
+        Assert.False(string.IsNullOrEmpty(reply.GetString("apiServerVersion")));
+        Assert.Null(client.DebugConnectionGeneration);
+    }
+
+    [E2EFact]
+    public async Task A_LongRunning_calls_own_transport_failure_never_disturbs_the_shared_connection()
+    {
+        using var client = NewClient();
+
+        // Establish the shared connection and note its generation.
+        (await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default)).Dispose();
+        var sharedGeneration = client.DebugConnectionGeneration;
+
+        // §1.6: an unregistered route gets no reply — libxpc reports it as "interrupted" on this
+        // call's own dedicated connection. The task's binding ruling requires this to never touch
+        // the shared connection, unlike the pre-ruling behavior a plain LongRunning call used to
+        // share.
+        var ex = await Assert.ThrowsAsync<XpcException>(() =>
+            client.SendAsync(new XpcMessage("thisRouteDoesNotExist"), XpcCallOptions.LongRunning));
+        Assert.Equal(XpcErrorClass.Transport, ex.ErrorClass);
+
+        // The shared connection must be untouched: same generation, still healthy.
+        Assert.Same(sharedGeneration, client.DebugConnectionGeneration);
+        using var reply = await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default);
+        Assert.False(string.IsNullOrEmpty(reply.GetString("apiServerVersion")));
+        Assert.Same(sharedGeneration, client.DebugConnectionGeneration);
+    }
 }

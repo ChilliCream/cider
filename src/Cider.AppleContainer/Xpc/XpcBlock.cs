@@ -18,13 +18,20 @@ namespace Cider.AppleContainer.Xpc;
 /// libxpc always passes the block's own address as the invoke function's first argument (the
 /// implicit <c>self</c>), so a distinct block allocation per connection — sharing one static
 /// <c>[UnmanagedCallersOnly]</c> invoke function pointer — is enough to route each event to the
-/// right managed callback, keyed by that address in <see cref="s_handlers"/> — the callback
-/// receives that same address back as its own first argument, so it can free the block itself
-/// once it knows no further call will ever arrive (see <see cref="Free"/>'s doc comment: cancelling
-/// a connection whose block was already freed segfaults inside libxpc, confirmed live while
-/// building this client — freeing must happen from inside the terminal
-/// <c>XPC_ERROR_CONNECTION_INVALID</c> callback, not synchronously after <c>xpc_connection_cancel</c>,
-/// because cancellation is asynchronous and that callback can still be in flight).
+/// right managed callback, keyed by that address in <see cref="s_handlers"/>.
+///
+/// Two ways to retire a block, for two different call sites (task's binding ruling, 2026-08-25):
+/// <see cref="Free"/> actually releases the native memory and is only safe to call from outside the
+/// block's own invoke — e.g. test cleanup that created a block and never handed it to libxpc's
+/// event handler in a way that could still be dispatching. <see cref="Detach"/> only stops routing
+/// (removes the <see cref="s_handlers"/> entry) and deliberately leaks the 48-byte literal+
+/// descriptor; it is the one safe to call from *inside* the block's own currently-executing invoke
+/// (i.e. from the managed callback <see cref="InvokeEventHandler"/> itself dispatched to) —
+/// <c>XpcClient</c>/<c>XpcListener</c> both call it from their terminal
+/// <c>XPC_ERROR_CONNECTION_INVALID</c> handler, which runs on this exact call stack. Freeing memory
+/// the CPU is actively executing code from is undefined behavior, not merely racy, so a connection's
+/// event-handler block is leaked once per connection generation rather than freed there — connections
+/// are recreated only on reconnect/apiserver-restart, not per call, so this is bounded.
 /// </summary>
 internal static unsafe class XpcBlock
 {
@@ -80,6 +87,20 @@ internal static unsafe class XpcBlock
         var literal = (Literal*)block;
         NativeMemory.Free(literal->descriptor);
         NativeMemory.Free(literal);
+    }
+
+    /// <summary>Stops routing events to a block created by <see cref="CreateEventHandler"/> without
+    /// freeing its native memory — safe to call from inside the block's own currently-executing
+    /// invoke, unlike <see cref="Free"/> (see this type's own doc comment). Idempotent and safe on
+    /// <c>0</c>, exactly like <see cref="Free"/>.</summary>
+    public static void Detach(nint block)
+    {
+        if (block == 0)
+        {
+            return;
+        }
+
+        s_handlers.TryRemove(block, out _);
     }
 
     /// <summary>Raw field values of a block created by <see cref="CreateEventHandler"/> —

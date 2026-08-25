@@ -48,8 +48,12 @@ internal sealed class XpcException : Exception
 
     /// <summary>The sync send returned the <c>XPC_ERROR_CONNECTION_INVALID</c> sentinel — the
     /// connection can never be used again (as opposed to "interrupted", which a fresh connection
-    /// recovers from).</summary>
-    public static XpcException Invalid(string message) => new(XpcErrorClass.Transport, "invalidState", message);
+    /// recovers from). <c>"connectionInvalid"</c>, not <c>"invalidState"</c>: the latter is also a
+    /// real <c>ApiServer</c>-class <c>ContainerizationError.Code</c> (§1.3) that maps to
+    /// <see cref="Cider.Core.Runtime.RuntimeErrorKind.Conflict"/> — reusing it here for an unrelated
+    /// <see cref="XpcErrorClass.Transport"/> failure would collide two unrelated meanings under one
+    /// string (task's binding ruling, 2026-08-25).</summary>
+    public static XpcException Invalid(string message) => new(XpcErrorClass.Transport, "connectionInvalid", message);
 
     /// <summary>The client-side per-call budget elapsed before a reply arrived (§1.4 — timeouts are
     /// implemented purely client-side, racing a delay against the reply, exactly as the Swift
