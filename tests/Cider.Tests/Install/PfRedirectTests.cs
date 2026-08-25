@@ -67,12 +67,15 @@ public class PfRedirectTests : IDisposable
     // binary — they just report the canned outcome the test asked for.
     private static PfRedirect.PrivilegedCommandRunner FakeRunner(
         bool copySucceeds = true,
-        bool loadSucceeds = true,
+        bool validateSucceeds = true,
+        bool reloadSucceeds = true,
         bool flushSucceeds = true,
-        bool removeSucceeds = true) =>
+        bool removeSucceeds = true,
+        bool pfReportsEnabled = true) =>
         (argv, _) =>
         {
             bool succeeded;
+            var stdOut = "";
             switch (argv[0])
             {
                 case "cp":
@@ -86,9 +89,18 @@ public class PfRedirectTests : IDisposable
                 case "pfctl" when argv.Contains("-F"):
                     succeeded = flushSucceeds;
                     break;
+                case "pfctl" when argv.Contains("-n") && argv.Contains("-f"):
+                    // `pfctl -n -f <tmp path>`: validates the rewritten pf.conf before it is ever
+                    // copied over the real path.
+                    succeeded = validateSucceeds;
+                    break;
                 case "pfctl" when argv.Contains("-f"):
-                    // Covers both `pfctl -n -f <path>` (validate) and `pfctl -f <path>` (reload).
-                    succeeded = loadSucceeds;
+                    // `pfctl -f <pfConfPath>`: reloads the real ruleset.
+                    succeeded = reloadSucceeds;
+                    break;
+                case "pfctl" when argv.Contains("-s") && argv.Contains("info"):
+                    succeeded = true;
+                    stdOut = pfReportsEnabled ? "Status: Enabled for 0 days 00:00:00\n" : "Status: Disabled\n";
                     break;
                 case "pfctl":
                     // `pfctl -E`/`-X`: harmless either way, neither core method gates on them.
@@ -111,6 +123,7 @@ public class PfRedirectTests : IDisposable
             var result = new PfRedirect.PrivilegedCommandResult(
                 "sudo -n " + string.Join(' ', argv),
                 succeeded ? 0 : 1,
+                stdOut,
                 succeeded ? "" : "sudo: a password is required\n",
                 succeeded);
             return Task.FromResult(result);
@@ -185,14 +198,18 @@ public class PfRedirectTests : IDisposable
     [Fact]
     public void InsertAnchorLines_OnAFileWithNoExistingAnchorStanza_AppendsAtTheEnd()
     {
-        const string bare = "#\n# minimal pf.conf\n#\n";
+        // A body with real filter/nat rules but no `*-anchor`/`anchor`/`load anchor` lines at all —
+        // the three inserted lines must land after all of it, in order, never ahead of `set skip`/
+        // `scrub`/`block` (pf.conf(5) requires anchor points to come after those).
+        const string bare = "#\n# minimal pf.conf\n#\nset skip on lo0\nscrub in all\nblock in all\n";
 
         var updated = PfRedirect.InsertAnchorLines(bare, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
 
-        Assert.Contains($"rdr-anchor \"{PfRedirect.AnchorName}\"", updated, StringComparison.Ordinal);
-        Assert.Contains($"anchor \"{PfRedirect.AnchorName}\"", updated, StringComparison.Ordinal);
-        Assert.Contains(
-            $"load anchor \"{PfRedirect.AnchorName}\" from \"{PfRedirect.AnchorFilePath}\"",
+        Assert.StartsWith(bare, updated, StringComparison.Ordinal);
+        Assert.EndsWith(
+            $"rdr-anchor \"{PfRedirect.AnchorName}\"\n" +
+            $"anchor \"{PfRedirect.AnchorName}\"\n" +
+            $"load anchor \"{PfRedirect.AnchorName}\" from \"{PfRedirect.AnchorFilePath}\"\n",
             updated,
             StringComparison.Ordinal);
     }
@@ -273,13 +290,20 @@ public class PfRedirectTests : IDisposable
     {
         await File.WriteAllTextAsync(PfConfFile, StockPfConf);
 
+        var seen = new List<IReadOnlyList<string>>();
+        PfRedirect.PrivilegedCommandRunner recording = (argv, ct) =>
+        {
+            seen.Add(argv);
+            return FakeRunner()(argv, ct);
+        };
+
         var result = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
             new StringWriter(),
             AnchorFile,
             PfRedirect.AnchorName,
-            FakeRunner(),
+            recording,
             CancellationToken.None,
             PfConfFile);
 
@@ -292,9 +316,17 @@ public class PfRedirectTests : IDisposable
         Assert.Contains($"anchor \"{PfRedirect.AnchorName}\"", pfConf, StringComparison.Ordinal);
         Assert.Contains($"load anchor \"{PfRedirect.AnchorName}\" from \"{AnchorFile}\"", pfConf, StringComparison.Ordinal);
 
-        Assert.Contains(result.Steps, s => s.StartsWith("sudo -n cp ", StringComparison.Ordinal));
-        Assert.Contains(result.Steps, s => s.StartsWith($"sudo -n pfctl -n -f {PfConfFile}", StringComparison.Ordinal));
-        Assert.Contains(result.Steps, s => s.StartsWith("sudo -n pfctl -E", StringComparison.Ordinal));
+        // Exact argv order: cp the anchor file, validate the rewritten pf.conf at its own (non-real)
+        // temp path — never pfConfPath itself — only THEN cp it over pfConfPath, take the `-E`
+        // reference, and finally reload the real ruleset.
+        Assert.Collection(
+            seen,
+            argv => Assert.True(argv[0] == "cp" && argv[^1] == AnchorFile),
+            argv => Assert.True(argv[0] == "pfctl" && argv.Contains("-n") && argv.Contains("-f") && argv[^1] != PfConfFile),
+            argv => Assert.True(argv[0] == "cp" && argv[^1] == PfConfFile),
+            argv => Assert.True(argv.SequenceEqual(["pfctl", "-E"])),
+            argv => Assert.True(argv.SequenceEqual(["pfctl", "-f", PfConfFile])));
+
         Assert.Contains(result.Steps, s => s == $"sudo -n pfctl -f {PfConfFile} (exit 0)");
     }
 
@@ -352,12 +384,101 @@ public class PfRedirectTests : IDisposable
             new StringWriter(),
             AnchorFile,
             PfRedirect.AnchorName,
-            FakeRunner(loadSucceeds: false),
+            FakeRunner(reloadSucceeds: false),
             CancellationToken.None,
             PfConfFile);
 
         Assert.False(result.Success);
         Assert.Contains($"sudo pfctl -n -f {PfConfFile}", result.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TryEnableCoreAsync_ReturnsInstructionsAndNeverCopiesPfConf_WhenValidationFails()
+    {
+        // Validation runs against the unprivileged temp copy BEFORE pf.conf is ever touched, so a
+        // syntax error there must never leave a `cp` targeting the real pf.conf path.
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
+        var seen = new List<IReadOnlyList<string>>();
+        PfRedirect.PrivilegedCommandRunner recording = (argv, ct) =>
+        {
+            seen.Add(argv);
+            return FakeRunner(validateSucceeds: false)(argv, ct);
+        };
+
+        var result = await PfRedirect.TryEnableCoreAsync(
+            "192.168.64.0/24",
+            "192.168.64.1",
+            new StringWriter(),
+            AnchorFile,
+            PfRedirect.AnchorName,
+            recording,
+            CancellationToken.None,
+            PfConfFile);
+
+        Assert.False(result.Success);
+        Assert.DoesNotContain(seen, argv => argv[0] == "cp" && argv[^1] == PfConfFile);
+        Assert.Equal(StockPfConf, await File.ReadAllTextAsync(PfConfFile));
+    }
+
+    [Fact]
+    public async Task TryEnableCoreAsync_DoesNotTakeTheEnableReference_WhenPfConfAlreadyRegisteredAndPfReportsEnabled()
+    {
+        var alreadyRegistered = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, AnchorFile);
+        await File.WriteAllTextAsync(PfConfFile, alreadyRegistered);
+
+        var seen = new List<IReadOnlyList<string>>();
+        PfRedirect.PrivilegedCommandRunner recording = (argv, ct) =>
+        {
+            seen.Add(argv);
+            return FakeRunner(pfReportsEnabled: true)(argv, ct);
+        };
+
+        var result = await PfRedirect.TryEnableCoreAsync(
+            "192.168.64.0/24",
+            "192.168.64.1",
+            new StringWriter(),
+            AnchorFile,
+            PfRedirect.AnchorName,
+            recording,
+            CancellationToken.None,
+            PfConfFile);
+
+        Assert.True(result.Success);
+        // pf.conf did not need changing and pf already reports enabled, so a previous enable must
+        // already hold the reference disable's `-X` will release — taking a second one here would
+        // leak it.
+        Assert.DoesNotContain(seen, argv => argv.SequenceEqual(["pfctl", "-E"]));
+        Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-s", "info"]));
+    }
+
+    [Fact]
+    public async Task TryEnableCoreAsync_RetakesTheEnableReference_WhenPfConfAlreadyRegisteredButPfReportsDisabled()
+    {
+        // Models the post-reboot case: pf.conf still has the lines (nothing removed them), but the
+        // reboot itself reset pf's own enable refcount to zero.
+        var alreadyRegistered = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, AnchorFile);
+        await File.WriteAllTextAsync(PfConfFile, alreadyRegistered);
+
+        var seen = new List<IReadOnlyList<string>>();
+        PfRedirect.PrivilegedCommandRunner recording = (argv, ct) =>
+        {
+            seen.Add(argv);
+            return FakeRunner(pfReportsEnabled: false)(argv, ct);
+        };
+
+        var result = await PfRedirect.TryEnableCoreAsync(
+            "192.168.64.0/24",
+            "192.168.64.1",
+            new StringWriter(),
+            AnchorFile,
+            PfRedirect.AnchorName,
+            recording,
+            CancellationToken.None,
+            PfConfFile);
+
+        Assert.True(result.Success);
+        Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-E"]));
     }
 
     [Fact]
@@ -474,6 +595,38 @@ public class PfRedirectTests : IDisposable
         Assert.True(result.Success);
         // `rm -f` failing on its own does not fail disable — flush is the load-bearing step.
         Assert.True(File.Exists(AnchorFile));
+    }
+
+    [Fact]
+    public async Task TryDisableCoreAsync_NeverRemovesTheAnchorFile_WhenThePfConfCopyFails()
+    {
+        // pf.conf still needs the lines removed (it has them), but the privileged `cp` that would
+        // rewrite it fails — the anchor file must be kept, since pf.conf's `load anchor ... from`
+        // line still points at it, and the call must report failure so callers never mark this
+        // disabled (see Program.cs's `if (result.Success) MarkDisabled(...)`).
+        await File.WriteAllTextAsync(AnchorFile, "rdr inet from 192.168.64.0/24 to 192.168.64.1 -> 127.0.0.1\n");
+        var registered = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, AnchorFile);
+        await File.WriteAllTextAsync(PfConfFile, registered);
+
+        var seen = new List<IReadOnlyList<string>>();
+        PfRedirect.PrivilegedCommandRunner recording = (argv, ct) =>
+        {
+            seen.Add(argv);
+            return FakeRunner(copySucceeds: false)(argv, ct);
+        };
+
+        var result = await PfRedirect.TryDisableCoreAsync(
+            new StringWriter(),
+            AnchorFile,
+            PfRedirect.AnchorName,
+            recording,
+            CancellationToken.None,
+            PfConfFile);
+
+        Assert.False(result.Success);
+        Assert.DoesNotContain(seen, argv => argv[0] == "rm");
+        Assert.True(File.Exists(AnchorFile));
+        Assert.Equal(registered, await File.ReadAllTextAsync(PfConfFile));
     }
 
     // ---- opt-in state marker ----

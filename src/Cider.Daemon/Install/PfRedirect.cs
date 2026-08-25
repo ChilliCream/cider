@@ -196,16 +196,17 @@ public static partial class PfRedirect
             // Insert right after the last existing line whose keyword rank is <= this one's, so the
             // relative keyword order pf.conf(5) requires is preserved regardless of what is already
             // in the file (or, absent any anchor stanza at all, at the end of the file).
-            var insertAt = 0;
+            int? lastMatch = null;
             for (var i = 0; i < lines.Count; i++)
             {
                 var r = AnchorLineRank(lines[i]);
                 if (r >= 0 && r <= rank)
                 {
-                    insertAt = i + 1;
+                    lastMatch = i;
                 }
             }
 
+            var insertAt = lastMatch is null ? lines.Count : lastMatch.Value + 1;
             lines.Insert(insertAt, line);
         }
 
@@ -279,7 +280,7 @@ public static partial class PfRedirect
         "",
         $"    echo 'rdr inet from {subnetCidr} to {gatewayIp} -> 127.0.0.1' | sudo tee {anchorFilePath} >/dev/null",
         $"    printf 'rdr-anchor \"%s\"\\nanchor \"%s\"\\nload anchor \"%s\" from \"%s\"\\n' '{anchorName}' '{anchorName}' '{anchorName}' '{anchorFilePath}' | sudo tee -a {pfConfPath} >/dev/null",
-        $"    sudo pfctl -n -f {pfConfPath} && sudo pfctl -E; sudo pfctl -f {pfConfPath}",
+        $"    sudo pfctl -n -f {pfConfPath} && sudo pfctl -E && sudo pfctl -f {pfConfPath}",
         "",
         Caveats,
         "",
@@ -378,9 +379,24 @@ public static partial class PfRedirect
             }
 
             var updatedPfConf = InsertAnchorLines(currentPfConf, anchorName, anchorFilePath);
-            if (!string.Equals(updatedPfConf, currentPfConf, StringComparison.Ordinal))
+            var pfConfChanged = !string.Equals(updatedPfConf, currentPfConf, StringComparison.Ordinal);
+            if (pfConfChanged)
             {
                 await File.WriteAllTextAsync(tmpPfConf, updatedPfConf, ct).ConfigureAwait(false);
+
+                // Validate against the unprivileged temp copy BEFORE ever touching pfConfPath: the
+                // anchor file is already copied in place at this point, so `-n -f` on the tmp file
+                // still resolves the `load anchor ... from anchorFilePath` line, and a syntax error
+                // is caught without ever leaving the real pf.conf in an invalid state.
+                var validate = await runner(["pfctl", "-n", "-f", tmpPfConf], ct).ConfigureAwait(false);
+                steps.Add($"{validate.Command} (exit {validate.ExitCode})");
+                log.WriteLine(steps[^1]);
+                if (!validate.Succeeded)
+                {
+                    var failure = $"{pfConfPath} would fail pfctl validation after registering the {anchorName} anchor; left {pfConfPath} untouched.";
+                    steps.Add(failure);
+                    return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName, pfConfPath), steps);
+                }
 
                 var copyPfConf = await runner(["cp", tmpPfConf, pfConfPath], ct).ConfigureAwait(false);
                 steps.Add($"{copyPfConf.Command} (exit {copyPfConf.ExitCode})");
@@ -391,25 +407,36 @@ public static partial class PfRedirect
                     steps.Add(failure);
                     return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName, pfConfPath), steps);
                 }
-
-                var validate = await runner(["pfctl", "-n", "-f", pfConfPath], ct).ConfigureAwait(false);
-                steps.Add($"{validate.Command} (exit {validate.ExitCode})");
-                log.WriteLine(steps[^1]);
-                if (!validate.Succeeded)
-                {
-                    var failure = $"{pfConfPath} failed pfctl validation after registering the {anchorName} anchor.";
-                    steps.Add(failure);
-                    return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName, pfConfPath), steps);
-                }
             }
 
             // Reference-counted per the /etc/pf.conf header ("each component ... responsible for
             // enabling and disabling PF via -E and -X ... PF is disabled only when the last enable
-            // reference is released"); harmless if something else already enabled pf, and disable
-            // stays symmetric with `-X`.
-            var enable = await runner(["pfctl", "-E"], ct).ConfigureAwait(false);
-            steps.Add($"{enable.Command} (exit {enable.ExitCode})");
-            log.WriteLine(steps[^1]);
+            // reference is released"). Only take the reference when this call actually changed
+            // pf.conf: an unchanged file means a previous enable already holds the reference, and
+            // disable releases exactly one with `-X` in the same call that removes the lines, so
+            // taking a second one here would leak a reference nothing ever releases. The exception is
+            // a reboot: pf.conf still has the lines (nothing removed them), but the reboot itself
+            // reset pf's enable refcount to zero (Apple's own launchd job reloads the ruleset, not the
+            // refcount) — detect that by asking pf directly and re-take the reference if it reports
+            // disabled.
+            if (pfConfChanged)
+            {
+                var enable = await runner(["pfctl", "-E"], ct).ConfigureAwait(false);
+                steps.Add($"{enable.Command} (exit {enable.ExitCode})");
+                log.WriteLine(steps[^1]);
+            }
+            else
+            {
+                var status = await runner(["pfctl", "-s", "info"], ct).ConfigureAwait(false);
+                steps.Add($"{status.Command} (exit {status.ExitCode})");
+                log.WriteLine(steps[^1]);
+                if (!status.StdOut.Contains("Status: Enabled", StringComparison.Ordinal))
+                {
+                    var enable = await runner(["pfctl", "-E"], ct).ConfigureAwait(false);
+                    steps.Add($"{enable.Command} (exit {enable.ExitCode})");
+                    log.WriteLine(steps[^1]);
+                }
+            }
 
             // Reloading the main ruleset is what actually (re)loads the anchor file's rule content,
             // now that it is declared via the `load anchor` line above.
@@ -420,6 +447,40 @@ public static partial class PfRedirect
             {
                 var failure = $"Could not reload {pfConfPath} (which loads the {anchorName} anchor) without an interactive password.";
                 steps.Add(failure);
+
+                if (pfConfChanged)
+                {
+                    // Belt-and-braces: validation at the temp path passed, but the reload against the
+                    // real path still failed (e.g. lost the password prompt mid-flow) — restore
+                    // pf.conf to what it was before this call rather than leaving the new lines in
+                    // place with no anchor actually loaded. Best effort; a failure here is only logged,
+                    // never turned into a second error the caller has to parse.
+                    var rollbackTmp = Path.Combine(Path.GetTempPath(), $"cider-pfconf-rollback-{Guid.NewGuid():N}.conf");
+                    try
+                    {
+                        await File.WriteAllTextAsync(rollbackTmp, currentPfConf, ct).ConfigureAwait(false);
+                        var rollback = await runner(["cp", rollbackTmp, pfConfPath], ct).ConfigureAwait(false);
+                        steps.Add($"{rollback.Command} (exit {rollback.ExitCode})");
+                        log.WriteLine(steps[^1]);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        steps.Add($"Could not roll back {pfConfPath}: {ex.Message}");
+                        log.WriteLine(steps[^1]);
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            File.Delete(rollbackTmp);
+                        }
+                        catch (IOException)
+                        {
+                            // best-effort temp file cleanup.
+                        }
+                    }
+                }
+
                 return new InstallResult(false, Instructions(subnetCidr, gatewayIp, anchorFilePath, anchorName, pfConfPath), steps);
             }
 
@@ -483,10 +544,19 @@ public static partial class PfRedirect
                 log.WriteLine(steps[^1]);
             }
 
+            // Only true once pf.conf is confirmed to no longer reference the anchor file — either it
+            // never did, or the rewritten copy actually landed at pfConfPath. Removing the anchor file
+            // while pf.conf still has a `load anchor ... from anchorFilePath` line pointing at it would
+            // leave pf.conf referencing a file that no longer exists.
+            var pfConfLinesConfirmedAbsent = false;
             if (currentPfConf is not null)
             {
                 var updatedPfConf = RemoveAnchorLines(currentPfConf, anchorName, anchorFilePath);
-                if (!string.Equals(updatedPfConf, currentPfConf, StringComparison.Ordinal))
+                if (string.Equals(updatedPfConf, currentPfConf, StringComparison.Ordinal))
+                {
+                    pfConfLinesConfirmedAbsent = true;
+                }
+                else
                 {
                     await File.WriteAllTextAsync(tmpPfConf, updatedPfConf, ct).ConfigureAwait(false);
 
@@ -496,6 +566,8 @@ public static partial class PfRedirect
 
                     if (copyPfConf.Succeeded)
                     {
+                        pfConfLinesConfirmedAbsent = true;
+
                         var reload = await runner(["pfctl", "-f", pfConfPath], ct).ConfigureAwait(false);
                         steps.Add($"{reload.Command} (exit {reload.ExitCode})");
                         log.WriteLine(steps[^1]);
@@ -509,13 +581,24 @@ public static partial class PfRedirect
             steps.Add($"{disableRef.Command} (exit {disableRef.ExitCode})");
             log.WriteLine(steps[^1]);
 
-            var remove = await runner(["rm", "-f", anchorFilePath], ct).ConfigureAwait(false);
-            steps.Add($"{remove.Command} (exit {remove.ExitCode})");
-            log.WriteLine(steps[^1]);
-
-            if (!flush.Succeeded)
+            if (pfConfLinesConfirmedAbsent)
             {
-                var failure = "Could not remove the pf anchor without an interactive password.";
+                var remove = await runner(["rm", "-f", anchorFilePath], ct).ConfigureAwait(false);
+                steps.Add($"{remove.Command} (exit {remove.ExitCode})");
+                log.WriteLine(steps[^1]);
+            }
+            else
+            {
+                var skipped = $"Kept {anchorFilePath}: could not confirm {pfConfPath} no longer references it.";
+                steps.Add(skipped);
+                log.WriteLine(skipped);
+            }
+
+            if (!flush.Succeeded || !pfConfLinesConfirmedAbsent)
+            {
+                var failure = !flush.Succeeded
+                    ? "Could not remove the pf anchor without an interactive password."
+                    : $"Could not confirm {pfConfPath} no longer references the {anchorName} anchor without an interactive password; left {anchorFilePath} in place.";
                 steps.Add(failure);
                 return new InstallResult(false, DisableInstructions(anchorFilePath, anchorName, pfConfPath), steps);
             }
@@ -538,7 +621,7 @@ public static partial class PfRedirect
     }
 
     /// <summary>Outcome of one privileged command, plus the command line as it should be logged.</summary>
-    internal readonly record struct PrivilegedCommandResult(string Command, int ExitCode, string StdErr, bool Succeeded);
+    internal readonly record struct PrivilegedCommandResult(string Command, int ExitCode, string StdOut, string StdErr, bool Succeeded);
 
     /// <summary>
     /// Runs a privileged command (argv, e.g. <c>["pfctl", "-a", name, "-F", "all"]</c>). Production
@@ -550,6 +633,6 @@ public static partial class PfRedirect
     {
         List<string> args = ["-n", .. argv];
         var result = await ProcessRunner.RunAsync("sudo", args, TimeSpan.FromSeconds(10), ct: ct).ConfigureAwait(false);
-        return new PrivilegedCommandResult($"sudo {string.Join(' ', args)}", result.ExitCode, result.StdErr, result.Succeeded);
+        return new PrivilegedCommandResult($"sudo {string.Join(' ', args)}", result.ExitCode, result.StdOut, result.StdErr, result.Succeeded);
     }
 }
