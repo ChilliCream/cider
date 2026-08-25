@@ -1,10 +1,13 @@
 using System.Text.RegularExpressions;
+using Cider.Daemon.Tunnel;
 
 namespace Cider.Daemon.Hosting;
 
 /// <summary>
 /// Strips Docker's <c>/v1.xx</c> API-version prefix from the request path, exactly like dockerd:
-/// any version is accepted (never rejected) and the routes below only ever see unprefixed paths.
+/// any version is accepted (never rejected) and the routes below only ever see unprefixed paths. A
+/// request that arrived over <see cref="TunnelTransport"/> is left untouched — gRPC paths (e.g.
+/// <c>/moby.buildkit.v1.Control/Solve</c>) are never Docker API paths and must not be rewritten.
 /// </summary>
 public sealed partial class VersionPrefixMiddleware(RequestDelegate next)
 {
@@ -18,6 +21,11 @@ public sealed partial class VersionPrefixMiddleware(RequestDelegate next)
     public Task InvokeAsync(HttpContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
+
+        if (TunnelRoutes.IsTunnelRequest(context))
+        {
+            return next(context);
+        }
 
         var path = context.Request.Path.Value ?? "";
         if (TryStrip(path, out var stripped, out var version))

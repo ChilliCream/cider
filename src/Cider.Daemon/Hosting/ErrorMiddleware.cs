@@ -4,21 +4,30 @@ using Cider.Core.DockerApi;
 using Cider.Core.DockerApi.Json;
 using Cider.Core.DockerApi.Models;
 using Cider.Core.Runtime;
+using Cider.Daemon.Tunnel;
 
 namespace Cider.Daemon.Hosting;
 
 /// <summary>
 /// Turns every exception a route can throw into Docker's error envelope (<c>{"message": "..."}</c>)
 /// with the right status code, logs the request at Debug and answers unmatched paths the way
-/// dockerd does (<c>404 {"message":"page not found"}</c>).
+/// dockerd does (<c>404 {"message":"page not found"}</c>). A request that arrived over
+/// <see cref="TunnelTransport"/> bypasses all of that: a gRPC client cannot parse a JSON error body,
+/// and <see cref="Tunnel.TunnelRoutes.RequireTunnel{TBuilder}"/> already renders gRPC-shaped errors
+/// for the one case this middleware would otherwise rewrite (an unmatched/misrouted tunnel request).
 /// </summary>
 public sealed class ErrorMiddleware(RequestDelegate next, ILogger<ErrorMiddleware> logger)
 {
     /// <summary>Runs the rest of the pipeline and renders whatever comes back out of it.</summary>
-    public async Task InvokeAsync(HttpContext context)
+    public Task InvokeAsync(HttpContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
 
+        return TunnelRoutes.IsTunnelRequest(context) ? next(context) : InvokeCoreAsync(context);
+    }
+
+    private async Task InvokeCoreAsync(HttpContext context)
+    {
         var started = Stopwatch.GetTimestamp();
         try
         {

@@ -11,7 +11,10 @@ using Cider.Core.Services;
 using Cider.Core.State;
 using Cider.Daemon.Dns;
 using Cider.Daemon.Routes;
+using Cider.Daemon.Tunnel;
 using Cider.Dns;
+using Microsoft.AspNetCore.Connections;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging.Console;
 
@@ -97,8 +100,20 @@ public static class DaemonHost
             kestrel.Limits.MinRequestBodyDataRate = null;
             kestrel.Limits.MinResponseDataRate = null;
 
+            // BuildKit's FileSend chunks reach 3 MiB and LLB definitions can exceed the HTTP/2
+            // defaults; both windows are raised together so a large message from either side can
+            // fully occupy one flow-control window without stalling on ACKs.
+            kestrel.Limits.Http2.InitialStreamWindowSize = 1024 * 1024;
+            kestrel.Limits.Http2.InitialConnectionWindowSize = 2 * 1024 * 1024;
+
             kestrel.ListenUnixSocket(options.SocketPath, listen =>
                 listen.Use(next => context => HijackInterceptor.HandleAsync(context, next, holder.Require())));
+
+            // The in-process tunnel (see Cider.Daemon.Tunnel.TunnelTransport): BuildKit's hijacked
+            // /grpc and /session connections, and buildctl dial-stdio, are handed to Kestrel's
+            // HTTP/2 engine here — never over a socket, so h2c prior-knowledge (which Kestrel only
+            // ever speaks on a Http2-only endpoint; see cider-ger.5) is exactly what this needs.
+            kestrel.Listen(new TunnelEndPoint(), listen => listen.Protocols = HttpProtocols.Http2);
         });
     }
 
@@ -172,6 +187,22 @@ public static class DaemonHost
         services.AddSingleton<StateSynchronizer>();
 
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, DaemonLifecycle>());
+
+        // The in-process tunnel transport (see Cider.Daemon.Tunnel.TunnelTransport) and the gRPC
+        // server plumbing every mapped BuildKit service needs. IgnoreUnknownServices is required,
+        // not cosmetic: without it grpc-dotnet maps a catch-all unimplemented-service endpoint at
+        // routing Order 0 that beats any MapFallback (Order int.MaxValue), so every request to a
+        // service we have not mapped yet would get grpc-status 12 from the wrong place. Message
+        // size limits are unbounded for the same reason DaemonHost lifts MaxRequestBodySize above:
+        // FileSend chunks and LLB definitions routinely exceed grpc-dotnet's 4 MB default.
+        services.AddSingleton<TunnelTransport>();
+        services.AddSingleton<IConnectionListenerFactory>(sp => sp.GetRequiredService<TunnelTransport>());
+        services.AddGrpc(grpc =>
+        {
+            grpc.IgnoreUnknownServices = true;
+            grpc.MaxReceiveMessageSize = null;
+            grpc.MaxSendMessageSize = null;
+        });
 
         settings.ConfigureServices?.Invoke(services);
     }
