@@ -273,7 +273,10 @@ public static class DaemonHost
             sp.GetRequiredService<ILogger<BuilderConnection>>()));
 
         // The daemon's own Control/Session bridge into buildkitd (see SessionBridge), one per
-        // CliSession, dialed lazily the first time something attaches.
+        // CliSession, dialed lazily the first time something attaches. Each attach dials its own
+        // dedicated connection (see IRawSessionDialer / LiteralHeadersRewriteStream, cider-ger.16)
+        // rather than reusing the shared BuilderLink.
+        services.AddSingleton<IRawSessionDialer, RuntimeRawSessionDialer>();
         services.AddSingleton<SessionBridge>();
 
         // The control-plane proxy (cider-ger.10): loads a captured docker-exporter tar into cider's

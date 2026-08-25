@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Net.Http;
 using Grpc.Core;
+using Grpc.Net.Client;
 using Moby.Buildkit.V1;
 
 namespace Cider.Daemon.BuildKit;
@@ -18,6 +20,15 @@ public sealed class SessionBridgeHandle : IAsyncDisposable
     private readonly BytesMessageStream _bytesStream;
     private readonly CancellationTokenSource _tunnelCts;
     private readonly Task _serveTask;
+
+    // The dedicated Control/Session dial's own connection (see IRawSessionDialer / cider-ger.16) --
+    // separate from BuilderLink's shared one, so it needs its own teardown, mirroring
+    // BuilderLink.DisposeAsync's own Channel/Invoker/handler/process sequence.
+    private readonly GrpcChannel _dialChannel;
+    private readonly HttpMessageInvoker _dialInvoker;
+    private readonly SocketsHttpHandler _dialHandler;
+    private readonly IAsyncDisposable _dialOwner;
+
     private readonly ILogger _logger;
     private readonly ConcurrentDictionary<int, TaskCompletionSource<ExportResult>> _exports = new();
     private readonly ConcurrentBag<ExportResult> _produced = [];
@@ -32,6 +43,10 @@ public sealed class SessionBridgeHandle : IAsyncDisposable
         BytesMessageStream bytesStream,
         CancellationTokenSource tunnelCts,
         Task serveTask,
+        GrpcChannel dialChannel,
+        HttpMessageInvoker dialInvoker,
+        SocketsHttpHandler dialHandler,
+        IAsyncDisposable dialOwner,
         ILogger logger)
     {
         _owner = owner;
@@ -40,6 +55,10 @@ public sealed class SessionBridgeHandle : IAsyncDisposable
         _bytesStream = bytesStream;
         _tunnelCts = tunnelCts;
         _serveTask = serveTask;
+        _dialChannel = dialChannel;
+        _dialInvoker = dialInvoker;
+        _dialHandler = dialHandler;
+        _dialOwner = dialOwner;
         _logger = logger;
 
         _ = MonitorAsync();
@@ -146,6 +165,34 @@ public sealed class SessionBridgeHandle : IAsyncDisposable
         await _bytesStream.DisposeAsync().ConfigureAwait(false);
         _call.Dispose();
         _tunnelCts.Dispose();
+
+        // Tears down the dedicated dial's own connection -- mirrors BuilderLink.DisposeAsync exactly,
+        // since this is the same shape of resource (channel/invoker/handler over one process/stream).
+        try
+        {
+            await _dialChannel.ShutdownAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
+        {
+        }
+
+        try
+        {
+            _dialInvoker.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        try
+        {
+            _dialHandler.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        await _dialOwner.DisposeAsync().ConfigureAwait(false);
 
         foreach (var result in _produced)
         {

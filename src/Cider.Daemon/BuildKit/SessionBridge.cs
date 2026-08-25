@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
+using System.Net.Http;
 using Cider.Core.Configuration;
 using Cider.Daemon.Tunnel;
 using Grpc.Core;
+using Grpc.Net.Client;
 using Moby.Buildkit.V1;
 
 namespace Cider.Daemon.BuildKit;
@@ -25,14 +27,16 @@ public sealed class SessionBridge
 {
     private readonly TunnelTransport _tunnel;
     private readonly CiderOptions _options;
+    private readonly IRawSessionDialer _rawDialer;
     private readonly ILogger<SessionBridge> _logger;
     private readonly SemaphoreSlim _attachGate = new(1, 1);
     private readonly ConcurrentDictionary<string, SessionBridgeHandle> _handles = new(StringComparer.Ordinal);
 
-    public SessionBridge(TunnelTransport tunnel, CiderOptions options, ILogger<SessionBridge> logger)
+    public SessionBridge(TunnelTransport tunnel, CiderOptions options, IRawSessionDialer rawDialer, ILogger<SessionBridge> logger)
     {
         _tunnel = tunnel ?? throw new ArgumentNullException(nameof(tunnel));
         _options = options ?? throw new ArgumentNullException(nameof(options));
+        _rawDialer = rawDialer ?? throw new ArgumentNullException(nameof(rawDialer));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -134,36 +138,61 @@ public sealed class SessionBridge
             BuildKitMethods.Health.Check.ToLowerInvariant(),
         };
 
-        var headers = new Metadata
+        // The complete HEADERS block for this dial's one and only request, pseudo-headers first
+        // (RFC 7540 §8.1.2.1) -- built by hand and sent through LiteralHeadersRewriteStream rather
+        // than as Grpc.Core.Metadata, because System.Net.Http silently comma-joins every value added
+        // under one header name before it reaches the wire, and buildkitd never splits that back
+        // apart (see LiteralHeadersRewriteStream's own doc comment -- cider-ger.16). A Metadata with
+        // a genuine duplicate key here would go right back to that same bug.
+        var fields = new List<(string Name, string Value)>
         {
-            { BuildKitMethods.MetadataKeys.SessionUuid, cli.Id },
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":authority", "buildkit"),
+            (":path", BuildKitMethods.Control.Session),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+            (BuildKitMethods.MetadataKeys.SessionUuid, cli.Id),
         };
 
         if (!string.IsNullOrEmpty(cli.SharedKey))
         {
-            headers.Add(BuildKitMethods.MetadataKeys.SessionSharedKey, cli.SharedKey);
+            fields.Add((BuildKitMethods.MetadataKeys.SessionSharedKey, cli.SharedKey));
         }
 
         foreach (var method in methods)
         {
-            headers.Add(BuildKitMethods.MetadataKeys.SessionGrpcMethod, method);
+            fields.Add((BuildKitMethods.MetadataKeys.SessionGrpcMethod, method));
         }
 
+        Stream? duplex = null;
+        IAsyncDisposable? owner = null;
+        SocketsHttpHandler? handler = null;
+        GrpcChannel? channel = null;
+        HttpMessageInvoker? invoker = null;
         AsyncDuplexStreamingCall<BytesMessage, BytesMessage>? call = null;
         try
         {
+            // A dedicated connection, not link.CallInvoker's shared one -- see IRawSessionDialer's
+            // doc comment for why LiteralHeadersRewriteStream needs that isolation.
+            (duplex, owner) = await _rawDialer.DialAsync(cancellationToken).ConfigureAwait(false);
+            var rewritten = new LiteralHeadersRewriteStream(duplex, fields);
+            (channel, invoker, handler) = StreamHttp2Client.Create(rewritten, "buildkit");
+
             // Deliberately CancellationToken.None: this call outlives whatever request triggered
             // AttachAsync (a Bake's CLI stream, a Solve) -- its own lifetime is governed by
             // SessionBridgeHandle.Release/teardown, not by the caller's token, which only bounds how
-            // long AttachAsync itself may wait to dial.
-            var control = new Control.ControlClient(link.CallInvoker);
-            call = control.Session(headers);
+            // long AttachAsync itself may wait to dial. The Metadata passed here carries nothing --
+            // every real header for this call already lives in `fields`, applied by the rewrite
+            // stream itself.
+            var control = new Control.ControlClient(channel.CreateCallInvoker());
+            call = control.Session(new Metadata());
 
             var bytesStream = new BytesMessageStream(call.ResponseStream, call.RequestStream, link.Target.Pacer);
             var tunnelCts = new CancellationTokenSource();
             var serveTask = _tunnel.ServeAsync(bytesStream, TunnelKind.Session, cli.Id, cancellationToken: tunnelCts.Token);
 
-            var handle = new SessionBridgeHandle(this, cli, call, bytesStream, tunnelCts, serveTask, _logger);
+            var handle = new SessionBridgeHandle(this, cli, call, bytesStream, tunnelCts, serveTask, channel, invoker, handler, owner, _logger);
             _logger.LogDebug("attached session bridge {SessionId} ({MethodCount} methods)", cli.Id, methods.Count);
             return handle;
         }
@@ -171,6 +200,24 @@ public sealed class SessionBridge
         {
             _logger.LogWarning(ex, "buildkitd rejected the session bridge for {SessionId}", cli.Id);
             call?.Dispose();
+            invoker?.Dispose();
+            if (channel is not null)
+            {
+                try
+                {
+                    await channel.ShutdownAsync().ConfigureAwait(false);
+                }
+                catch (Exception shutdownEx) when (shutdownEx is InvalidOperationException or ObjectDisposedException)
+                {
+                }
+            }
+
+            handler?.Dispose();
+            if (owner is not null)
+            {
+                await owner.DisposeAsync().ConfigureAwait(false);
+            }
+
             throw;
         }
     }

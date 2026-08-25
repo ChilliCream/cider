@@ -98,6 +98,7 @@ public sealed class ControlProxyTests : IAsyncLifetime
                 services.AddSingleton(_images);
                 services.AddSingleton(events);
                 services.AddSingleton<CliSessionRegistry>();
+                services.AddSingleton<IRawSessionDialer>(new FakeRawSessionDialer(_buildkitd));
                 services.AddSingleton<SessionBridge>();
                 services.AddSingleton<ExportLoader>();
                 services.AddSingleton<ControlProxyService>();
@@ -336,6 +337,21 @@ public sealed class ControlProxyTests : IAsyncLifetime
         var server = new DuplexStream(clientToServer.Reader.AsStream(), serverToClient.Writer.AsStream());
         var client = new DuplexStream(serverToClient.Reader.AsStream(), clientToServer.Writer.AsStream());
         return (server, client);
+    }
+
+    /// <summary>
+    /// <see cref="IRawSessionDialer"/> for tests: hands <see cref="SessionBridge"/> a fresh in-memory
+    /// duplex pair into the same fake buildkitd host a real dial would reach through
+    /// <c>buildctl dial-stdio</c>, instead of touching <see cref="Cider.Core.Runtime.IContainerRuntime"/> at all.
+    /// </summary>
+    private sealed class FakeRawSessionDialer(WebApplication buildkitd) : IRawSessionDialer
+    {
+        public Task<(Stream Duplex, IAsyncDisposable Owner)> DialAsync(CancellationToken cancellationToken)
+        {
+            var (server, client) = CreateDuplexPair();
+            _ = buildkitd.Services.GetRequiredService<TunnelTransport>().ServeAsync(server, TunnelKind.Control);
+            return Task.FromResult<(Stream, IAsyncDisposable)>((client, new NoopProcess()));
+        }
     }
 
     /// <summary>A minimal <see cref="Cider.Core.Runtime.IContainerProcess"/> good enough to back a directly-constructed <see cref="BuilderLink"/> in tests.</summary>
