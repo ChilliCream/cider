@@ -12,7 +12,8 @@ came from and how to refresh them.
 scripts/vendor-buildkit-protos.sh
 ```
 
-Re-downloads every vendored file from the pinned refs below into `protos/`. It is idempotent:
+Re-downloads every vendored file from the pinned refs below into `protos/`, then applies one
+deterministic, idempotent post-fetch patch (see "Local patches" below). It is idempotent:
 re-running it against an unmodified checkout produces no `git diff`. `dotnet build` then
 regenerates the C# message/client/service classes from `protos/**/*.proto` via the `<Protobuf>`
 items in `Cider.Daemon.csproj` — nothing under `protos/` is C# and nothing generated is committed.
@@ -30,7 +31,30 @@ Bumping `BUILDKIT_REF`/`FSUTIL_REF` to track a newer Apple builder: update both 
 top of `scripts/vendor-buildkit-protos.sh`, re-run it, re-run
 `dotnet build Cider.sln -p:CiderTargetFrameworks=net10.0`, and diff the regenerated message shapes
 against the field/method facts recorded below (BuildKit is proto3, so old fields don't get
-renumbered, but new ones can appear).
+renumbered, but new ones can appear). Expect `protos/` to diverge from upstream only in
+`control.proto` (see "Local patches" below); re-check whether upstream has fixed the
+`Descriptor`/CS0542 collision before assuming the patch is still needed.
+
+## Local patches
+
+`scripts/vendor-buildkit-protos.sh` applies exactly one patch after fetching, deterministically
+and idempotently, on every run:
+
+- `control.proto`'s `message Descriptor` — the OCI content descriptor used by
+  `BuildHistoryRecord`'s `logs`/`trace`/`externalError` fields and related build-history
+  messages — is renamed to `BuildHistoryDescriptor`. protoc's C# generator emits a static
+  `Descriptor` property on every message class, so a message literally named `Descriptor`
+  collides with its own generated member (`CS0542`); this is a long-standing, unresolved
+  upstream issue (protocolbuffers/protobuf#12291), not a bug in this vendoring. The rename is
+  wire-compatible — protobuf's wire format encodes field numbers and types, not type names, and
+  neither change here — but it does change the fully-qualified proto type name (now
+  `moby.buildkit.v1.BuildHistoryDescriptor`), which matters if this type is ever referenced by a
+  `google.protobuf.Any` type URL.
+
+Known accepted deviation: `dotnet build` emits one `protoc` warning for `stat.proto`'s unused
+import of `vtproto/ext.proto` (the file only needs the extension declarations, not any type from
+it). This is authentic upstream content — nothing in this project's MSBuild can suppress a
+`protoc` warning — so it is recorded here rather than treated as a regression.
 
 ## What is vendored, and what is not
 
