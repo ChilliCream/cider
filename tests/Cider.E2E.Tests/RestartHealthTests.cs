@@ -124,9 +124,26 @@ public sealed class RestartHealthTests(DaemonFixture daemon)
                 TimeSpan.FromMilliseconds(250));
             Assert.True(dropped, $"{name} was never dropped after being removed outside cider");
 
-            // No restart-loop spam: at most a handful of lines mention this container (one Warning
-            // once the backoff had grown past attempt 5, one for the poller's drop), not thousands.
+            // The state poller (cider-4y2) drops the record on its own, much faster schedule; the
+            // restart supervisor (cider-msj) only discovers the container is gone on its own next
+            // scheduled attempt (record.Id no longer resolving is what turns into the "giving up"
+            // Warning), which this deep into exponential backoff can trail the drop above by up to
+            // the current delay — capped at MaxBackoff (1 min by default). Wait for that Warning
+            // rather than asserting on the drop alone, to prove the supervisor itself gave up
+            // instead of merely inferring it from the (independent) poller having done so.
+            var gaveUp = await DaemonFixture.EventuallyAsync(
+                () => Task.FromResult(daemon.DaemonLog.Any(line =>
+                    line.Contains(name, StringComparison.Ordinal) &&
+                    line.Contains("giving up restarting it", StringComparison.Ordinal))),
+                TimeSpan.FromSeconds(90),
+                TimeSpan.FromSeconds(1));
+
             var relevant = daemon.DaemonLog.Where(line => line.Contains(name, StringComparison.Ordinal)).ToArray();
+            Assert.True(gaveUp, $"expected a Warning saying the supervisor gave up restarting {name}, saw:\n{string.Join('\n', relevant)}");
+
+            // No restart-loop spam: at most a handful of lines mention this container (one Warning
+            // once the backoff had grown past attempt 5, one for the poller's drop, one for the
+            // supervisor giving up), not thousands.
             Assert.True(relevant.Length < 50, $"expected no restart-loop log spam for {name}, saw {relevant.Length} lines:\n{string.Join('\n', relevant)}");
 
             var warnings = relevant.Where(line => line.Contains(" Warning ", StringComparison.Ordinal)).ToArray();
