@@ -68,14 +68,15 @@ before. That is intentional, not a broken install.
 ### `cider install` — the opt-in daemon
 
 ```bash
-cider install [--system-socket] [--force-system-socket] [--no-context] [--socket PATH] [--data-dir DIR]
+cider install [--system-socket] [--force-system-socket] [--no-context] [--host-loopback] [--socket PATH] [--data-dir DIR]
 ```
 
 This writes a per-user launchd agent at
 `~/Library/LaunchAgents/com.chillicream.cider.daemon.plist` (`RunAtLoad`, and a `KeepAlive` that
 restarts it after a non-zero exit), bootstraps and kickstarts it under `gui/<uid>`, waits up to 10 s
 for the socket to appear, and — unless `--no-context` — creates a `cider` docker context. It does
-**not** switch your current context, and it does **not** touch `/var/run/docker.sock` unless you ask.
+**not** switch your current context, and it does **not** touch `/var/run/docker.sock` or `pf`
+unless you ask (`--system-socket`, `--host-loopback`).
 
 The plist sets `ProcessType` to `Interactive`, not the launchd default. Every container operation
 cider runs is a child `container` CLI process, and macOS applies background CPU/IO throttling to a
@@ -91,6 +92,7 @@ cider serve [--socket PATH] [--data-dir DIR] [--log-level LEVEL] [--no-dns]   # 
 cider status [--socket PATH]        # socket / launchd / Apple container status
 cider sync [--socket PATH] [--data-dir DIR] [--json]   # resync cider's state with Apple container
 cider uninstall [--data-dir DIR]    # unload the agent, drop the context, restore the system socket
+cider host-loopback enable|disable  # opt in/out of the 127.0.0.1 pf redirect, see below
 cider version
 ```
 
@@ -290,6 +292,40 @@ are tried and the forwarders relay to the one actually bound.
 Forwarders shut down with their network (`docker network rm`, `compose down`) and on a clean daemon
 shutdown. A hard-killed daemon can leave one behind — see [Troubleshooting](#troubleshooting).
 
+### Reaching loopback-only host services
+
+By default `host.docker.internal` (answered with the gateway address, above) only reaches a host
+service bound to `0.0.0.0` — a service bound to `127.0.0.1` only, which is the default for many dev
+servers, is not reachable from a container. This is an opt-in, not something Cider tries at DNS
+resolution time: it copies the same recipe Apple's own `container system dns create --localhost`
+uses for the identical problem — one `pf` anchor rule redirecting the container subnet's gateway
+address to `127.0.0.1`, all ports, one rule — under Cider's own anchor name
+(`com.chillicream.cider.hostloopback`), so it never touches or races Apple's `com.apple.container`
+anchor.
+
+```bash
+cider install --host-loopback     # opt in at install time, or:
+cider host-loopback enable        # opt in later, against an already-running daemon
+cider host-loopback disable       # opt back out
+```
+
+`enable` asks the running daemon for the default network's gateway/subnet, then writes and loads the
+anchor via non-interactive `sudo`; if that would need a password it prints the exact commands to run
+by hand instead (the same pattern as [`--system-socket`](#taking-over-varrundockersock)) — either
+way it is recorded as opted in, so `disable` (or the manual `pfctl`/`rm` it prints) is the only way to
+turn it back off, and:
+
+- **Needs admin (root).** Non-interactive only — Cider never prompts for a password itself.
+- **Disables Private Relay while the rule is loaded**, per Apple's own documented caveat for the
+  identical trick (`docs/host-integration.md` in the `container` repo).
+- **Does not survive a reboot** — pf state resets, so `cider serve` reinstalls the rule itself (best
+  effort, silently, no prompt) each time it starts while enabled. There is still a gap between boot
+  and the daemon coming back up.
+- **Covers only the default `bridge` network's subnet.** A container on a different, user-created
+  network is unaffected.
+- `disable` only flushes Cider's own anchor (`pfctl -a com.chillicream.cider.hostloopback -F all`) —
+  it never runs `pfctl -d` and never touches any other anchor, Apple's included.
+
 ## Limitations
 
 | Limitation | Detail |
@@ -313,7 +349,7 @@ shutdown. A hard-killed daemon can leave one behind — see [Troubleshooting](#t
 | Restart policies and healthchecks are emulated | The daemon supervises `always`/`unless-stopped`/`on-failure` restarts and runs healthcheck probes itself; Apple `container` has no native support for either |
 | No swarm | Every `/swarm`, `/services`, `/tasks`, `/nodes`, `/secrets`, `/configs`, `/plugins` route answers with a clear "not supported" error instead of a raw 404 |
 | IPv6 not handled | Container IPv6 addresses exist on the wire but are not managed or exposed |
-| `host.docker.internal` reaches only `0.0.0.0`-bound services | A host service bound to `127.0.0.1` only is not reachable from containers — and many dev servers bind loopback by default |
+| `host.docker.internal` reaches only `0.0.0.0`-bound services, unless you opt in | A host service bound to `127.0.0.1` only is not reachable from containers by default — and many dev servers bind loopback by default. `cider host-loopback enable` closes the gap with a pf redirect; see [Reaching loopback-only host services](#reaching-loopback-only-host-services) |
 | Published ports flow through the daemon (default `proxy`) | Traffic is relayed by the daemon process, not by the kernel or Apple's forwarder, so it stops when the daemon stops and adds one userland hop. `portPublishing: "apple"` avoids the hop but depends on macOS Local Network permission |
 | `docker cp` **into** a created container is emulated | Apple `container cp` refuses a container that is not running, so a tar `PUT` into a created container is staged under the data dir and bind-mounted in when the container starts (this is how .NET Aspire injects its dev certificates). Up to 64 files are mounted; beyond that they are copied in immediately after the start instead |
 | `docker cp` **out of** a stopped container is emulated | The same refusal, in the other direction: the path is selected out of the container's own rootfs export, which costs O(rootfs) rather than O(path). A path that reaches its target through a symbolic link inside the container is not resolved <!-- wording taken from the cp-out implementation's own note; src/Cider.Core/Services/ContainerManager.Archive.cs --> |

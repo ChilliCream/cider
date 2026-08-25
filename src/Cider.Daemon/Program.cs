@@ -1,7 +1,9 @@
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Cider.AppleContainer;
 using Cider.Core.Configuration;
+using Cider.Core.DockerApi.Models;
 using Cider.Daemon.Hosting;
 using Cider.Daemon.Install;
 using Cider.Daemon.Routes;
@@ -27,6 +29,7 @@ public static class Program
                 "serve" => await ServeAsync(rest),
                 "install" => await InstallAsync(rest),
                 "uninstall" => await UninstallAsync(rest),
+                "host-loopback" => await HostLoopbackAsync(rest),
                 "status" => await StatusAsync(rest),
                 "sync" => await SyncAsync(rest),
                 "version" => await VersionAsync(rest),
@@ -57,13 +60,103 @@ public static class Program
             DnsEnabled = !parsed.Flag("--no-dns"),
         });
 
+        // pf state does not survive a reboot, so a daemon that was left enabled reinstalls the
+        // anchor itself once it is up — best effort and silent: this is a background
+        // reconciliation, not something that can prompt for a password.
+        if (PfRedirect.IsEnabled(options.DataDir))
+        {
+            app.Lifetime.ApplicationStarted.Register(() =>
+                _ = ReconcileHostLoopbackAsync(options, app.Lifetime.ApplicationStopping));
+        }
+
         await app.RunAsync();
         return 0;
     }
 
+    /// <summary>
+    /// Best-effort reinstall of the host-loopback pf anchor at daemon start, for a data dir where
+    /// `host-loopback enable` previously opted in. Never touches pf when it is not enabled, never
+    /// prompts, and never lets a failure here affect the rest of the daemon.
+    /// </summary>
+    private static async Task ReconcileHostLoopbackAsync(CiderOptions options, CancellationToken ct)
+    {
+        try
+        {
+            var target = await FindLoopbackTargetAsync(options.SocketPath, TimeSpan.FromSeconds(5), ct);
+            if (target is not { } t)
+            {
+                // No network with a gateway yet (e.g. nothing has been created since boot); the
+                // rule has nothing to redirect to until one exists, so there is nothing to do.
+                return;
+            }
+
+            using var log = TextWriter.Null;
+            await PfRedirect.TryEnableAsync(t.Subnet, t.Gateway, log, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Console.Error.WriteLine($"cider: host-loopback reinstall at startup failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Looks up the subnet/gateway the host-loopback pf rule should target: the default `bridge`
+    /// network if it has a gateway, else the first network that does — the same choice
+    /// <c>DaemonDnsResolver.GatewayForAsync</c> makes for answering host.docker.internal itself.
+    /// Talks to the already-running daemon over its own socket (like `sync`/`status` do), rather
+    /// than reading runtime state directly, so this needs no dependency on the runtime layer.
+    /// </summary>
+    private static async Task<(string Subnet, string Gateway)?> FindLoopbackTargetAsync(
+        string socketPath,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
+        if (!File.Exists(socketPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var client = DaemonClient.Create(socketPath, timeout);
+            using var response = await client.GetAsync(new Uri("/networks", UriKind.Relative), ct);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            await using var body = await response.Content.ReadAsStreamAsync(ct);
+            var networks = await JsonSerializer.DeserializeAsync(body, NetworkListJsonContext.Default.ListNetworkResource, ct);
+            if (networks is null)
+            {
+                return null;
+            }
+
+            var chosen =
+                networks.FirstOrDefault(n =>
+                    string.Equals(n.Name, "bridge", StringComparison.Ordinal)
+                    && n.IPAM.Config.Any(c => !string.IsNullOrEmpty(c.Gateway) && !string.IsNullOrEmpty(c.Subnet)))
+                ?? networks.FirstOrDefault(n =>
+                    n.IPAM.Config.Any(c => !string.IsNullOrEmpty(c.Gateway) && !string.IsNullOrEmpty(c.Subnet)));
+
+            var config = chosen?.IPAM.Config.FirstOrDefault(c => !string.IsNullOrEmpty(c.Gateway) && !string.IsNullOrEmpty(c.Subnet));
+            return config is { Subnet: { Length: > 0 } subnet, Gateway: { Length: > 0 } gateway }
+                ? (subnet, gateway)
+                : null;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException
+            or System.Net.Sockets.SocketException or JsonException)
+        {
+            return null;
+        }
+    }
+
     private static async Task<int> InstallAsync(string[] args)
     {
-        var parsed = CommandLine.Parse(args, ["--socket", "--data-dir", "--log-level"], ["--system-socket", "--force-system-socket", "--no-context"]);
+        var parsed = CommandLine.Parse(
+            args,
+            ["--socket", "--data-dir", "--log-level"],
+            ["--system-socket", "--force-system-socket", "--no-context", "--host-loopback"]);
         var options = CiderOptions.Load(parsed.Value("--data-dir"), parsed.Value("--socket"), parsed.Value("--log-level"));
 
         var executable = Environment.ProcessPath
@@ -92,6 +185,12 @@ public static class Program
                 Console.WriteLine();
                 Console.WriteLine(SystemSocketLink.Instructions(options.SocketPath));
             }
+
+            if (parsed.Flag("--host-loopback"))
+            {
+                Console.WriteLine();
+                await EnableHostLoopbackAsync(options);
+            }
         }
 
         return result.Success ? 0 : 1;
@@ -107,6 +206,64 @@ public static class Program
         var result = await LaunchdInstaller.UninstallAsync(label, Console.Out, CancellationToken.None, options.DataDir);
         Console.WriteLine(result.Message);
         return result.Success ? 0 : 1;
+    }
+
+    /// <summary>
+    /// `cider host-loopback enable|disable` — the standalone opt-in/opt-out for the pf redirect
+    /// that lets `host.docker.internal` reach 127.0.0.1-bound host services, independent of
+    /// `install --host-loopback`. See the `PfRedirect` type for what this touches and why.
+    /// </summary>
+    private static async Task<int> HostLoopbackAsync(string[] args)
+    {
+        if (args.Length == 0 || args[0].StartsWith('-'))
+        {
+            Console.Error.WriteLine("cider: host-loopback needs a subcommand: 'enable' or 'disable'");
+            return 2;
+        }
+
+        var sub = args[0];
+        var parsed = CommandLine.Parse(args[1..], ["--socket", "--data-dir"], []);
+        var options = CiderOptions.Load(parsed.Value("--data-dir"), parsed.Value("--socket"), null);
+
+        return sub switch
+        {
+            "enable" => await EnableHostLoopbackAsync(options) ? 0 : 1,
+            "disable" => await DisableHostLoopbackAsync(options) ? 0 : 1,
+            _ => Unknown($"host-loopback {sub}"),
+        };
+    }
+
+    /// <summary>
+    /// Looks up the running daemon's default network, then writes and loads the pf anchor via
+    /// non-interactive `sudo`, printing the manual recipe instead when that needs a password.
+    /// Marks the opt-in either way, so a daemon restart keeps reinstalling the rule once whichever
+    /// of the two attempts above prints instructions has actually been run by hand.
+    /// </summary>
+    private static async Task<bool> EnableHostLoopbackAsync(CiderOptions options)
+    {
+        var target = await FindLoopbackTargetAsync(options.SocketPath, TimeSpan.FromSeconds(10), CancellationToken.None);
+        await PfRedirect.MarkEnabledAsync(options.DataDir, CancellationToken.None);
+
+        if (target is not { } t)
+        {
+            Console.WriteLine(
+                "cider: no docker network with a gateway yet, so there is nothing to redirect to. " +
+                "host-loopback is recorded as enabled; `cider serve` will install the rule once a " +
+                "network exists, or re-run `cider host-loopback enable` after creating one.");
+            return true;
+        }
+
+        var result = await PfRedirect.TryEnableAsync(t.Subnet, t.Gateway, Console.Out, CancellationToken.None);
+        Console.WriteLine(result.Message);
+        return result.Success;
+    }
+
+    private static async Task<bool> DisableHostLoopbackAsync(CiderOptions options)
+    {
+        PfRedirect.MarkDisabled(options.DataDir);
+        var result = await PfRedirect.TryDisableAsync(Console.Out, CancellationToken.None);
+        Console.WriteLine(result.Message);
+        return result.Success;
     }
 
     private static async Task<int> StatusAsync(string[] args)
@@ -323,8 +480,9 @@ public static class Program
 
             Usage:
               cider serve [--socket PATH] [--data-dir DIR] [--log-level LEVEL] [--no-dns]
-              cider install [--system-socket] [--force-system-socket] [--no-context] [--socket PATH] [--data-dir DIR]
+              cider install [--system-socket] [--force-system-socket] [--no-context] [--host-loopback] [--socket PATH] [--data-dir DIR]
               cider uninstall [--label LABEL] [--data-dir DIR]
+              cider host-loopback enable|disable [--socket PATH] [--data-dir DIR]
               cider status [--socket PATH]
               cider sync [--socket PATH] [--data-dir DIR] [--json]
               cider version
@@ -335,12 +493,27 @@ public static class Program
             --data-dir you installed with, or uninstall cannot find that record. It refuses to
             replace a real socket file (which could not be restored) unless --force-system-socket.
 
+            --host-loopback / `host-loopback enable` opts in to a pf redirect so host.docker.internal
+            also reaches 127.0.0.1-bound host services, not just 0.0.0.0-bound ones. Needs root and
+            non-interactive sudo (prints the exact commands to run by hand otherwise), disables
+            Private Relay while loaded, and does not survive a reboot — `cider serve` reinstalls it
+            on start while enabled. `host-loopback disable` removes it.
+
             Environment:
               CIDER_SOCKET, CIDER_DATA_DIR, CIDER_LOG_LEVEL, CIDER_CONTAINER_CLI
             """);
         return exitCode;
     }
 }
+
+/// <summary>
+/// Source-generated JSON contract for the one Docker API response `FindLoopbackTargetAsync` reads
+/// (<c>GET /networks</c>), kept local to <c>Program.cs</c> rather than reusing
+/// <c>Cider.Core.DockerApi.Json.DockerJsonContext</c>, which is internal to Cider.Core.
+/// </summary>
+[JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]
+[JsonSerializable(typeof(List<NetworkResource>))]
+internal sealed partial class NetworkListJsonContext : JsonSerializerContext;
 
 /// <summary>A bad command line.</summary>
 public sealed class OptionException(string message) : Exception(message);
