@@ -29,10 +29,10 @@ public sealed class RestartSupervisor : IAsyncDisposable
     /// <summary>
     /// The error text <see cref="MarkVanished"/> puts on <c>record.State.Error</c>, and the marker
     /// <see cref="ContainerManager.HandleExitAsync"/> (ContainerManager.Lifecycle.cs) also stamps
-    /// when the started process itself reports the container gone rather than the start call
-    /// throwing (a warm tty cache can let <c>container start -a</c> spawn against a runtime id
-    /// Apple has already dropped — cider-msj). <see cref="OnStateChanged"/> treats either source of
-    /// this marker as terminal.
+    /// when the runtime itself confirms (via inspect) that the container is gone even though the
+    /// start call never threw (a warm tty cache can let <c>container start -a</c> spawn against a
+    /// runtime id Apple has already dropped — cider-msj). <see cref="OnStateChanged"/> treats either
+    /// source of this marker as terminal, once a restart would otherwise have been scheduled.
     /// </summary>
     public const string VanishedError = "container no longer exists in Apple container (removed outside cider)";
 
@@ -134,21 +134,25 @@ public sealed class RestartSupervisor : IAsyncDisposable
             return;
         }
 
-        // ContainerManager.HandleExitAsync already recognized (from the started process's own
-        // stderr) that the container itself is gone, even though the start call never threw —
-        // the same "give up for good" situation the NotFound catch in RestartAsync handles below,
-        // just discovered on the other side of a successful start. Status/Error/the "die" event
-        // are already set by the time this runs; only the scheduling decision is ours to make.
+        if (!ShouldRestart(record))
+        {
+            _attempts.TryRemove(record.Id, out _);
+            return;
+        }
+
+        // ContainerManager.HandleExitAsync already recognized (confirmed against the runtime, not
+        // just the started process's own stderr) that the container itself is gone, even though the
+        // start call never threw — the same "give up for good" situation the NotFound catch in
+        // RestartAsync handles below, just discovered on the other side of a successful start.
+        // Status/Error/the "die" event are already set by the time this runs; only the scheduling
+        // decision is ours to make. Checked only once a restart would otherwise be scheduled, so a
+        // container without a restart policy (or one the user stopped) never gets this "giving up
+        // restarting it" Warning or attempt-map churn — ShouldRestart above already said no restart
+        // was ever going to happen.
         if (string.Equals(record.State.Error, VanishedError, StringComparison.Ordinal))
         {
             _attempts.TryRemove(record.Id, out _);
             LogGivingUp(record);
-            return;
-        }
-
-        if (!ShouldRestart(record))
-        {
-            _attempts.TryRemove(record.Id, out _);
             return;
         }
 

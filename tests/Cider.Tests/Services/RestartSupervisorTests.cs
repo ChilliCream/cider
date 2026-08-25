@@ -152,22 +152,33 @@ public sealed class RestartSupervisorTests
         await using var harness = await ContainerTestHarness.CreateAsync();
         await using var supervisor = new RestartSupervisor(harness.Containers, harness.Events, NullLogger<RestartSupervisor>.Instance)
         {
-            InitialBackoff = TimeSpan.FromMilliseconds(30),
+            InitialBackoff = TimeSpan.FromMilliseconds(100),
             MaxBackoff = TimeSpan.FromSeconds(5),
-            StableRunThreshold = TimeSpan.FromMilliseconds(60),
+            StableRunThreshold = TimeSpan.FromMilliseconds(200),
         };
         await supervisor.StartAsync(default);
 
         await using var collector = await harness.CollectEventsAsync();
 
-        // Every run stays up ~90 ms, comfortably past the 60 ms stable threshold, so each exit
-        // should reset the backoff back to the initial delay instead of doubling.
-        var record = await harness.CreateShellAsync("sleep 0.09; exit 1", "steady", request =>
+        // Every run stays up ~300 ms, comfortably past the 200 ms stable threshold, so each exit
+        // should reset the backoff back to the initial delay instead of doubling. At this scale
+        // (~400 ms gaps: 300 ms sleep + 100 ms backoff) there is real headroom against
+        // scheduling/process-spawn jitter, unlike the 120 ms gaps a tighter timing produces.
+        var record = await harness.CreateShellAsync("sleep 0.3; exit 1", "steady", request =>
             request.HostConfig = new HostConfig { RestartPolicy = new RestartPolicy { Name = "always" } });
 
         await harness.Containers.StartAsync(record.Id, default);
 
-        await ContainerTestHarness.WaitUntilAsync(() => record.RestartCount >= 3, "three restart attempts", timeoutMs: 10_000);
+        // Wait on the collected "restart" events themselves, not record.RestartCount: MarkRestarting
+        // bumps RestartCount and persists before RestartAsync publishes the event, and the collector
+        // delivers asynchronously, so record.RestartCount could reach 3 a moment before the 3rd
+        // "restart" message has actually landed in collector.Messages — leaving the snapshot below
+        // one event short on a slow run (the same race commit 64fef25 hardened Backoff_doubles_...
+        // against).
+        await ContainerTestHarness.WaitUntilAsync(
+            () => collector.Messages.Count(message => string.Equals(message.Action, "restart", StringComparison.Ordinal)) >= 3,
+            "three restart events to be collected",
+            timeoutMs: 15_000);
         await supervisor.StopAsync();
 
         var restarts = collector.Messages
@@ -182,8 +193,12 @@ public sealed class RestartSupervisorTests
         var gap1 = (restarts[1] - restarts[0]) / 1_000_000.0;
         var gap2 = (restarts[2] - restarts[1]) / 1_000_000.0;
 
-        // A doubling loop would roughly double this gap every cycle; a reset keeps it flat.
-        Assert.True(gap2 < gap1 * 1.7, $"expected the backoff to reset (flat gaps), not double: {gap1} ms -> {gap2} ms");
+        // A doubling loop would roughly double this gap every cycle; a reset keeps it flat. Bounded
+        // against the configured backoff itself (not a bare multiplier) so the tolerance scales with
+        // the timing this test actually uses.
+        Assert.True(
+            gap2 < gap1 + 2 * supervisor.InitialBackoff.TotalMilliseconds,
+            $"expected the backoff to reset (flat gaps), not double: {gap1} ms -> {gap2} ms");
     }
 
     [Fact]
@@ -222,13 +237,18 @@ public sealed class RestartSupervisorTests
         // (AppleContainerRuntime._ttyByContainer) can let `container start -a` spawn successfully
         // even though Apple's own container table has already dropped the runtime id (cider-msj).
         // RestartSupervisor never sees a thrown NotFound in that case, only an ordinary "die" — so
-        // ContainerManager.HandleExitAsync has to classify the started process's own stderr instead,
-        // which is what this exercises: the fake's tiny shell interpreter writes a "container ...
-        // not found" line to stderr before exiting non-zero, the way Apple's CLI would.
+        // ContainerManager.HandleExitAsync classifies the started process's own stderr as only a
+        // pre-filter, then confirms against the runtime itself: the fake's tiny shell interpreter
+        // writes a "container ... not found" line to stderr before exiting non-zero, the way
+        // Apple's CLI would, and VanishContainer below drops the id from the fake's table the same
+        // way Apple loses track of a container when its services restart, so InspectContainerAsync
+        // reports it gone too.
         var record = await harness.RunShellAsync(
             "sleep 0.05; echo Error: container not found 1>&2; exit 1",
             "gone",
             request => request.HostConfig = new HostConfig { RestartPolicy = new RestartPolicy { Name = "always" } });
+
+        harness.Runtime.VanishContainer(record.RuntimeId);
 
         await ContainerTestHarness.WaitUntilAsync(
             () => record.State.Status == "exited" && record.State.Error is not null,
@@ -241,6 +261,34 @@ public sealed class RestartSupervisorTests
         Assert.Equal(0, record.RestartCount);
         Assert.Equal("exited", record.State.Status);
         Assert.Equal(RestartSupervisor.VanishedError, record.State.Error);
+    }
+
+    [Fact]
+    public async Task An_apps_own_container_not_found_stderr_does_not_stop_it_restarting_when_the_runtime_still_knows_it()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await using var supervisor = NewSupervisor(harness);
+        await supervisor.StartAsync(default);
+
+        // The application's own stderr happens to match the same wording the vanished-container
+        // heuristic looks for (it could be printing its own "no such container" log line, or piping
+        // through something that mimics Docker's error text) but the runtime still knows the
+        // container exists — the fake's table was never touched. That must not be enough on its own
+        // to stamp VanishedError: it is ordinary application output (Broadcast writes the same bytes
+        // to the container log the app itself sees), not a runtime-confirmed removal, so the
+        // restart policy still applies normally.
+        var record = await harness.RunShellAsync(
+            "echo Error: No such container: foo 1>&2; exit 1",
+            "chatty",
+            request => request.HostConfig = new HostConfig { RestartPolicy = new RestartPolicy { Name = "always" } });
+
+        await ContainerTestHarness.WaitUntilAsync(
+            () => record.RestartCount >= 1,
+            "the container to restart despite the app's own stderr line");
+        await supervisor.StopAsync();
+
+        Assert.True(record.RestartCount >= 1);
+        Assert.NotEqual(RestartSupervisor.VanishedError, record.State.Error);
     }
 
     [Theory]

@@ -599,6 +599,27 @@ public sealed partial class ContainerManager
             text.Contains("does not exist", StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The actual terminal decision for a container the stderr heuristic only flagged as suspect:
+    /// asks the runtime itself (the same <see cref="IContainerRuntime.InspectContainerAsync"/> call
+    /// <see cref="StatePoller"/>'s reconciliation loop relies on to detect a dropped container,
+    /// which returns <c>null</c> when the engine no longer knows the id) rather than trusting
+    /// application output. Any runtime error is swallowed — a flaky inspect must never itself block
+    /// exit handling nor get treated as confirmation.
+    /// </summary>
+    private async Task<bool> IsConfirmedVanishedAsync(string runtimeId)
+    {
+        try
+        {
+            return await _runtime.InspectContainerAsync(runtimeId, CancellationToken.None) is null;
+        }
+        catch (RuntimeException ex)
+        {
+            _logger.LogDebug(ex, "confirming vanished container {RuntimeId} failed", runtimeId);
+            return false;
+        }
+    }
+
     private async Task HandleExitAsync(string id, ContainerHandle handle, IContainerProcess process, StringBuilder? stderrTail = null)
     {
         var exitCode = -1;
@@ -651,10 +672,14 @@ public sealed partial class ContainerManager
             // A warm tty cache (AppleContainerRuntime._ttyByContainer) can let `container start -a`
             // spawn even though Apple's own container table has already dropped the runtime id: the
             // start call never throws, so RestartSupervisor never sees the NotFound it otherwise
-            // catches — only the attached process's own stderr says the container is gone. Stamp the
-            // same marker MarkVanished uses so OnStateChanged recognizes this and gives up instead of
+            // catches. The attached process's own stderr is only ever a cheap pre-filter for this —
+            // it is the application's own output (Broadcast writes the same bytes to the container
+            // log), so an ordinary "no such container" logged by the app itself must never be trusted
+            // on its own. Stamp the same marker MarkVanished uses only once the runtime itself
+            // confirms the id is gone, so OnStateChanged recognizes this and gives up instead of
             // rescheduling into a tight loop (cider-msj).
-            if (exitCode != 0 && LooksLikeVanishedContainer(stderrTail?.ToString()))
+            if (exitCode != 0 && LooksLikeVanishedContainer(stderrTail?.ToString()) &&
+                await IsConfirmedVanishedAsync(record.RuntimeId))
             {
                 record.State.Error = RestartSupervisor.VanishedError;
             }
