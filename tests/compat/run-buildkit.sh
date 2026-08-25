@@ -232,7 +232,7 @@ fi
 
 # ---------- 10. buildx inspect/du/prune, builder prune ----------
 inspect_out=$(docker buildx inspect default --bootstrap 2>&1)
-if grep -q "Status: running" <<<"$inspect_out" && grep -q "linux/arm64" <<<"$inspect_out" &&
+if grep -qE "Status:[[:space:]]+running" <<<"$inspect_out" && grep -q "linux/arm64" <<<"$inspect_out" &&
    docker buildx du >/dev/null 2>&1 &&
    docker buildx prune -f >/dev/null 2>&1 &&
    docker builder prune -f >/dev/null 2>&1; then
