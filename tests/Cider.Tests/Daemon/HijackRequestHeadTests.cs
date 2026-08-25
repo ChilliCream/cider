@@ -100,4 +100,74 @@ public sealed class HijackRequestHeadTests
         Assert.Equal("x1", head.Id);
         Assert.Equal("foo=bar", head.Query);
     }
+
+    [Fact]
+    public void Recognizes_a_grpc_upgrade()
+    {
+        var head = HijackRequestHead.TryParse("POST /grpc HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n");
+
+        Assert.NotNull(head);
+        Assert.Equal(HijackKind.Grpc, head.Kind);
+        Assert.True(head.Upgrade);
+    }
+
+    [Fact]
+    public void Recognizes_a_versioned_session_upgrade_with_repeated_session_methods()
+    {
+        var head = HijackRequestHead.TryParse(
+            "POST /v1.47/session HTTP/1.1\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Upgrade: h2c\r\n" +
+            "X-Docker-Expose-Session-Uuid: abc-123\r\n" +
+            "X-Docker-Expose-Session-Sharedkey: sharedkey-1\r\n" +
+            "X-Docker-Expose-Session-Grpc-Method: /moby.filesync.v1.FileSync/DiffCopy\r\n" +
+            "X-Docker-Expose-Session-Grpc-Method: /moby.filesync.v1.Auth/Credentials\r\n");
+
+        Assert.NotNull(head);
+        Assert.Equal(HijackKind.Session, head.Kind);
+        Assert.True(head.Upgrade);
+        Assert.Equal("abc-123", head.SessionId);
+        Assert.Equal("sharedkey-1", head.SessionSharedKey);
+        Assert.NotNull(head.SessionMethods);
+        Assert.Equal(2, head.SessionMethods.Count);
+        Assert.Contains("/moby.filesync.v1.FileSync/DiffCopy", head.SessionMethods);
+        Assert.Contains("/moby.filesync.v1.Auth/Credentials", head.SessionMethods);
+    }
+
+    [Fact]
+    public void Splits_comma_joined_session_grpc_method_values()
+    {
+        var head = HijackRequestHead.TryParse(
+            "POST /session HTTP/1.1\r\n" +
+            "Upgrade: h2c\r\n" +
+            "X-Docker-Expose-Session-Grpc-Method: /a/A, /b/B\r\n");
+
+        Assert.NotNull(head);
+        Assert.NotNull(head.SessionMethods);
+        Assert.Equal(2, head.SessionMethods.Count);
+        Assert.Contains("/a/A", head.SessionMethods);
+        Assert.Contains("/b/B", head.SessionMethods);
+    }
+
+    [Fact]
+    public void Rejects_an_upgrade_tcp_grpc_request()
+    {
+        var head = HijackRequestHead.TryParse("POST /grpc HTTP/1.1\r\nUpgrade: tcp\r\n");
+
+        Assert.NotNull(head);
+        Assert.Equal(HijackKind.Grpc, head.Kind);
+        Assert.False(head.Upgrade);
+    }
+
+    [Fact]
+    public void Session_without_session_headers_has_null_session_fields()
+    {
+        var head = HijackRequestHead.TryParse("POST /session HTTP/1.1\r\nUpgrade: h2c\r\n");
+
+        Assert.NotNull(head);
+        Assert.Equal(HijackKind.Session, head.Kind);
+        Assert.Null(head.SessionId);
+        Assert.Null(head.SessionSharedKey);
+        Assert.Null(head.SessionMethods);
+    }
 }

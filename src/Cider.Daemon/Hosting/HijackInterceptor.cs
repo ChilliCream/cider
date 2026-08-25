@@ -3,10 +3,13 @@ using System.IO.Pipelines;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
+using Cider.Core.Configuration;
 using Cider.Core.DockerApi;
 using Cider.Core.DockerApi.Json;
 using Cider.Core.DockerApi.Models;
 using Cider.Core.Services;
+using Cider.Daemon.BuildKit;
+using Cider.Daemon.Tunnel;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.WebUtilities;
@@ -255,19 +258,151 @@ public static class HijackInterceptor
         using var scope = services.CreateScope();
         try
         {
-            if (head.Kind == HijackKind.ExecStart)
+            if (head.Kind is HijackKind.Grpc or HijackKind.Session)
             {
-                await ExecStartAsync(context, scope.ServiceProvider, logger, head.Id, body);
+                var options = scope.ServiceProvider.GetRequiredService<CiderOptions>();
+                if (!options.BuildKitEnabled)
+                {
+                    // Exactly the answer StubRoutes gives a plain (non-hijacked) POST /grpc or
+                    // /session: buildx's docker driver treats any non-101 as "unsupported" and
+                    // reports the default builder unsupported, leaving DOCKER_BUILDKIT=0 as the
+                    // user's path — the signal we want when the builder is turned off.
+                    logger.LogWarning("{Kind} rejected: BuildKit is disabled", head.Kind);
+                    await WriteHttpErrorAsync(context.Transport.Output, 404, "page not found");
+                    return;
+                }
             }
-            else
+
+            switch (head.Kind)
             {
-                await AttachAsync(context, scope.ServiceProvider, logger, head);
+                case HijackKind.ExecStart:
+                    await ExecStartAsync(context, scope.ServiceProvider, logger, head.Id, body);
+                    break;
+                case HijackKind.ContainerAttach:
+                    await AttachAsync(context, scope.ServiceProvider, logger, head);
+                    break;
+                case HijackKind.Grpc:
+                    await GrpcAsync(context, scope.ServiceProvider, logger);
+                    break;
+                case HijackKind.Session:
+                    await SessionAsync(context, scope.ServiceProvider, logger, head);
+                    break;
+                default:
+                    throw new InvalidOperationException($"cider: unhandled hijack kind {head.Kind}");
             }
         }
         finally
         {
-            await context.Transport.Output.CompleteAsync();
-            await context.Transport.Input.CompleteAsync();
+            // For /grpc, TunnelTransport re-tags this same ConnectionContext and hands it to
+            // Kestrel's HTTP/2 engine, which disposes it (and so this shared Transport) once the h2
+            // connection tears down — before control returns here. Completing an
+            // already-torn-down transport is a no-op everywhere else; this only guards the one path
+            // that can get there first.
+            try
+            {
+                await context.Transport.Output.CompleteAsync();
+                await context.Transport.Input.CompleteAsync();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+    }
+
+    /// <summary>
+    /// <c>POST /grpc</c>: BuildKit's control-plane connection. BuildKit is the gRPC *client* here,
+    /// so the upgraded connection is handed straight to Kestrel's HTTP/2 engine over
+    /// <see cref="TunnelTransport"/> as <see cref="TunnelKind.Control"/> — the daemon serves it.
+    /// Dialed repeatedly and concurrently (buildx opens a new connection per <c>Client()</c> call:
+    /// Features, HistoryAPISupported probe, resolver boot, build), so this returns as soon as this
+    /// one connection's HTTP/2 traffic ends; it does not own the socket's lifetime beyond that.
+    /// </summary>
+    private static async Task GrpcAsync(ConnectionContext context, IServiceProvider services, ILogger logger)
+    {
+        var tunnel = services.GetRequiredService<TunnelTransport>();
+
+        await WriteUpgradeAsync(context, "Switching Protocols", "h2c", contentType: null);
+        logger.LogDebug("/grpc tunnel opened");
+
+        await tunnel.ServeAsync(context, TunnelKind.Control, sessionId: null, meta: null, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// <c>POST /session</c>: a CLI session connection. Unlike <c>/grpc</c>, the CLI runs the gRPC
+    /// *server* here (session/grpc.go:24-31) and the daemon must be the client — so this never hands
+    /// the connection to Kestrel's HTTP/2 engine; instead it builds a <see cref="CliSession"/> (which
+    /// dials out over the connection itself via <see cref="Tunnel.StreamHttp2Client"/>) and parks it
+    /// in the <see cref="CliSessionRegistry"/> until the connection dies.
+    /// </summary>
+    private static async Task SessionAsync(
+        ConnectionContext context, IServiceProvider services, ILogger logger, HijackRequestHead head)
+    {
+        var output = context.Transport.Output;
+
+        if (string.IsNullOrEmpty(head.SessionId))
+        {
+            logger.LogWarning("/session rejected: no session id");
+            await WriteHttpErrorAsync(output, 400, "cider: no session id");
+            return;
+        }
+
+        if (!head.Upgrade)
+        {
+            logger.LogWarning("/session rejected: protocol h2c not supported");
+            await WriteHttpErrorAsync(output, 400, "cider: protocol h2c not supported");
+            return;
+        }
+
+        var registry = services.GetRequiredService<CliSessionRegistry>();
+
+        // Reject a known duplicate before ever touching the wire, per buildkit's own
+        // "session %s already exists" (session/manager.go) — a client that hijacked once already
+        // must not get a second 101 for the same id.
+        if (registry.TryGet(head.SessionId, out _))
+        {
+            logger.LogWarning("session {Session} rejected: already registered", head.SessionId);
+            await WriteHttpErrorAsync(output, 409, $"cider: session {head.SessionId} already exists");
+            return;
+        }
+
+        // Building the CliSession only wires up a SocketsHttpHandler over the transport; nothing is
+        // written to the wire until the first RPC, so this is still safe to do before the 101.
+        var stream = new DuplexStream(
+            context.Transport.Input.AsStream(leaveOpen: true),
+            context.Transport.Output.AsStream(leaveOpen: true));
+        var session = new CliSession(head.SessionId, head.SessionSharedKey, head.SessionMethods ?? [], stream);
+
+        try
+        {
+            registry.Register(session);
+        }
+        catch (InvalidOperationException)
+        {
+            await session.DisposeAsync();
+            logger.LogWarning("session {Session} rejected: registered concurrently", head.SessionId);
+            await WriteHttpErrorAsync(output, 409, $"cider: session {head.SessionId} already exists");
+            return;
+        }
+
+        // CliSession's own read/write-fault detection only fires once something actually uses the
+        // gRPC channel over this stream — but "the daemon need not speak first; the CLI session
+        // server idles until called" means that may never happen at all for a session nothing ends
+        // up needing. Kestrel's own receive loop for this connection runs regardless of whether the
+        // application ever consumes Transport.Input, so ConnectionClosed is the signal that actually
+        // fires when the client goes away from an otherwise-idle session.
+        using var registration = context.ConnectionClosed.Register(static state => ((CliSession)state!).Close(), session);
+
+        try
+        {
+            await WriteUpgradeAsync(context, "Switching Protocols", "h2c", contentType: null);
+            logger.LogDebug("session {Session} registered ({Count} methods)", session.Id, session.Methods.Count);
+
+            await session.Closed;
+        }
+        finally
+        {
+            registry.Unregister(session.Id);
+            await session.DisposeAsync();
         }
     }
 
@@ -338,7 +473,7 @@ public static class HijackInterceptor
 
         try
         {
-            await WriteUpgradeAsync(context, session.Tty);
+            await WriteUpgradeAsync(context, "UPGRADED", "tcp", DockerResults.StreamContentType(session.Tty));
             await PumpAsync(
                 context,
                 session.OpenStdin,
@@ -413,7 +548,7 @@ public static class HijackInterceptor
 
         try
         {
-            await WriteUpgradeAsync(context, attachment.Tty);
+            await WriteUpgradeAsync(context, "UPGRADED", "tcp", DockerResults.StreamContentType(attachment.Tty));
             await PumpAsync(
                 context,
                 options.Stdin,
@@ -472,7 +607,7 @@ public static class HijackInterceptor
     }
 
     /// <summary>
-    /// Writes the <c>101 UPGRADED</c> head so that it leaves as its own socket write.
+    /// Writes the <c>101</c> upgrade head so that it leaves as its own socket write.
     /// <para>
     /// A <see cref="PipeWriter.FlushAsync"/> is not a socket boundary: it only hands the bytes to
     /// Kestrel's send loop, which can pick up the first stream frames in the very same <c>send()</c>.
@@ -488,14 +623,22 @@ public static class HijackInterceptor
     /// socket carrying nothing but the head. dockerd gets that gap for free, because a container's
     /// first output never arrives this instantly.
     /// </para>
+    /// <para>
+    /// Parameterised for the two shapes this middleware upgrades: exec/attach's
+    /// <c>101 UPGRADED</c> + <c>Upgrade: tcp</c> + a stream <paramref name="contentType"/>, and
+    /// <c>/grpc</c>/<c>/session</c>'s <c>101 Switching Protocols</c> + <c>Upgrade: h2c</c> with no
+    /// <c>Content-Type</c> at all (moby writes the same head: daemon/server/router/grpc/grpc_routes.go:11-45,
+    /// session/manager.go:45-91).
+    /// </para>
     /// </summary>
-    private static async Task WriteUpgradeAsync(ConnectionContext context, bool tty)
+    private static async Task WriteUpgradeAsync(ConnectionContext context, string reasonPhrase, string upgradeToken, string? contentType)
     {
+        var contentTypeLine = contentType is null ? "" : $"Content-Type: {contentType}\r\n";
         var head = Encoding.ASCII.GetBytes(
-            "HTTP/1.1 101 UPGRADED\r\n" +
-            $"Content-Type: {DockerResults.StreamContentType(tty)}\r\n" +
+            $"HTTP/1.1 101 {reasonPhrase}\r\n" +
+            contentTypeLine +
             "Connection: Upgrade\r\n" +
-            "Upgrade: tcp\r\n\r\n");
+            $"Upgrade: {upgradeToken}\r\n\r\n");
 
         if (context.Features.Get<IConnectionSocketFeature>()?.Socket is { } socket)
         {

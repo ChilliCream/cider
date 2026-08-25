@@ -9,6 +9,7 @@ using Cider.Core.Restart;
 using Cider.Core.Runtime;
 using Cider.Core.Services;
 using Cider.Core.State;
+using Cider.Daemon.BuildKit;
 using Cider.Daemon.Dns;
 using Cider.Daemon.Routes;
 using Cider.Daemon.Tunnel;
@@ -197,6 +198,12 @@ public static class DaemonHost
         // FileSend chunks and LLB definitions routinely exceed grpc-dotnet's 4 MB default.
         services.AddSingleton<TunnelTransport>();
         services.AddSingleton<IConnectionListenerFactory>(sp => sp.GetRequiredService<TunnelTransport>());
+
+        // Every CLI session dialed through the hijacked POST /session (see HijackInterceptor); a
+        // build's Control/Solve can name a session id before its connection has upgraded, hence
+        // CliSessionRegistry.WaitAsync rather than only a synchronous lookup.
+        services.AddSingleton<CliSessionRegistry>();
+
         services.AddGrpc(grpc =>
         {
             grpc.IgnoreUnknownServices = true;

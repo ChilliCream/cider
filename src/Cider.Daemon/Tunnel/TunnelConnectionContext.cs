@@ -48,7 +48,20 @@ public sealed class TunnelConnectionContext : ConnectionContext,
             PipeWriter.Create(stream, new StreamPipeWriterOptions(leaveOpen: true)));
     }
 
-    /// <summary>Re-tags an already-hijacked <paramref name="connection"/> as a tunnel connection, reusing its transport.</summary>
+    /// <summary>
+    /// Re-tags an already-hijacked <paramref name="connection"/> as a tunnel connection, reusing its
+    /// transport.
+    /// <para>
+    /// Two things the plain field copy below would otherwise drop, both needed the moment the
+    /// hijacking connection (a real Kestrel socket connection) closes out from under this wrapper
+    /// rather than through it — e.g. the OS tearing down the underlying Unix socket: the inner
+    /// connection's own <see cref="ConnectionClosed"/> is chained into this wrapper's so it aborts
+    /// too instead of dangling forever with pending reads that never unstick, and any feature the
+    /// inner connection carries (e.g. <see cref="IConnectionSocketFeature"/>) is copied over so
+    /// downstream code sees the same connection it would have without the re-tag — never
+    /// overwriting a feature this type sets on itself above.
+    /// </para>
+    /// </summary>
     public TunnelConnectionContext(ConnectionContext connection, TunnelKind kind, string? sessionId, IDictionary<string, string[]>? meta)
         : this(kind, sessionId, meta)
     {
@@ -56,6 +69,19 @@ public sealed class TunnelConnectionContext : ConnectionContext,
         _inner = connection;
         ConnectionId = connection.ConnectionId;
         Transport = connection.Transport;
+
+        foreach (var feature in connection.Features)
+        {
+            if (Features[feature.Key] is null)
+            {
+                Features[feature.Key] = feature.Value;
+            }
+        }
+
+        if (connection.ConnectionClosed.CanBeCanceled)
+        {
+            connection.ConnectionClosed.Register(static state => ((TunnelConnectionContext)state!).Abort(), this);
+        }
     }
 
     private TunnelConnectionContext(TunnelKind kind, string? sessionId, IDictionary<string, string[]>? meta)
