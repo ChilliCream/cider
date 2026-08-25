@@ -46,7 +46,19 @@ internal sealed class LiteralHeadersRewriteStream : Stream
     private const int PrefaceLength = 24;
 
     private const byte HeadersFrameType = 0x1;
+    private const byte ContinuationFrameType = 0x9;
     private const byte EndHeadersFlag = 0x4;
+
+    /// <summary>
+    /// RFC 7540 §4.2's default <c>SETTINGS_MAX_FRAME_SIZE</c> — the largest single frame payload a
+    /// peer must accept without having first been told (via its own SETTINGS) that a larger one is
+    /// welcome. This stream never negotiates that up, so <see cref="_headerBlock"/> must fit inside
+    /// one frame or <see cref="BuildHeadersFrame"/> would have to split it across HEADERS +
+    /// CONTINUATION — unimplemented here (see the class doc comment); go over this and construction
+    /// fails loudly instead of silently emitting a frame the peer is entitled to reject with
+    /// FRAME_SIZE_ERROR.
+    /// </summary>
+    private const int MaxFrameSize = 16384;
 
     private readonly Stream _inner;
     private readonly byte[] _headerBlock;
@@ -65,6 +77,13 @@ internal sealed class LiteralHeadersRewriteStream : Stream
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
         ArgumentNullException.ThrowIfNull(fields);
         _headerBlock = EncodeLiteralFields(fields);
+        if (_headerBlock.Length > MaxFrameSize)
+        {
+            throw new InvalidOperationException(
+                $"cider: session dial header block is {_headerBlock.Length} bytes, over the " +
+                $"{MaxFrameSize}-byte default SETTINGS_MAX_FRAME_SIZE -- LiteralHeadersRewriteStream " +
+                "cannot split a header block across HEADERS + CONTINUATION frames");
+        }
     }
 
     /// <inheritdoc />
@@ -162,9 +181,33 @@ internal sealed class LiteralHeadersRewriteStream : Stream
             var type = _pending[3];
             if (type == HeadersFrameType)
             {
+                var flags = _pending[4];
+                if ((flags & EndHeadersFlag) == 0)
+                {
+                    // SocketsHttpHandler split its own header block across HEADERS + one or more
+                    // CONTINUATION frames -- this stream only ever substitutes the one HEADERS frame,
+                    // so latching _headersRewritten now and flushing the rest raw would forward the
+                    // original (un-substituted) CONTINUATION payload right behind our replacement
+                    // HEADERS frame, corrupting the connection's HPACK state for both sides silently.
+                    // Fail loudly instead.
+                    throw new InvalidOperationException(
+                        "cider: session dial's HEADERS frame did not set END_HEADERS -- a CONTINUATION " +
+                        "frame would follow, which LiteralHeadersRewriteStream does not support");
+                }
+
                 var streamId = ((_pending[5] & 0x7F) << 24) | (_pending[6] << 16) | (_pending[7] << 8) | _pending[8];
                 await _inner.WriteAsync(BuildHeadersFrame(streamId), cancellationToken).ConfigureAwait(false);
                 _headersRewritten = true;
+            }
+            else if (type == ContinuationFrameType)
+            {
+                // A CONTINUATION frame arriving before any HEADERS frame has been seen would mean
+                // this connection's first request already needed one, which BuildHeadersFrame's own
+                // MaxFrameSize guard should have prevented for the header block this stream itself
+                // writes -- but SocketsHttpHandler is the one framing the original request, so guard
+                // this too rather than forwarding a frame type this class was never designed to handle.
+                throw new InvalidOperationException(
+                    "cider: unexpected CONTINUATION frame before this connection's HEADERS frame was rewritten");
             }
             else
             {

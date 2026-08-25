@@ -208,6 +208,32 @@ public sealed class ControlProxyTests : IAsyncLifetime
             await _controlService.DriveCompletedTask.WaitAsync(TimeSpan.FromSeconds(20));
             Assert.Null(_controlService.DriveError);
 
+            // cider-ger.16 regression coverage: mirrors SessionBridgeTests' header assertion --
+            // this fake buildkitd's Session call also arrives through SessionBridge.OpenAsync's
+            // LiteralHeadersRewriteStream dial, decoded by Kestrel's real HPACK decoder. The
+            // method-count/no-comma checks read the raw HttpContext.Request.Headers StringValues
+            // rather than ServerCallContext.RequestHeaders (Metadata) -- see the matching comment on
+            // SessionBridgeTests.Bridges_captures_and_tears_down_idempotently for why: Grpc.AspNetCore
+            // .Server's own Metadata construction re-joins repeated header lines with "," before this
+            // test could ever see them separately, which real buildkitd (grpc-go) does not do.
+            var expectedMethods = new HashSet<string>(cliSession.Methods, StringComparer.Ordinal)
+            {
+                BuildKitMethods.FileSend.DiffCopy.ToLowerInvariant(),
+                BuildKitMethods.Health.Check.ToLowerInvariant(),
+            };
+            var rawHeaders = _controlService.LastHttpContext!.Request.Headers;
+            var methodValues = rawHeaders[BuildKitMethods.MetadataKeys.SessionGrpcMethod];
+            Assert.Equal(expectedMethods.Count, methodValues.Count);
+            Assert.Equal(expectedMethods, new HashSet<string>(methodValues!, StringComparer.Ordinal));
+            foreach (var (_, values) in rawHeaders)
+            {
+                Assert.All(values, v => Assert.DoesNotContain(',', v!));
+            }
+
+            var headers = _controlService.LastHeaders!;
+            Assert.Equal(cliSession.Id, headers.First(h => h.Key == BuildKitMethods.MetadataKeys.SessionUuid).Value);
+            Assert.Equal(cliSession.SharedKey, headers.First(h => h.Key == BuildKitMethods.MetadataKeys.SessionSharedKey).Value);
+
             var expected = await _images.InspectAsync("docker.io/library/app:1", CancellationToken.None);
             Assert.Equal(expected.Id, response.ExporterResponse["containerimage.digest"]);
             Assert.Equal(expected.Id, response.ExporterResponse["containerimage.config.digest"]);
@@ -424,6 +450,21 @@ public sealed class ControlProxyTests : IAsyncLifetime
 
         public Task DriveCompletedTask => _driveCompleted.Task;
 
+        /// <summary>
+        /// The request headers the most recent <c>Session</c> call arrived with -- mirrors
+        /// <c>SessionBridgeTests.TestControlService.LastHeaders</c> (cider-ger.16 regression
+        /// coverage), decoded by Kestrel's real HPACK decoder since <see cref="SessionBridge"/>
+        /// dials this fake buildkitd the same way it dials the real one.
+        /// </summary>
+        public Metadata? LastHeaders { get; private set; }
+
+        /// <summary>
+        /// The raw ASP.NET Core <see cref="HttpContext"/> for the most recent <c>Session</c> call --
+        /// needed alongside <see cref="LastHeaders"/> because <see cref="Grpc.AspNetCore.Server"/>'s
+        /// own <c>Metadata</c> construction comma-joins repeated header lines (see the usage site).
+        /// </summary>
+        public HttpContext? LastHttpContext { get; private set; }
+
         public override Task<InfoResponse> Info(InfoRequest request, ServerCallContext context)
         {
             InfoCalled = true;
@@ -445,6 +486,8 @@ public sealed class ControlProxyTests : IAsyncLifetime
         public override async Task Session(
             IAsyncStreamReader<BytesMessage> requestStream, IServerStreamWriter<BytesMessage> responseStream, ServerCallContext context)
         {
+            LastHeaders = context.RequestHeaders;
+            LastHttpContext = context.GetHttpContext();
             var sessionId = context.RequestHeaders.FirstOrDefault(h => h.Key == BuildKitMethods.MetadataKeys.SessionUuid)?.Value;
             if (sessionId == "S2")
             {

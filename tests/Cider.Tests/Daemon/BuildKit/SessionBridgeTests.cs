@@ -12,6 +12,7 @@ using Grpc.HealthCheck;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -187,6 +188,38 @@ public sealed class SessionBridgeTests : IAsyncLifetime
         await _controlService.DriveCompletedTask.WaitAsync(TimeSpan.FromSeconds(20));
         Assert.Null(_controlService.DriveError);
         Assert.Equal(1, Volatile.Read(ref _controlService.SessionCallCount));
+
+        // cider-ger.16 regression coverage: the dial's hand-rolled header block, as buildkitd's own
+        // real HPACK decoder actually saw it -- one line per advertised method (not one comma-joined
+        // line), no comma inside any single value, and the session identity intact.
+        //
+        // The method-count/no-comma checks below read the raw Kestrel HttpContext.Request.Headers
+        // StringValues, not ServerCallContext.RequestHeaders (Metadata): Grpc.AspNetCore.Server's own
+        // Metadata construction does `header.Value.ToString()` over that StringValues, which silently
+        // re-joins repeated header lines with "," -- exactly the bug this fix removes, but reintroduced
+        // one layer up, in the .NET server framework rather than the .NET client one, in a way that
+        // would make a real regression (a revert of the LiteralHeadersRewriteStream fix) and a healthy
+        // build produce an IDENTICAL single Metadata entry. Real buildkitd (grpc-go) does not do this
+        // -- metadata.MD.Append preserves each HPACK-decoded header line as its own slice entry -- so
+        // the raw StringValues Kestrel's own HPACK decoder produced (before grpc-dotnet's join) is what
+        // is actually faithful to what buildkitd sees, and is asserted here instead.
+        var expectedMethods = new HashSet<string>(_cliSession.Methods, StringComparer.Ordinal)
+        {
+            BuildKitMethods.FileSend.DiffCopy.ToLowerInvariant(),
+            BuildKitMethods.Health.Check.ToLowerInvariant(),
+        };
+        var rawHeaders = _controlService.LastHttpContext!.Request.Headers;
+        var methodValues = rawHeaders[BuildKitMethods.MetadataKeys.SessionGrpcMethod];
+        Assert.Equal(expectedMethods.Count, methodValues.Count);
+        Assert.Equal(expectedMethods, new HashSet<string>(methodValues!, StringComparer.Ordinal));
+        foreach (var (_, values) in rawHeaders)
+        {
+            Assert.All(values, v => Assert.DoesNotContain(',', v!));
+        }
+
+        var headers = _controlService.LastHeaders!;
+        Assert.Equal(_cliSession.Id, headers.First(h => h.Key == BuildKitMethods.MetadataKeys.SessionUuid).Value);
+        Assert.Equal(_cliSession.SharedKey, headers.First(h => h.Key == BuildKitMethods.MetadataKeys.SessionSharedKey).Value);
 
         // FileSend exporter 0: captured to disk, never reached the CLI.
         var exportResult = await exportTask.WaitAsync(TimeSpan.FromSeconds(20));
@@ -517,12 +550,38 @@ public sealed class SessionBridgeTests : IAsyncLifetime
 
         public Task SessionEndedTask => _sessionEnded.Task;
 
+        /// <summary>
+        /// The request headers this <c>Session</c> call arrived with, as
+        /// <c>ServerCallContext.RequestHeaders</c> exposes them -- fine for single-valued entries
+        /// (<c>SessionUuid</c>, <c>SessionSharedKey</c>), but NOT where a reverted cider-ger.16 fix
+        /// would show up: <see cref="Grpc.AspNetCore.Server"/>'s own <c>Metadata</c> construction
+        /// comma-joins repeated header lines before this property could ever see them separately, so
+        /// a genuine N-separate-lines advertisement and the old comma-joined-by-the-client bug look
+        /// identical here. See <see cref="LastHttpContext"/> for the property that actually
+        /// distinguishes them.
+        /// </summary>
+        public Metadata? LastHeaders { get; private set; }
+
+        /// <summary>
+        /// The raw ASP.NET Core <see cref="HttpContext"/> for this <c>Session</c> call -- i.e. exactly
+        /// what <see cref="SessionBridge.OpenAsync"/>'s <see cref="LiteralHeadersRewriteStream"/> put
+        /// on the wire, decoded by Kestrel's real HPACK decoder (cider-ger.16 regression coverage: a
+        /// reverted-to-<c>Metadata</c> advertisement would comma-join every
+        /// <c>x-docker-expose-session-grpc-method</c> value into one useless line instead of N
+        /// separate ones -- <c>Request.Headers[...]</c>'s raw <c>StringValues</c>, read before
+        /// grpc-dotnet's own <see cref="LastHeaders"/> conversion collapses that distinction, is where
+        /// that actually shows up).
+        /// </summary>
+        public HttpContext? LastHttpContext { get; private set; }
+
         public void SignalReady() => _readyToDrive.TrySetResult();
 
         public override async Task Session(
             IAsyncStreamReader<BytesMessage> requestStream, IServerStreamWriter<BytesMessage> responseStream, ServerCallContext context)
         {
             Interlocked.Increment(ref SessionCallCount);
+            LastHeaders = context.RequestHeaders;
+            LastHttpContext = context.GetHttpContext();
 
             var stream = new ServerBytesMessageStream(requestStream, responseStream);
             var (channel, invoker, handler) = StreamHttp2Client.Create(stream, $"embedded-{Guid.NewGuid():n}");
