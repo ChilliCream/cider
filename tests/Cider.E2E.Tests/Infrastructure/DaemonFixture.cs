@@ -39,7 +39,15 @@ public class DaemonFixture : IAsyncLifetime
         string.Equals(PortPublishingMode, CiderOptions.ApplePortPublishing, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The daemon's configuration (short socket path, temp data dir).</summary>
-    public CiderOptions Options { get; private set; } = new();
+    public CiderOptions Options { get; protected set; } = new();
+
+    /// <summary>
+    /// The fixture-instance-unique id <see cref="BuildOptions"/> bakes into <see cref="Options"/>'s
+    /// paths, captured once in <see cref="InitializeAsync"/> so every later rebuild (see
+    /// <see cref="RecreateOptions"/>) produces a value-identical <see cref="CiderOptions"/> — same
+    /// <c>DataDir</c>, same <c>SocketPath</c> — just a different object instance.
+    /// </summary>
+    private string _id = "";
 
     /// <summary>The value tests put into <c>DOCKER_HOST</c>.</summary>
     public string DockerHost => "unix://" + Options.SocketPath;
@@ -92,20 +100,8 @@ public class DaemonFixture : IAsyncLifetime
             return;
         }
 
-        var id = Guid.NewGuid().ToString("n")[..8] + InstanceSuffix;
-        Options = new CiderOptions
-        {
-            // sockaddr_un.sun_path is 104 bytes on macOS: /tmp/cider-e2e-xxxxxxxx.sock is far below it.
-            DataDir = $"/tmp/cider-e2e-{id}",
-            SocketPath = $"/tmp/cider-e2e-{id}.sock",
-            LogLevel = Environment.GetEnvironmentVariable("CIDER_E2E_LOGLEVEL") ?? "Information",
-            PollIntervalSeconds = PollIntervalOverride,
-            DnsEnabled = true,
-
-            // `proxy` by default, like the real daemon; CIDER_PORT_PUBLISHING=apple runs the
-            // suite against Apple's own `-p` forwarder instead.
-            PortPublishing = PortPublishingMode,
-        };
+        _id = Guid.NewGuid().ToString("n")[..8] + InstanceSuffix;
+        Options = BuildOptions(_id);
 
         DockerConfigDir = Path.Combine(Options.DataDir, "docker-config");
         ScratchDir = Path.Combine(Options.DataDir, "scratch");
@@ -117,6 +113,37 @@ public class DaemonFixture : IAsyncLifetime
         await StartDaemonAsync();
         await SnapshotPreExistingDockerObjectsAsync();
     }
+
+    /// <summary>
+    /// Builds this fixture instance's <see cref="CiderOptions"/> deterministically from <paramref
+    /// name="id"/>: same <c>DataDir</c>, <c>SocketPath</c>, <c>PollIntervalSeconds</c>,
+    /// <c>PortPublishing</c>, <c>LogLevel</c> and <c>DnsEnabled</c> every time it is called for this
+    /// instance, but a fresh object each call.
+    /// </summary>
+    private CiderOptions BuildOptions(string id) => new()
+    {
+        // sockaddr_un.sun_path is 104 bytes on macOS: /tmp/cider-e2e-xxxxxxxx.sock is far below it.
+        DataDir = $"/tmp/cider-e2e-{id}",
+        SocketPath = $"/tmp/cider-e2e-{id}.sock",
+        LogLevel = Environment.GetEnvironmentVariable("CIDER_E2E_LOGLEVEL") ?? "Information",
+        PollIntervalSeconds = PollIntervalOverride,
+        DnsEnabled = true,
+
+        // `proxy` by default, like the real daemon; CIDER_PORT_PUBLISHING=apple runs the
+        // suite against Apple's own `-p` forwarder instead.
+        PortPublishing = PortPublishingMode,
+    };
+
+    /// <summary>
+    /// Replaces <see cref="Options"/> with a freshly built, value-identical copy of itself. A new
+    /// <see cref="CiderOptions"/> instance is a new <c>ConditionalWeakTable</c> key for
+    /// <c>RuntimeTransportSelector</c>'s per-instance transport-selection cache
+    /// (<c>src/Cider.AppleContainer/Xpc/RuntimeTransportSelector.cs</c>), so restarting a daemon on a
+    /// recreated <see cref="Options"/> forces a fresh <c>SelectAsync</c> and a live
+    /// <c>XpcClient</c>, instead of the disposed one the cache would otherwise hand back keyed on the
+    /// original, still-alive <see cref="Options"/> reference.
+    /// </summary>
+    protected void RecreateOptions() => Options = BuildOptions(_id);
 
     /// <summary>
     /// Records every container/network/volume the daemon already knows about right after startup

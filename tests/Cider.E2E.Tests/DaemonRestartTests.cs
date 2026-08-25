@@ -14,6 +14,13 @@ public sealed class RestartableDaemonFixture : DaemonFixture
     public async Task RestartAsync()
     {
         await StopDaemonAsync();
+
+        // RuntimeTransportSelector caches the selected transport per-CiderOptions-instance
+        // (ConditionalWeakTable<CiderOptions, ...>), so reusing the same Options object would hand the
+        // restarted daemon the previous daemon's now-disposed XpcClient. A value-identical copy is a
+        // new cache key, forcing a fresh SelectAsync/XpcClient for the new process.
+        RecreateOptions();
+
         await StartDaemonAsync();
     }
 }
