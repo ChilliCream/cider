@@ -70,7 +70,7 @@ internal sealed class XpcClient : IDisposable
     private readonly Lock _connectionLock = new();
 
     private Connection? _current;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public XpcClient(string serviceName, ILogger logger)
     {
@@ -95,6 +95,11 @@ internal sealed class XpcClient : IDisposable
         var stopwatch = Stopwatch.StartNew();
         try
         {
+            // Checked before EnsureConnection: EnsureConnection hands out a caller-owned retain
+            // that only SendSync ever releases (via RunWithTimeoutAsync/RunOnDedicatedThreadAsync
+            // below). If ct were already cancelled, bailing out here means that retain is never
+            // taken in the first place, so there is nothing for SendSync to have to balance.
+            ct.ThrowIfCancellationRequested();
             var connection = EnsureConnection();
 
             var replyDict = options.LongRunning
@@ -113,7 +118,12 @@ internal sealed class XpcClient : IDisposable
     private async Task<XpcDictionary> RunWithTimeoutAsync(
         Connection connection, XpcMessage request, TimeSpan? timeout, CancellationToken ct)
     {
-        var sendTask = Task.Run(() => SendSync(connection, request), ct);
+        // CancellationToken.None, not ct: SendSync is the only place that releases the
+        // caller-owned retain EnsureConnection handed out, so it must always actually run. Passing
+        // ct here would let an already-cancelled (or concurrently cancelled) token make Task.Run
+        // return a cancelled task without ever calling SendSync, leaking that retain. ct still
+        // governs the wait below, exactly like the Swift client's purely client-side timeout (§1.4).
+        var sendTask = Task.Run(() => SendSync(connection, request), CancellationToken.None);
         if (timeout is not { } budget)
         {
             return await sendTask.ConfigureAwait(false);
@@ -129,10 +139,15 @@ internal sealed class XpcClient : IDisposable
         catch (TimeoutException)
         {
             // Purely client-side, exactly like the Swift client (§1.4): the underlying sync send is
-            // still blocked in native code and is not cancelled — only observed, so its eventual
-            // fault (or success, which must still be disposed rather than leaked) can never surface
-            // as an unobserved exception, or leaked reply, once the caller has already moved on with
-            // a Timeout.
+            // still blocked in native code. Cancelling the connection here releases that blocked
+            // thread promptly with an XPC_ERROR_CONNECTION_INVALID reply instead of leaving it
+            // hanging until the daemon eventually replies (or never does); EnsureConnection then
+            // transparently reconnects on the next call. The abandoned task is only observed, never
+            // awaited further, so its eventual fault (or success, which must still be disposed
+            // rather than leaked) can never surface as an unobserved exception, or leaked reply,
+            // once the caller has already moved on with a Timeout.
+            connection.Broken = true;
+            XpcNative.xpc_connection_cancel(connection.Handle);
             _ = sendTask.ContinueWith(
                 static t =>
                 {
@@ -153,24 +168,30 @@ internal sealed class XpcClient : IDisposable
     }
 
     private Task<XpcDictionary> RunOnDedicatedThreadAsync(Connection connection, XpcMessage request, CancellationToken ct) =>
+        // CancellationToken.None, not ct, for the same reason as RunWithTimeoutAsync above: SendSync
+        // must always run so it always releases EnsureConnection's caller-owned retain. Cancellation
+        // is not supported on this long-running path anyway — the sync send itself is never
+        // interrupted by ct.
         Task.Factory.StartNew(
             () => SendSync(connection, request),
-            ct,
+            CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
 
     /// <summary>The blocking call itself — always run off whatever thread called <see cref="SendAsync"/>
-    /// (see <see cref="RunWithTimeoutAsync"/>/<see cref="RunOnDedicatedThreadAsync"/>). Pins
-    /// <paramref name="connection"/> with an extra native retain for the duration of the blocking
-    /// call: <see cref="RunWithTimeoutAsync"/> can abandon this call (on timeout) and the client can
-    /// be disposed concurrently, either of which would otherwise drop the connection's only
-    /// reference — via <see cref="CancelAndReleaseConnection"/> — while
-    /// <c>xpc_connection_send_message_with_reply_sync</c> is still blocked on it. The extra retain
-    /// keeps the object alive for that call; cancellation still unblocks it promptly with an
-    /// <c>XPC_ERROR_CONNECTION_INVALID</c> reply.</summary>
+    /// (see <see cref="RunWithTimeoutAsync"/>/<see cref="RunOnDedicatedThreadAsync"/>). Runs against
+    /// a <paramref name="connection"/> that already carries a caller-owned native retain, taken by
+    /// <see cref="EnsureConnection"/> under <c>_connectionLock</c> at hand-out time — not here — so
+    /// the retain and the lookup that hands the connection out can never be split by a concurrent
+    /// <see cref="Dispose"/> or reconnect landing in between. This method releases that retain when
+    /// the blocking call completes: <see cref="RunWithTimeoutAsync"/> can abandon this call (on
+    /// timeout) and the client can be disposed concurrently, either of which would otherwise drop
+    /// the connection's only remaining reference — via <see cref="CancelAndReleaseConnection"/> —
+    /// while <c>xpc_connection_send_message_with_reply_sync</c> is still blocked on it. On a
+    /// client-side timeout, <see cref="RunWithTimeoutAsync"/> now also cancels the connection so
+    /// this blocked thread is released promptly with an <c>XPC_ERROR_CONNECTION_INVALID</c> reply.</summary>
     private XpcDictionary SendSync(Connection connection, XpcMessage request)
     {
-        XpcNative.xpc_retain(connection.Handle);
         try
         {
             var replyPtr = request.Dictionary.Use(handle =>
@@ -200,7 +221,20 @@ internal sealed class XpcClient : IDisposable
                 throw XpcException.ApiServer("unknown", $"unexpected XPC reply type '{type}': {description}");
             }
 
-            return new XpcDictionary(replyPtr);
+            var reply = new XpcDictionary(replyPtr);
+
+            // §1.3: apiserver errors ride inside an ordinary reply dictionary, never as a separate
+            // XPC error object — every dictionary reply must be checked for the envelope. The route
+            // ran and the daemon rejected the call, so unlike the two branches above this leaves the
+            // connection itself un-broken; only this one call failed.
+            var envelope = reply.GetData(XpcMessage.ErrorKey);
+            if (envelope is not null)
+            {
+                reply.Dispose();
+                throw XpcErrorMapper.Decode(envelope);
+            }
+
+            return reply;
         }
         finally
         {
@@ -208,12 +242,18 @@ internal sealed class XpcClient : IDisposable
         }
     }
 
+    /// <summary>Returns the connection to send on, creating one if the current one is missing or
+    /// broken. The returned <see cref="Connection"/> carries a caller-owned native retain — taken
+    /// here, under <see cref="_connectionLock"/>, on top of the client's own reference — so the
+    /// hand-out and the retain can never be split by a concurrent <see cref="Dispose"/> or reconnect.
+    /// <see cref="SendSync"/> is the one place that releases it.</summary>
     private Connection EnsureConnection()
     {
         lock (_connectionLock)
         {
             if (_current is { Broken: false } c)
             {
+                XpcNative.xpc_retain(c.Handle);
                 return c;
             }
 
@@ -238,6 +278,9 @@ internal sealed class XpcClient : IDisposable
             XpcNative.xpc_connection_set_event_handler(handle, block);
             XpcNative.xpc_connection_activate(handle);
 
+            // The caller-owned retain on top of the client's own reference from
+            // xpc_connection_create_mach_service above — see this method's doc comment.
+            XpcNative.xpc_retain(handle);
             _current = connection;
             return connection;
         }

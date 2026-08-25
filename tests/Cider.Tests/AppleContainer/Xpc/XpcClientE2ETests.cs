@@ -1,4 +1,5 @@
 using Cider.AppleContainer.Xpc;
+using Cider.Core.Runtime;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -104,6 +105,30 @@ public class XpcClientE2ETests
 
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"unknown route took {sw.Elapsed} to surface");
         Assert.Equal(XpcErrorClass.Transport, ex.ErrorClass);
+    }
+
+    [E2EFact]
+    public async Task ContainerDelete_of_an_unknown_id_decodes_the_apiserver_error_envelope()
+    {
+        using var client = NewClient();
+
+        // §8.9: the route runs and rejects a valid-looking but nonexistent id with `notFound` —
+        // this exercises the client actually decoding com.apple.container.xpc.error off a normal
+        // reply dictionary (§1.3), as opposed to the transport-level failure the unknown-route test
+        // above covers. Read-only: deleting an id that was never created never touches a real
+        // container.
+        using var request = new XpcMessage("containerDelete");
+        request.SetString("id", $"cider-e2e-nonexistent-{Guid.NewGuid():N}");
+        request.SetBool("forceDelete", false);
+
+        var ex = await Assert.ThrowsAsync<XpcException>(() =>
+            client.SendAsync(request, XpcCallOptions.NoTimeout));
+
+        Assert.Equal(XpcErrorClass.ApiServer, ex.ErrorClass);
+        Assert.Equal("notFound", ex.Code);
+
+        var runtimeEx = ex.ToRuntimeException("delete container");
+        Assert.Equal(RuntimeErrorKind.NotFound, runtimeEx.Kind);
     }
 
     [E2EFact]
