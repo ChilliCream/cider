@@ -119,8 +119,6 @@ internal sealed class SingleKeyUnionConverter<[DynamicallyAccessedMembers(Dynami
             .Select(p => (Property: p, JsonName: JsonNamingPolicy.CamelCase.ConvertName(p.Name)))
             .ToArray();
 
-    [RequiresDynamicCode("Calls System.Text.Json.JsonSerializer.Deserialize(Type, JsonSerializerOptions)")]
-    [RequiresUnreferencedCode("Calls System.Text.Json.JsonSerializer.Deserialize(Type, JsonSerializerOptions)")]
     public override T Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         if (reader.TokenType != JsonTokenType.StartObject)
@@ -143,14 +141,12 @@ internal sealed class SingleKeyUnionConverter<[DynamicallyAccessedMembers(Dynami
             throw new JsonException($"Unknown case '{member.Name}' for union type '{typeToConvert.Name}'.");
         }
 
-        var value = member.Value.Deserialize(match.Property.PropertyType, options);
+        var value = member.Value.Deserialize(options.GetTypeInfo(match.Property.PropertyType));
         var result = new T();
         match.Property.SetValue(result, value);
         return result;
     }
 
-    [RequiresDynamicCode("Calls System.Text.Json.JsonSerializer.Serialize(Utf8JsonWriter, Object, Type, JsonSerializerOptions)")]
-    [RequiresUnreferencedCode("Calls System.Text.Json.JsonSerializer.Serialize(Utf8JsonWriter, Object, Type, JsonSerializerOptions)")]
     public override void Write(Utf8JsonWriter writer, T value, JsonSerializerOptions options)
     {
         foreach (var (property, jsonName) in Cases)
@@ -163,7 +159,7 @@ internal sealed class SingleKeyUnionConverter<[DynamicallyAccessedMembers(Dynami
 
             writer.WriteStartObject();
             writer.WritePropertyName(jsonName);
-            JsonSerializer.Serialize(writer, caseValue, property.PropertyType, options);
+            JsonSerializer.Serialize(writer, caseValue, options.GetTypeInfo(property.PropertyType));
             writer.WriteEndObject();
             return;
         }
@@ -275,7 +271,6 @@ internal sealed class NetworkConfigurationConverter : JsonConverter<NetworkConfi
         };
     }
 
-    [RequiresUnreferencedCode("Calls System.Text.Json.JsonSerializer.Serialize<TValue>(Utf8JsonWriter, TValue, JsonSerializerOptions)")]
     public override void Write(Utf8JsonWriter writer, NetworkConfiguration value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
@@ -293,14 +288,14 @@ internal sealed class NetworkConfigurationConverter : JsonConverter<NetworkConfi
         }
 
         writer.WritePropertyName("labels");
-        JsonSerializer.Serialize(writer, value.Labels, options);
+        JsonSerializer.Serialize(writer, value.Labels, XpcJsonContext.Default.DictionaryStringString);
         if (value.Plugin is not null)
         {
             writer.WriteString("plugin", value.Plugin);
         }
 
         writer.WritePropertyName("options");
-        JsonSerializer.Serialize(writer, value.Options, options);
+        JsonSerializer.Serialize(writer, value.Options, XpcJsonContext.Default.DictionaryStringString);
         writer.WriteEndObject();
     }
 
