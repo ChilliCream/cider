@@ -91,8 +91,11 @@ public sealed partial class ContainerManager
             return;
         }
 
-        // Hidden system containers (the DNS forwarders) are the daemon's own business and must
-        // never show up as Docker containers.
+        // Hidden system containers (the DNS forwarders, Apple's builder VM) are never Docker
+        // containers. Kept unfiltered too, so a record already adopted for one of them (upgrade
+        // from before this filter existed) can be told apart from one whose runtime container is
+        // genuinely gone.
+        var byRawRuntimeId = runtimeContainers.ToDictionary(c => c.RuntimeId, StringComparer.Ordinal);
         runtimeContainers = [.. runtimeContainers.Where(container => !IsSystemContainer(container))];
         var byRuntimeId = runtimeContainers.ToDictionary(c => c.RuntimeId, StringComparer.Ordinal);
 
@@ -102,6 +105,19 @@ public sealed partial class ContainerManager
 
             if (!byRuntimeId.TryGetValue(record.RuntimeId, out var runtimeContainer))
             {
+                // An older daemon adopted this before system containers were filtered (e.g. Apple's
+                // builder VM). The engine still has it, but it now classifies as system, so the
+                // stale record is dropped outright rather than marked exited.
+                if (!record.Managed &&
+                    byRawRuntimeId.TryGetValue(record.RuntimeId, out var stillPresent) &&
+                    IsSystemContainer(stillPresent))
+                {
+                    _store.Delete(record.Id);
+                    _handles.TryRemove(record.Id, out _);
+                    _logger.LogInformation("dropping adopted system container record {Name}", record.Name);
+                    continue;
+                }
+
                 if (record.State.Running)
                 {
                     record.State.Status = "exited";

@@ -176,11 +176,50 @@ public sealed partial class ContainerManager : IContainerCounts
     /// <summary>Transitional (rename to Cider): pre-rename <see cref="SystemLabel"/>; read, never written.</summary>
     public const string LegacySystemLabel = "com.apple-demon.system";
 
-    /// <summary><c>true</c> for a hidden container the daemon started for its own plumbing.</summary>
+    /// <summary>Label Apple's own tooling stamps on the builder VM's plugin role.</summary>
+    private const string AppleBuilderRoleLabel = "com.apple.container.resource.role";
+
+    /// <summary>Label Apple's own tooling stamps on the builder VM's plugin identity.</summary>
+    private const string AppleBuilderPluginLabel = "com.apple.container.plugin";
+
+    /// <summary>Runtime id Apple's <c>container</c> CLI gives its builder VM.</summary>
+    private const string AppleBuilderRuntimeId = "buildkit";
+
+    /// <summary>
+    /// <c>true</c> for a hidden container the daemon started for its own plumbing, or for Apple's
+    /// builder VM (<c>buildkit</c>): it is the Apple CLI's own build cache, not a Docker container,
+    /// and must never be adopted, listed or removable through the Docker API.
+    /// </summary>
     public static bool IsSystemContainer(RuntimeContainer container)
     {
         ArgumentNullException.ThrowIfNull(container);
-        return ContainerIdentity.TryReadLabel(container.Labels, SystemLabel, LegacySystemLabel, out _);
+
+        if (ContainerIdentity.TryReadLabel(container.Labels, SystemLabel, LegacySystemLabel, out _))
+        {
+            return true;
+        }
+
+        if (container.Labels.TryGetValue(AppleBuilderRoleLabel, out var role) &&
+            string.Equals(role, "builder", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (container.Labels.TryGetValue(AppleBuilderPluginLabel, out var plugin) &&
+            string.Equals(plugin, "builder", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        // Belt and braces: the builder's well-known runtime id, so long as it does not also carry
+        // Cider's own labels (a user-created container could in principle be named "buildkit").
+        if (string.Equals(container.RuntimeId, AppleBuilderRuntimeId, StringComparison.Ordinal) &&
+            ContainerIdentity.ReadDockerId(container.Labels) is null)
+        {
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>Every known record (used by the state poller and the health monitor).</summary>
