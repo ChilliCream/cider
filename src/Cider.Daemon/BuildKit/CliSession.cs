@@ -66,8 +66,9 @@ public sealed class CliSession : IAsyncDisposable
     /// next HEADERS frame this session's <see cref="Invoker"/> writes on the wire, working around
     /// <c>System.Net.Http.Headers.HttpHeaders</c> silently comma-joining repeated header values into
     /// one line (cider-ger.16, cider-ger.18). Awaits until any earlier call's own HEADERS frame has
-    /// finished writing (the gate this returns releases) before queuing, so two forwards racing on the
-    /// same session never see each other's fields.
+    /// actually been written on the wire -- the gate this returns is released the instant that write
+    /// completes, not whenever that earlier call's <c>SendAsync</c> eventually returns -- before
+    /// queuing, so two forwards racing on the same session never see each other's fields.
     /// </summary>
     internal async Task<IAsyncDisposable> BeginHeaderRewriteAsync(
         IReadOnlyList<(string Name, string Value)> fields, CancellationToken cancellationToken) =>
@@ -135,7 +136,7 @@ public sealed class CliSession : IAsyncDisposable
         private int _signaled;
         private readonly SemaphoreSlim _headerGate = new(1, 1);
         private readonly List<byte> _pendingWrite = [];
-        private IReadOnlyList<(string Name, string Value)>? _nextHeaderFields;
+        private (IReadOnlyList<(string Name, string Value)> Fields, HeaderRewriteScope Scope)? _pendingHeaderRewrite;
         private int _prefaceRemaining = PrefaceLength;
 
         public override bool CanRead => inner.CanRead;
@@ -228,14 +229,19 @@ public sealed class CliSession : IAsyncDisposable
         /// HEADERS/CONTINUATION sequence for one stream interleaving with another's (RFC 7540 §4.3),
         /// so once this stream has actually written the substitute frame the connection is free for
         /// the next caller regardless of how long that first call's body/response takes afterwards.
+        /// <see cref="RewriteAndForwardAsync"/> releases the gate itself the instant it finishes
+        /// writing the substitute HEADERS frame -- the <see cref="HeaderRewriteScope"/> returned here
+        /// is only the fallback for a caller whose <c>SendAsync</c> throws before ever writing HEADERS
+        /// (its <c>Interlocked</c> guard makes a release that already happened a harmless no-op).
         /// </summary>
         public async Task<IAsyncDisposable> BeginHeaderRewriteAsync(
             IReadOnlyList<(string Name, string Value)> fields, CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(fields);
             await _headerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            _nextHeaderFields = fields;
-            return new HeaderRewriteScope(_headerGate);
+            var scope = new HeaderRewriteScope(_headerGate);
+            _pendingHeaderRewrite = (fields, scope);
+            return scope;
         }
 
         /// <summary>
@@ -245,8 +251,9 @@ public sealed class CliSession : IAsyncDisposable
         /// bytes follow, so frame boundaries are unambiguous regardless of how
         /// <c>SocketsHttpHandler</c> chose to chunk its own writes). Every frame passes through
         /// untouched except HEADERS, which is replaced by a same-stream-id, same-flags frame built
-        /// from whatever <see cref="_nextHeaderFields"/> the current <see cref="BeginHeaderRewriteAsync"/>
-        /// caller queued.
+        /// from whatever fields the current <see cref="BeginHeaderRewriteAsync"/> caller queued in
+        /// <see cref="_pendingHeaderRewrite"/> -- releasing that caller's gate the instant the
+        /// substitute frame is written, not whenever its own <c>SendAsync</c> eventually returns.
         /// </summary>
         private async Task RewriteAndForwardAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
         {
@@ -292,10 +299,18 @@ public sealed class CliSession : IAsyncDisposable
                     }
 
                     var streamId = ((_pendingWrite[5] & 0x7F) << 24) | (_pendingWrite[6] << 16) | (_pendingWrite[7] << 8) | _pendingWrite[8];
-                    var fields = _nextHeaderFields ?? throw new InvalidOperationException(
+                    var (fields, scope) = _pendingHeaderRewrite ?? throw new InvalidOperationException(
                         "cider: a session forward wrote a HEADERS frame without first calling BeginHeaderRewriteAsync");
-                    _nextHeaderFields = null;
+                    _pendingHeaderRewrite = null;
                     await inner.WriteAsync(BuildHeadersFrame(streamId, flags, fields), cancellationToken).ConfigureAwait(false);
+
+                    // Release the gate the instant the substitute frame has actually gone out, not
+                    // whenever the caller's SendAsync eventually returns/throws -- see
+                    // BeginHeaderRewriteAsync's doc comment. HeaderRewriteScope's Interlocked guard
+                    // makes GrpcForwarder.ForwardAsync's later finally-dispose of the same scope a
+                    // harmless no-op; that finally stays the safety net for a SendAsync that throws
+                    // before ever reaching this point.
+                    await scope.DisposeAsync().ConfigureAwait(false);
                 }
                 else if (type == ContinuationFrameType)
                 {

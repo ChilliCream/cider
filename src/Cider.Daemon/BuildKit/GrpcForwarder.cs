@@ -105,10 +105,13 @@ public static class GrpcForwarder
             using var request = BuildRequest(http, target);
 
             // See ForwardTarget.HeaderRewrite's doc comment: queued before SendAsync so the target's
-            // duplex stream can substitute the HEADERS frame SendAsync is about to write, then
-            // released the moment SendAsync returns (or throws) -- never held past that, so it only
-            // ever blocks whichever other forward on the same connection is also mid-SendAsync, not
-            // this one's body/response.
+            // duplex stream can substitute the HEADERS frame SendAsync is about to write. The duplex
+            // stream releases the gate itself the instant it finishes writing that substitute frame,
+            // not whenever SendAsync eventually returns, so it only ever blocks whichever other
+            // forward on the same connection is also mid-write of its own HEADERS frame. The
+            // finally-dispose below is only the fallback for a SendAsync that throws before ever
+            // writing HEADERS -- HeaderRewriteScope's Interlocked guard makes disposing an
+            // already-released scope a harmless no-op.
             var headerScope = target.HeaderRewrite is not null
                 ? await target.HeaderRewrite(BuildLiteralFields(http, target), http.RequestAborted).ConfigureAwait(false)
                 : null;
