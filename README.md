@@ -327,9 +327,9 @@ turn it back off, and:
 - **Covers only the default `bridge` network's subnet.** A container on a different, user-created
   network is unaffected.
 - `disable` only flushes Cider's own anchor (`pfctl -a com.chillicream.cider.hostloopback -F all`),
-  removes its three lines from `/etc/pf.conf` and releases pf via reference-counted `pfctl -X` (the
-  counterpart to `enable`'s `pfctl -E`) — it never runs `pfctl -d` and never touches any other
-  anchor, Apple's included.
+  removes its three lines from `/etc/pf.conf` and releases pf via reference-counted
+  `pfctl -X <token>`, using the token `enable`'s `pfctl -E` printed and recorded — it never runs
+  `pfctl -d` and never touches any other anchor, Apple's included.
 
 ## Limitations
 

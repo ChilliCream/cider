@@ -91,7 +91,7 @@ public static class Program
             }
 
             using var log = TextWriter.Null;
-            await PfRedirect.TryEnableAsync(t.Subnet, t.Gateway, log, ct);
+            await PfRedirect.TryEnableAsync(t.Subnet, t.Gateway, log, options.DataDir, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -253,14 +253,14 @@ public static class Program
             return true;
         }
 
-        var result = await PfRedirect.TryEnableAsync(t.Subnet, t.Gateway, Console.Out, CancellationToken.None);
+        var result = await PfRedirect.TryEnableAsync(t.Subnet, t.Gateway, Console.Out, options.DataDir, CancellationToken.None);
         Console.WriteLine(result.Message);
         return result.Success;
     }
 
     private static async Task<bool> DisableHostLoopbackAsync(CiderOptions options)
     {
-        var result = await PfRedirect.TryDisableAsync(Console.Out, CancellationToken.None);
+        var result = await PfRedirect.TryDisableAsync(Console.Out, options.DataDir, CancellationToken.None);
         Console.WriteLine(result.Message);
 
         // Only clear the opt-in marker once the anchor is actually torn down; a failed flush must

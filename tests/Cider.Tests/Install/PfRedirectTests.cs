@@ -71,7 +71,10 @@ public class PfRedirectTests : IDisposable
         bool reloadSucceeds = true,
         bool flushSucceeds = true,
         bool removeSucceeds = true,
-        bool pfReportsEnabled = true) =>
+        bool pfReportsEnabled = true,
+        bool pfStatusSucceeds = true,
+        bool disableRefSucceeds = true,
+        string enableToken = "42") =>
         (argv, _) =>
         {
             bool succeeded;
@@ -99,12 +102,17 @@ public class PfRedirectTests : IDisposable
                     succeeded = reloadSucceeds;
                     break;
                 case "pfctl" when argv.Contains("-s") && argv.Contains("info"):
-                    succeeded = true;
+                    succeeded = pfStatusSucceeds;
                     stdOut = pfReportsEnabled ? "Status: Enabled for 0 days 00:00:00\n" : "Status: Disabled\n";
                     break;
-                case "pfctl":
-                    // `pfctl -E`/`-X`: harmless either way, neither core method gates on them.
+                case "pfctl" when argv.Contains("-E"):
+                    // Mirrors the line real macOS `pfctl -E` prints: `Token : <n>`, the value a
+                    // later `pfctl -X <token>` needs to release exactly this reference.
                     succeeded = true;
+                    stdOut = $"Token : {enableToken}\n";
+                    break;
+                case "pfctl" when argv.Contains("-X"):
+                    succeeded = disableRefSucceeds;
                     break;
                 case "rm":
                     succeeded = removeSucceeds;
@@ -196,22 +204,58 @@ public class PfRedirectTests : IDisposable
     }
 
     [Fact]
-    public void InsertAnchorLines_OnAFileWithNoExistingAnchorStanza_AppendsAtTheEnd()
+    public void InsertAnchorLines_OnAFileWithNoExistingAnchorStanza_PlacesLinesByPfConfRuleClass()
     {
-        // A body with real filter/nat rules but no `*-anchor`/`anchor`/`load anchor` lines at all —
-        // the three inserted lines must land after all of it, in order, never ahead of `set skip`/
-        // `scrub`/`block` (pf.conf(5) requires anchor points to come after those).
+        // A body with a real filter rule but no `*-anchor`/`anchor`/`load anchor` lines at all.
+        // Unconditionally appending at the end (the previous behavior) would land `rdr-anchor` and
+        // `anchor` after `block in all`, which `pfctl -n -f` rejects ("Rules must be in order:
+        // options, normalization, queueing, translation, filtering") — instead `rdr-anchor`
+        // (translation-class) must land immediately before the first filtering-class line, `anchor`
+        // (itself filtering-class) immediately after the last one, and `load anchor` at the very end.
         const string bare = "#\n# minimal pf.conf\n#\nset skip on lo0\nscrub in all\nblock in all\n";
 
         var updated = PfRedirect.InsertAnchorLines(bare, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
 
-        Assert.StartsWith(bare, updated, StringComparison.Ordinal);
-        Assert.EndsWith(
+        Assert.Equal(
+            "#\n# minimal pf.conf\n#\n" +
+            "set skip on lo0\n" +
+            "scrub in all\n" +
+            $"rdr-anchor \"{PfRedirect.AnchorName}\"\n" +
+            "block in all\n" +
+            $"anchor \"{PfRedirect.AnchorName}\"\n" +
+            $"load anchor \"{PfRedirect.AnchorName}\" from \"{PfRedirect.AnchorFilePath}\"\n",
+            updated);
+    }
+
+    [Fact]
+    public void InsertAnchorLines_OnAFileWithNoAnchorStanzaAndNoFilteringRules_AppendsAtTheEnd()
+    {
+        // No filtering-class line to place `rdr-anchor`/`anchor` relative to either, so the
+        // rule-class fallback has nothing to anchor off of and appends at the end — still in the
+        // right relative order among the three inserted lines themselves.
+        const string bare = "#\n# minimal pf.conf\n#\nset skip on lo0\nscrub in all\n";
+
+        var updated = PfRedirect.InsertAnchorLines(bare, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+
+        Assert.Equal(
+            "#\n# minimal pf.conf\n#\n" +
+            "set skip on lo0\n" +
+            "scrub in all\n" +
             $"rdr-anchor \"{PfRedirect.AnchorName}\"\n" +
             $"anchor \"{PfRedirect.AnchorName}\"\n" +
             $"load anchor \"{PfRedirect.AnchorName}\" from \"{PfRedirect.AnchorFilePath}\"\n",
-            updated,
-            StringComparison.Ordinal);
+            updated);
+    }
+
+    [Fact]
+    public void RemoveAnchorLines_RoundTripsTheRuleClassPlacedLayout()
+    {
+        const string bare = "#\n# minimal pf.conf\n#\nset skip on lo0\nscrub in all\nblock in all\n";
+        var updated = PfRedirect.InsertAnchorLines(bare, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+
+        var removed = PfRedirect.RemoveAnchorLines(updated, PfRedirect.AnchorName, PfRedirect.AnchorFilePath);
+
+        Assert.Equal(bare, removed);
     }
 
     [Fact]
@@ -283,6 +327,25 @@ public class PfRedirectTests : IDisposable
         Assert.Contains($"sudo rm -f {PfRedirect.AnchorFilePath}", instructions, StringComparison.Ordinal);
     }
 
+    // ---- ParseEnableToken ----
+
+    [Theory]
+    [InlineData("Token : 21\n", "21")]
+    [InlineData("No ALTQ support in kernel\nALTQ related functions disabled\nToken : 7\n", "7")]
+    [InlineData("Token:21\n", "21")]
+    public void ParseEnableToken_ExtractsTheTokenFromRealPfctlEOutput(string stdout, string expected)
+    {
+        Assert.Equal(expected, PfRedirect.ParseEnableToken(stdout));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("pfctl: pf already enabled\n")]
+    public void ParseEnableToken_ReturnsNull_WhenNoTokenIsPresent(string stdout)
+    {
+        Assert.Null(PfRedirect.ParseEnableToken(stdout));
+    }
+
     // ---- TryEnableCoreAsync ----
 
     [Fact]
@@ -297,7 +360,7 @@ public class PfRedirectTests : IDisposable
             return FakeRunner()(argv, ct);
         };
 
-        var result = await PfRedirect.TryEnableCoreAsync(
+        var (result, enableToken) = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
             new StringWriter(),
@@ -308,6 +371,9 @@ public class PfRedirectTests : IDisposable
             PfConfFile);
 
         Assert.True(result.Success);
+        // The token `pfctl -E` printed must come back so a later disable can release exactly this
+        // reference with `pfctl -X <token>` (`-X` is mandatory, not optional — man pfctl).
+        Assert.Equal("42", enableToken);
         Assert.Equal("rdr inet from 192.168.64.0/24 to 192.168.64.1 -> 127.0.0.1\n", await File.ReadAllTextAsync(AnchorFile));
 
         // The anchor must actually be reachable from the main ruleset — not just written to disk.
@@ -336,7 +402,7 @@ public class PfRedirectTests : IDisposable
         var alreadyRegistered = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, AnchorFile);
         await File.WriteAllTextAsync(PfConfFile, alreadyRegistered);
 
-        var result = await PfRedirect.TryEnableCoreAsync(
+        var (result, _) = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
             new StringWriter(),
@@ -358,7 +424,7 @@ public class PfRedirectTests : IDisposable
     {
         await File.WriteAllTextAsync(PfConfFile, StockPfConf);
 
-        var result = await PfRedirect.TryEnableCoreAsync(
+        var (result, _) = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
             new StringWriter(),
@@ -378,7 +444,7 @@ public class PfRedirectTests : IDisposable
     {
         await File.WriteAllTextAsync(PfConfFile, StockPfConf);
 
-        var result = await PfRedirect.TryEnableCoreAsync(
+        var (result, enableToken) = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
             new StringWriter(),
@@ -390,6 +456,9 @@ public class PfRedirectTests : IDisposable
 
         Assert.False(result.Success);
         Assert.Contains($"sudo pfctl -n -f {PfConfFile}", result.Message, StringComparison.Ordinal);
+        // pf.conf changed here, so `-E` ran (and succeeded) before the reload that then failed — the
+        // token it printed must still come back so a caller could release the reference it took.
+        Assert.Equal("42", enableToken);
     }
 
     [Fact]
@@ -406,7 +475,7 @@ public class PfRedirectTests : IDisposable
             return FakeRunner(validateSucceeds: false)(argv, ct);
         };
 
-        var result = await PfRedirect.TryEnableCoreAsync(
+        var (result, _) = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
             new StringWriter(),
@@ -434,7 +503,7 @@ public class PfRedirectTests : IDisposable
             return FakeRunner(pfReportsEnabled: true)(argv, ct);
         };
 
-        var result = await PfRedirect.TryEnableCoreAsync(
+        var (result, enableToken) = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
             new StringWriter(),
@@ -450,6 +519,8 @@ public class PfRedirectTests : IDisposable
         // leak it.
         Assert.DoesNotContain(seen, argv => argv.SequenceEqual(["pfctl", "-E"]));
         Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-s", "info"]));
+        // No `-E` ran, so there is nothing to record — must not fabricate a token.
+        Assert.Null(enableToken);
     }
 
     [Fact]
@@ -467,7 +538,7 @@ public class PfRedirectTests : IDisposable
             return FakeRunner(pfReportsEnabled: false)(argv, ct);
         };
 
-        var result = await PfRedirect.TryEnableCoreAsync(
+        var (result, enableToken) = await PfRedirect.TryEnableCoreAsync(
             "192.168.64.0/24",
             "192.168.64.1",
             new StringWriter(),
@@ -479,6 +550,39 @@ public class PfRedirectTests : IDisposable
 
         Assert.True(result.Success);
         Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-E"]));
+        Assert.Equal("42", enableToken);
+    }
+
+    [Fact]
+    public async Task TryEnableCoreAsync_Fails_WhenThePfStatusProbeFails_RatherThanGuessingAndReTakingTheReference()
+    {
+        // sudo is evidently unavailable (the status probe itself failed), so guessing at pf's actual
+        // state and either re-taking a reference that was never released, or skipping one that was
+        // needed, would both be wrong — must fail outright instead, and never even attempt `-E`.
+        var alreadyRegistered = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, AnchorFile);
+        await File.WriteAllTextAsync(PfConfFile, alreadyRegistered);
+
+        var seen = new List<IReadOnlyList<string>>();
+        PfRedirect.PrivilegedCommandRunner recording = (argv, ct) =>
+        {
+            seen.Add(argv);
+            return FakeRunner(pfStatusSucceeds: false)(argv, ct);
+        };
+
+        var (result, enableToken) = await PfRedirect.TryEnableCoreAsync(
+            "192.168.64.0/24",
+            "192.168.64.1",
+            new StringWriter(),
+            AnchorFile,
+            PfRedirect.AnchorName,
+            recording,
+            CancellationToken.None,
+            PfConfFile);
+
+        Assert.False(result.Success);
+        Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-s", "info"]));
+        Assert.DoesNotContain(seen, argv => argv.SequenceEqual(["pfctl", "-E"]));
+        Assert.Null(enableToken);
     }
 
     [Fact]
@@ -550,14 +654,55 @@ public class PfRedirectTests : IDisposable
             return FakeRunner()(argv, ct);
         };
 
-        await PfRedirect.TryDisableCoreAsync(new StringWriter(), AnchorFile, PfRedirect.AnchorName, recording, CancellationToken.None, PfConfFile);
+        await PfRedirect.TryDisableCoreAsync(
+            new StringWriter(), AnchorFile, PfRedirect.AnchorName, recording, CancellationToken.None, PfConfFile, enableToken: "42");
 
         // `pfctl -d` disables pf globally; disabling host-loopback must only ever flush cider's
         // own named anchor (`-a <name> -F all`) and release its own `-E` reference via `-X`, never
-        // the global switch.
+        // the global switch. `-X` takes the token `-E` printed — man pfctl: not optional.
         Assert.DoesNotContain(seen, argv => argv[0] == "pfctl" && argv.Contains("-d"));
         Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-a", PfRedirect.AnchorName, "-F", "all"]));
-        Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-X"]));
+        Assert.Contains(seen, argv => argv.SequenceEqual(["pfctl", "-X", "42"]));
+    }
+
+    [Fact]
+    public async Task TryDisableCoreAsync_NeverSendsPfctlDashXAtAll_WhenNoEnableTokenIsRecorded()
+    {
+        // No token on record means this process (or a prior one) never confirmed taking a fresh `-E`
+        // reference to release — `-X` requires a token (man pfctl), so sending it bare would be
+        // invalid, and guessing at a token would risk releasing a reference this call never took.
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
+        var seen = new List<IReadOnlyList<string>>();
+        PfRedirect.PrivilegedCommandRunner recording = (argv, ct) =>
+        {
+            seen.Add(argv);
+            return FakeRunner()(argv, ct);
+        };
+
+        var result = await PfRedirect.TryDisableCoreAsync(
+            new StringWriter(), AnchorFile, PfRedirect.AnchorName, recording, CancellationToken.None, PfConfFile, enableToken: null);
+
+        Assert.True(result.Success);
+        Assert.DoesNotContain(seen, argv => argv[0] == "pfctl" && argv.Contains("-X"));
+    }
+
+    [Fact]
+    public async Task TryDisableCoreAsync_Fails_WhenReleasingTheEnableReferenceFails()
+    {
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
+        var result = await PfRedirect.TryDisableCoreAsync(
+            new StringWriter(),
+            AnchorFile,
+            PfRedirect.AnchorName,
+            FakeRunner(disableRefSucceeds: false),
+            CancellationToken.None,
+            PfConfFile,
+            enableToken: "42");
+
+        Assert.False(result.Success);
+        Assert.Contains(result.Steps, s => s.StartsWith("sudo -n pfctl -X 42", StringComparison.Ordinal));
     }
 
     [Fact]
