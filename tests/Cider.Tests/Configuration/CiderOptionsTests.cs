@@ -22,6 +22,7 @@ public sealed class CiderOptionsTests : IDisposable
         Assert.Equal("0.0.0.0:10053", options.DnsListen);
         Assert.Equal("docker.io/coredns/coredns:1.14.7", options.DnsForwarderImage);
         Assert.Equal(3, options.PollIntervalSeconds);
+        Assert.False(options.PollIntervalSecondsIsExplicit);
         Assert.Equal(64L * 1024 * 1024, options.LogMaxBytes);
         Assert.True(options.BuildKitEnabled);
         Assert.Null(options.BuilderCpus);
@@ -65,6 +66,7 @@ public sealed class CiderOptionsTests : IDisposable
         Assert.Equal("/opt/bin/container", options.ContainerCliPath);
         Assert.Equal(6, options.DefaultCpus);
         Assert.Equal(9, options.PollIntervalSeconds);
+        Assert.True(options.PollIntervalSecondsIsExplicit);
         Assert.False(options.DnsEnabled);
         Assert.Equal("127.0.0.1:5353", options.DnsListen);
         Assert.Equal(["8.8.4.4:53"], options.DnsUpstreams);

@@ -107,6 +107,14 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         _dnsDomainResolver = new SystemDnsDomainResolver(options, logger);
     }
 
+    /// <summary>
+    /// Always <c>true</c> in practice — <see cref="RuntimeTransportSelector"/> only ever constructs
+    /// this class once it has settled on <see cref="RuntimeTransportKind.Xpc"/> — but reads
+    /// <see cref="_capabilities"/> rather than hardcoding that so it stays correct if that ever
+    /// changes (task cider-ede.19's fix direction: the poller's transport-aware default).
+    /// </summary>
+    public bool IsXpcTransport => _capabilities.Transport == RuntimeTransportKind.Xpc;
+
     // ---- system -------------------------------------------------------------------------------
 
     /// <summary>

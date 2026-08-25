@@ -14,6 +14,11 @@ public sealed partial class FakeContainerRuntime : IContainerRuntime
     /// <summary>Every call made against this fake, in order, for test assertions.</summary>
     public List<string> Calls { get; } = new();
 
+    /// <summary>Lets tests exercise <c>StatePoller</c>'s transport-aware default poll interval
+    /// (task cider-ede.19) without a real XPC runtime; defaults to <c>false</c>, matching
+    /// <see cref="IContainerRuntime.IsXpcTransport"/>'s own CLI-cadence default.</summary>
+    public bool IsXpcTransport { get; set; }
+
     /// <summary>Replaces the exec process a test gets — e.g. with one on a real pty.</summary>
     public Func<ExecSpec, IContainerProcess>? ExecFactory { get; set; }
 

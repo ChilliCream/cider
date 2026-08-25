@@ -6,6 +6,17 @@ namespace Cider.Core.Runtime;
 /// </summary>
 public interface IContainerRuntime
 {
+    /// <summary>
+    /// <c>true</c> for the XPC transport, whose <c>containerList</c> pass costs ~0.1 ms versus the
+    /// CLI's ~19 ms process spawn (docs/spikes/xpc/04-dotnet-xpc-probe-report.md, "Latency" table) —
+    /// lets <c>Cider.Core.Services.StatePoller</c> pick a much tighter default poll cadence without
+    /// this seam depending on <c>Cider.AppleContainer</c>'s <c>RuntimeCapabilities</c> type (that
+    /// would be a back-reference: <c>Cider.AppleContainer</c> already depends on <c>Cider.Core</c>).
+    /// Defaults to <c>false</c> (the CLI-spawn cadence) so every implementation that never overrides
+    /// this — the CLI runtime, test fakes — keeps today's behaviour unchanged.
+    /// </summary>
+    bool IsXpcTransport => false;
+
     /// <summary>Runtime name/version, kernel version and whether the apiserver is up.</summary>
     Task<RuntimeInfo> GetInfoAsync(CancellationToken ct);
 

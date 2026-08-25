@@ -224,12 +224,13 @@ you want to override a default. Environment variables win over the file, and exp
 | `dns.upstream` | — | `["1.1.1.1:53", "8.8.8.8:53"]` | Upstream resolvers for names the daemon does not know |
 | `dns.searchDomain` | — | `""` | Optional `--dns-search` value passed to containers |
 | `dnsForwarderImage` | — | `docker.io/coredns/coredns:1.14.7` | Image used for the per-network DNS forwarder |
-| `pollIntervalSeconds` | — | `3` | How often the state poller reconciles against `container ls` |
+| `pollIntervalSeconds` | — | `3` (cli) / `1` (xpc) | How often the state poller reconciles against the engine; transport-aware unless set explicitly (a `containerList` pass is ~19 ms over the CLI vs. ~0.1 ms over XPC) |
 | `logMaxBytes` | — | `67108864` (64 MiB) | Cap on one container's captured log file before it is truncated |
 
 <!-- every key, default and env var: src/Cider.Core/Configuration/CiderOptions.cs (properties at
-     :39-122, builder.* config.json overlay in ApplyFile() at :342-355, env reads in Load() at
-     :157-185 incl. CIDER_BUILDKIT at :181-185) -->
+     :48-162, builder.* config.json overlay in ApplyFile() at :405-416, env reads in Load() at
+     :189-255 incl. CIDER_BUILDKIT at :239-243; pollIntervalSeconds's transport-aware default is
+     resolved by Cider.Core.Services.StatePoller, not here) -->
 
 Not configurable: the daemon advertises Docker API version `1.47` (accepting clients down to `1.24`)
 and reports engine version `29.0.0`.

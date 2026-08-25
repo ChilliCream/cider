@@ -236,6 +236,54 @@ public sealed class StatePollerTests
         Assert.Empty(await harness.Containers.ListAsync(all: true, null, false, Core.DockerApi.Filters.Empty, default));
     }
 
+    // ---- poll interval default resolution (task cider-ede.19) -------------------------------
+
+    [Fact]
+    public async Task Interval_defaults_to_3s_on_the_cli_transport()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        await using var poller = new StatePoller(
+            harness.Containers, harness.Runtime, harness.Events, harness.Options, NullLogger<StatePoller>.Instance);
+
+        Assert.Equal(TimeSpan.FromSeconds(3), poller.Interval);
+    }
+
+    [Fact]
+    public async Task Interval_defaults_to_1s_on_the_xpc_transport()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        harness.Runtime.IsXpcTransport = true;
+
+        await using var poller = new StatePoller(
+            harness.Containers, harness.Runtime, harness.Events, harness.Options, NullLogger<StatePoller>.Instance);
+
+        Assert.Equal(TimeSpan.FromSeconds(1), poller.Interval);
+    }
+
+    [Fact]
+    public async Task An_explicit_poll_interval_wins_over_the_xpc_default()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync(options => options.PollIntervalSeconds = 7);
+        harness.Runtime.IsXpcTransport = true;
+
+        await using var poller = new StatePoller(
+            harness.Containers, harness.Runtime, harness.Events, harness.Options, NullLogger<StatePoller>.Instance);
+
+        Assert.Equal(TimeSpan.FromSeconds(7), poller.Interval);
+    }
+
+    [Fact]
+    public async Task An_explicit_poll_interval_wins_over_the_cli_default()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync(options => options.PollIntervalSeconds = 9);
+
+        await using var poller = new StatePoller(
+            harness.Containers, harness.Runtime, harness.Events, harness.Options, NullLogger<StatePoller>.Instance);
+
+        Assert.Equal(TimeSpan.FromSeconds(9), poller.Interval);
+    }
+
     private static StatePoller NewPoller(ContainerTestHarness harness) =>
         new(harness.Containers, harness.Runtime, harness.Events, harness.Options, NullLogger<StatePoller>.Instance)
         {

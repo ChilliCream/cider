@@ -122,8 +122,41 @@ public sealed partial class CiderOptions
     public bool UseProxyPortPublishing =>
         !string.Equals(PortPublishing, ApplePortPublishing, StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>How often the state poller reconciles with the engine.</summary>
-    public int PollIntervalSeconds { get; set; } = 3;
+    /// <summary>The constructor default of <see cref="PollIntervalSeconds"/> — a CLI-transport
+    /// cadence, since <see cref="PollIntervalSecondsIsExplicit"/> is what actually gates whether
+    /// <c>Cider.Core.Services.StatePoller</c> uses this or its own transport-aware default (task
+    /// cider-ede.19's fix direction).</summary>
+    private const int DefaultPollIntervalSeconds = 3;
+
+    private int _pollIntervalSeconds = DefaultPollIntervalSeconds;
+
+    /// <summary>
+    /// How often the state poller reconciles with the engine, when the user set one explicitly (the
+    /// config file's <c>pollIntervalSeconds</c> key, or a direct assignment). Unset, this reads
+    /// <see cref="DefaultPollIntervalSeconds"/> — but <c>StatePoller</c> does not use that value
+    /// verbatim: unless <see cref="PollIntervalSecondsIsExplicit"/> is <c>true</c> it substitutes its
+    /// own transport-aware default (3 s on the CLI, 1 s on XPC — task cider-ede.19), because only it
+    /// knows the transport the runtime actually resolved to.
+    /// </summary>
+    public int PollIntervalSeconds
+    {
+        get => _pollIntervalSeconds;
+        set
+        {
+            _pollIntervalSeconds = value;
+            PollIntervalSecondsIsExplicit = true;
+        }
+    }
+
+    /// <summary>
+    /// <c>true</c> once <see cref="PollIntervalSeconds"/> has been assigned — by <see cref="Load"/>
+    /// reading the config file's <c>pollIntervalSeconds</c> key, or by any other explicit set —
+    /// rather than left at its constructor default. <c>false</c> tells
+    /// <c>Cider.Core.Services.StatePoller</c> that no one asked for a specific cadence, so it is free
+    /// to pick its own transport-aware default instead of <see cref="PollIntervalSeconds"/>'s literal
+    /// value.
+    /// </summary>
+    public bool PollIntervalSecondsIsExplicit { get; private set; }
 
     /// <summary>Cap for one container's captured log file; the file is truncated when it is exceeded.</summary>
     public long LogMaxBytes { get; set; } = 64L * 1024 * 1024;

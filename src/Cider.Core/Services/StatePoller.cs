@@ -13,6 +13,19 @@ namespace Cider.Core.Services;
 /// </summary>
 public sealed class StatePoller : IAsyncDisposable
 {
+    /// <summary>Default cadence when nobody set <see cref="CiderOptions.PollIntervalSeconds"/>
+    /// explicitly and the runtime is CLI-backed — a ~19 ms spawn each pass makes anything tighter
+    /// mostly wasted work (docs/spikes/xpc/04-dotnet-xpc-probe-report.md). Matches
+    /// <see cref="CiderOptions"/>'s own constructor default, unchanged from before task cider-ede.19.</summary>
+    private const int CliDefaultPollIntervalSeconds = 3;
+
+    /// <summary>Default cadence when nobody set <see cref="CiderOptions.PollIntervalSeconds"/>
+    /// explicitly and the runtime is XPC — a pass costs ~0.1 ms there
+    /// (docs/spikes/xpc/04-dotnet-xpc-probe-report.md), so the 3 s CLI-era default only added
+    /// latency to exit detection, adoption and <c>docker events</c> (task cider-ede.19's problem
+    /// statement).</summary>
+    private const int XpcDefaultPollIntervalSeconds = 1;
+
     private readonly ContainerManager _containers;
     private readonly IContainerRuntime _runtime;
     private readonly EventBus _events;
@@ -41,7 +54,10 @@ public sealed class StatePoller : IAsyncDisposable
         _events = events ?? throw new ArgumentNullException(nameof(events));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        Interval = TimeSpan.FromSeconds(Math.Max(options.PollIntervalSeconds, 1));
+
+        var defaultSeconds = runtime.IsXpcTransport ? XpcDefaultPollIntervalSeconds : CliDefaultPollIntervalSeconds;
+        var effectiveSeconds = options.PollIntervalSecondsIsExplicit ? options.PollIntervalSeconds : defaultSeconds;
+        Interval = TimeSpan.FromSeconds(Math.Max(effectiveSeconds, 1));
     }
 
     /// <summary>How often the engine is polled while nobody watches <c>/events</c>.</summary>
@@ -57,6 +73,13 @@ public sealed class StatePoller : IAsyncDisposable
         {
             return Task.CompletedTask;
         }
+
+        _logger.LogInformation(
+            "state poller: interval {IntervalSeconds}s ({Source}, transport {Transport}), fast interval {FastIntervalSeconds}s",
+            Interval.TotalSeconds,
+            _options.PollIntervalSecondsIsExplicit ? "configured" : "default",
+            _runtime.IsXpcTransport ? "xpc" : "cli",
+            FastInterval.TotalSeconds);
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _loop = Task.Run(() => RunAsync(_cts.Token), CancellationToken.None);
