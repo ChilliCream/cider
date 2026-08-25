@@ -244,4 +244,32 @@ public class XpcClientE2ETests
         Assert.False(string.IsNullOrEmpty(reply.GetString("apiServerVersion")));
         Assert.Same(sharedGeneration, client.DebugConnectionGeneration);
     }
+
+    [E2EFact]
+    public async Task Cancelling_a_LongRunning_call_cancels_only_its_own_dedicated_connection()
+    {
+        using var client = NewClient();
+
+        // Establish the shared connection and note its generation.
+        (await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default)).Dispose();
+        var sharedGeneration = client.DebugConnectionGeneration;
+
+        // Already-cancelled token, LongRunning's null Timeout: SendOnDedicatedConnectionAsync's
+        // `timeout is null && !ct.CanBeCanceled` fast path is skipped (ct.CanBeCanceled is true),
+        // so this deterministically routes into `sendTask.WaitAsync(ct)` and, since ct is already
+        // cancelled, straight into the timeout/ct catch (XpcClient.cs) that cancels this call's own
+        // dedicated connection and releases the awaiting-scope retain — the branch neither existing
+        // LongRunning fact above exercises.
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            client.SendAsync(new XpcMessage("ping"), XpcCallOptions.LongRunning, cts.Token));
+
+        // The shared connection must be entirely untouched by the dedicated call's own cancellation.
+        Assert.Same(sharedGeneration, client.DebugConnectionGeneration);
+        using var reply = await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default);
+        Assert.False(string.IsNullOrEmpty(reply.GetString("apiServerVersion")));
+        Assert.Same(sharedGeneration, client.DebugConnectionGeneration);
+    }
 }

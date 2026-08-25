@@ -131,11 +131,7 @@ internal sealed class XpcClient : IDisposable
         // ct here would let an already-cancelled (or concurrently cancelled) token make Task.Run
         // return a cancelled task without ever calling SendSync, leaking that retain. ct still
         // governs the wait below, exactly like the Swift client's purely client-side timeout (§1.4).
-        var sendTask = Task.Factory.StartNew(
-            () => SendSync(connection, request),
-            CancellationToken.None,
-            TaskCreationOptions.LongRunning,
-            TaskScheduler.Default);
+        var sendTask = Task.Run(() => SendSync(connection, request), CancellationToken.None);
         if (timeout is not { } budget)
         {
             return await sendTask.ConfigureAwait(false);
@@ -156,11 +152,10 @@ internal sealed class XpcClient : IDisposable
             // tear that connection down — only a real connection-level error, observed reactively in
             // SendSync/OnConnectionEvent, may mark it broken. So unlike
             // SendOnDedicatedConnectionAsync below, this deliberately leaves the connection alone:
-            // the abandoned sync send stays blocked until the daemon eventually replies (or the
-            // connection is later torn down for an unrelated reason) — a bounded, accepted leak
-            // (pre-cb184d0 behavior for this path) of one dedicated native thread per abandoned
-            // timeout (LongRunning above, same as the dedicated-connection path, rather than a
-            // pool thread that would otherwise progressively starve the thread pool). The abandoned
+            // the abandoned send stays blocked until the daemon eventually replies (or the connection
+            // is later torn down for an unrelated reason), pinning one thread-pool thread for that
+            // long — unbounded over the process lifetime across repeated abandoned timeouts, an
+            // accepted cost of this path's ruling (pre-cb184d0 behavior). The abandoned
             // task is only observed, never awaited further, so its eventual fault (or success, which must still
             // be disposed rather than leaked) can never surface as an unobserved exception, or leaked
             // reply, once the caller has already moved on with an exception of its own. Rethrowing
