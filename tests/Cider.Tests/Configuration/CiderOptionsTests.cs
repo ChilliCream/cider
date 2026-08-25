@@ -29,6 +29,7 @@ public sealed class CiderOptionsTests : IDisposable
         Assert.Equal("1.47", options.ApiVersion);
         Assert.Equal("1.24", options.MinApiVersion);
         Assert.Equal("29.0.0", options.EngineVersion);
+        Assert.Equal("auto", options.RuntimeTransport);
     }
 
     [Fact]
@@ -127,6 +128,50 @@ public sealed class CiderOptionsTests : IDisposable
 
         Assert.Null(options.BuilderCpus);
         Assert.Null(options.BuilderMemoryBytes);
+    }
+
+    [Fact]
+    public void CIDER_RUNTIME_TRANSPORT_overrides_the_file_and_the_default()
+    {
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(
+            Path.Combine(_root, CiderOptions.ConfigFileName),
+            """{ "runtime": { "transport": "xpc" } }""");
+
+        Environment.SetEnvironmentVariable("CIDER_RUNTIME_TRANSPORT", "cli");
+        try
+        {
+            var options = CiderOptions.Load(_root, null, null);
+            Assert.Equal("cli", options.RuntimeTransport);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CIDER_RUNTIME_TRANSPORT", null);
+        }
+    }
+
+    [Fact]
+    public void The_config_files_runtime_transport_key_is_applied_without_the_env_override()
+    {
+        Directory.CreateDirectory(_root);
+        File.WriteAllText(
+            Path.Combine(_root, CiderOptions.ConfigFileName),
+            """{ "runtime": { "transport": "xpc" } }""");
+
+        var options = CiderOptions.Load(_root, null, null);
+
+        Assert.Equal("xpc", options.RuntimeTransport);
+    }
+
+    [Fact]
+    public void ToJson_round_trips_the_runtime_transport()
+    {
+        var options = new CiderOptions { DataDir = _root, RuntimeTransport = "xpc" };
+
+        var json = options.ToJson();
+
+        Assert.Contains("\"transport\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"xpc\"", json, StringComparison.Ordinal);
     }
 
     [Fact]

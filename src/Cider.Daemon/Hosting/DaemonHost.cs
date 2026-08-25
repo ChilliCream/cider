@@ -1,4 +1,4 @@
-using Cider.AppleContainer;
+using Cider.AppleContainer.Xpc;
 using Cider.Core.Configuration;
 using Cider.Core.DockerApi.Json;
 using Cider.Core.Events;
@@ -188,13 +188,13 @@ public static class DaemonHost
             json.SerializerOptions.Encoder = DockerJson.Options.Encoder;
         });
 
-        services.AddSingleton<IContainerRuntime>(sp => new AppleContainerRuntime(
-            new AppleContainerOptions
-            {
-                CliPath = options.ContainerCliPath,
-                TmpDir = options.TmpDir,
-            },
-            sp.GetRequiredService<ILogger<AppleContainerRuntime>>()));
+        // RuntimeTransportSelector runs the version-gate ping/decision once per `options` and both
+        // singletons share that one result (cider-ede.4) — the CLI runtime construction this used to
+        // do inline now lives there, alongside cider-ede.5's future XPC choice.
+        services.AddSingleton<IContainerRuntime>(sp => RuntimeTransportSelector
+            .SelectOnceAsync(options, sp.GetRequiredService<ILoggerFactory>()).GetAwaiter().GetResult().Runtime);
+        services.AddSingleton(sp => RuntimeTransportSelector
+            .SelectOnceAsync(options, sp.GetRequiredService<ILoggerFactory>()).GetAwaiter().GetResult().Capabilities);
 
         services.AddSingleton(_ => new EngineId(options.DataDir));
 

@@ -32,6 +32,15 @@ public sealed partial class CiderOptions
     /// <summary><see cref="PortPublishing"/>: hand <c>-p</c> to Apple <c>container</c> and let it forward.</summary>
     public const string ApplePortPublishing = "apple";
 
+    /// <summary><see cref="RuntimeTransport"/>: ping the apiserver and decide (the default).</summary>
+    public const string AutoRuntimeTransport = "auto";
+
+    /// <summary><see cref="RuntimeTransport"/>: talk to the apiserver over XPC, or fail fast.</summary>
+    public const string XpcRuntimeTransport = "xpc";
+
+    /// <summary><see cref="RuntimeTransport"/>: always shell out to the <c>container</c> CLI.</summary>
+    public const string CliRuntimeTransport = "cli";
+
     private string _dataDir = ExpandHome(DefaultDataDir);
     private string _socketPath = "";
 
@@ -51,6 +60,16 @@ public sealed partial class CiderOptions
 
     /// <summary>Path of the Apple <c>container</c> CLI (or a bare name resolved through <c>PATH</c>).</summary>
     public string ContainerCliPath { get; set; } = "container";
+
+    /// <summary>
+    /// Which transport talks to the Apple container engine: <see cref="AutoRuntimeTransport"/> (the
+    /// default — ping the apiserver over XPC and decide), <see cref="XpcRuntimeTransport"/> (XPC
+    /// only, fail fast below the version gate), or <see cref="CliRuntimeTransport"/> (always the
+    /// <c>container</c> CLI). Set by <c>CIDER_RUNTIME_TRANSPORT</c> or config's <c>runtime.transport</c>;
+    /// anything other than <c>xpc</c>/<c>cli</c> (case-insensitive) means <c>auto</c> — see
+    /// <c>Cider.AppleContainer.Xpc.RuntimeTransportSelector</c>.
+    /// </summary>
+    public string RuntimeTransport { get; set; } = AutoRuntimeTransport;
 
     /// <summary>CPU count handed to containers that do not ask for a specific amount.</summary>
     public double DefaultCpus { get; set; } = 2;
@@ -170,6 +189,12 @@ public sealed partial class CiderOptions
         if (!string.IsNullOrEmpty(envCli))
         {
             options.ContainerCliPath = envCli;
+        }
+
+        var envRuntimeTransport = Environment.GetEnvironmentVariable("CIDER_RUNTIME_TRANSPORT");
+        if (!string.IsNullOrEmpty(envRuntimeTransport))
+        {
+            options.RuntimeTransport = envRuntimeTransport;
         }
 
         var envPortPublishing = Environment.GetEnvironmentVariable("CIDER_PORT_PUBLISHING");
@@ -339,6 +364,11 @@ public sealed partial class CiderOptions
             }
         }
 
+        if (model.Runtime is not null && !string.IsNullOrEmpty(model.Runtime.Transport))
+        {
+            RuntimeTransport = model.Runtime.Transport;
+        }
+
         if (model.Builder is not null)
         {
             BuildKitEnabled = model.Builder.Enabled ?? BuildKitEnabled;
@@ -432,6 +462,7 @@ public sealed partial class CiderOptions
         public long? DefaultMemoryBytes { get; set; }
         public DnsModel? Dns { get; set; }
         public BuilderModel? Builder { get; set; }
+        public RuntimeModel? Runtime { get; set; }
         public string? PortPublishing { get; set; }
         public int? PollIntervalSeconds { get; set; }
         public long? LogMaxBytes { get; set; }
@@ -458,6 +489,7 @@ public sealed partial class CiderOptions
                 Cpus = options.BuilderCpus,
                 Memory = options.BuilderMemoryBytes,
             },
+            Runtime = new RuntimeModel { Transport = options.RuntimeTransport },
             PortPublishing = options.PortPublishing,
             PollIntervalSeconds = options.PollIntervalSeconds,
             LogMaxBytes = options.LogMaxBytes,
@@ -478,5 +510,10 @@ public sealed partial class CiderOptions
         public bool? Enabled { get; set; }
         public int? Cpus { get; set; }
         public long? Memory { get; set; }
+    }
+
+    private sealed class RuntimeModel
+    {
+        public string? Transport { get; set; }
     }
 }

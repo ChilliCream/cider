@@ -2,8 +2,10 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Cider.AppleContainer;
+using Cider.AppleContainer.Xpc;
 using Cider.Core.Configuration;
 using Cider.Core.DockerApi.Models;
+using Cider.Core.Runtime;
 using Cider.Daemon.Hosting;
 using Cider.Daemon.Install;
 using Cider.Daemon.Routes;
@@ -289,6 +291,22 @@ public static class Program
         Console.WriteLine($"launchd:   {(service.Installed ? "installed" : "not installed")}" +
                           (service.Running ? $", running (pid {service.Pid})" : ", not running") +
                           (service.LastExitStatus is { Length: > 0 } exit ? $", last exit {exit}" : ""));
+
+        // Read-only (autoStartServices: false): status never runs `container system start` on the
+        // caller's behalf, unlike the daemon's own `auto` startup — see RuntimeTransportSelector.
+        try
+        {
+            var selection = await RuntimeTransportSelector.SelectAsync(
+                options, NullLoggerFactory.Instance, CancellationToken.None, autoStartServices: false);
+            var capabilities = selection.Capabilities;
+            Console.WriteLine(capabilities.Transport == RuntimeTransportKind.Xpc
+                ? $"transport: xpc (apiserver {capabilities.ApiServerVersion!.Semver})"
+                : $"transport: cli" + (capabilities.FallbackReason is { Length: > 0 } reason ? $" ({reason})" : ""));
+        }
+        catch (RuntimeException ex)
+        {
+            Console.WriteLine($"transport: cli ({ex.Message})");
+        }
 
         var runtime = new AppleContainerRuntime(
             new AppleContainerOptions { CliPath = options.ContainerCliPath, TmpDir = options.TmpDir },
