@@ -3,7 +3,10 @@
   <PropertyGroup>
     <RootNamespace>Cider.AppleContainer</RootNamespace>
     <AssemblyName>Cider.AppleContainer</AssemblyName>
-    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <!-- Needed by src/Cider.AppleContainer/Xpc: the block-literal ABI (Xpc/XpcBlock.cs) and the
+         xpc_dictionary_get_data/xpc_dictionary_get_string dictionary-owned-memory accessors are
+         pointer types by nature (docs/spikes/xpc-probe/XpcProbe/Xpc.cs). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
