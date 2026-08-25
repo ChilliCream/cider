@@ -13,10 +13,13 @@ namespace Cider.AppleContainer.Xpc;
 /// The apiserver is the primary transport; the constructor's <c>cliFallback</c> only ever answers a
 /// call when the apiserver reports <see cref="RuntimeErrorKind.Unavailable"/> — the "Fallback rule"
 /// in the task's fix direction §4.
-/// This first slice ports the read paths (<see cref="GetInfoAsync"/>, <see cref="EnsureReadyAsync"/>,
-/// container list/inspect/stats, disk usage, network/volume list/inspect); every other
-/// <see cref="IContainerRuntime"/> member is listed in the <c>// FALLBACK</c> block at the bottom and
-/// delegates straight to the CLI runtime until later tasks (X6, X9, X11, X12) port it.
+/// cider-ede.5 ported the read paths (<see cref="GetInfoAsync"/>, <see cref="EnsureReadyAsync"/>,
+/// container list/inspect/stats, disk usage, network/volume list/inspect); cider-ede.6 ports
+/// create/delete/stop/kill (<c>XpcContainerRuntime.Create.cs</c>, its own sibling partial file, plus
+/// <c>ContainerConfigurationBuilder</c>/<c>KernelCache</c>/<c>InitImageResolver</c>/
+/// <c>ImageSnapshotEnsurer</c>/<c>ImagesServiceClient</c>). Every other <see cref="IContainerRuntime"/>
+/// member is listed in the <c>// FALLBACK</c> block at the bottom and delegates straight to the CLI
+/// runtime until later tasks (X7, X9, X11, X12) port it.
 /// Mapping from the wire models to <c>Cider.Core.Runtime</c> types lives in the sibling
 /// <c>XpcContainerRuntime.Mapping.cs</c> file of this partial class.
 /// </summary>
@@ -39,6 +42,21 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     private readonly RuntimeCapabilities _capabilities;
     private readonly AppleContainerOptions _options;
     private readonly ILogger _logger;
+
+    /// <summary>The three-route images-service wrapper create's preconditions need (task cider-ede.6);
+    /// held here (not just inside <see cref="_imageSnapshotEnsurer"/>/<see cref="_initImageResolver"/>)
+    /// so cider-ede.10 can reuse the same instance instead of re-plumbing <see cref="_images"/>.</summary>
+    private readonly ImagesServiceClient _imagesClient;
+
+    /// <summary><c>getDefaultKernel</c>, cached for this runtime's lifetime — see <see cref="KernelCache"/>.</summary>
+    private readonly KernelCache _kernelCache;
+
+    /// <summary>Resolves + unpacks the container's own image snapshot before <c>containerCreate</c> —
+    /// see <see cref="ImageSnapshotEnsurer"/>.</summary>
+    private readonly ImageSnapshotEnsurer _imageSnapshotEnsurer;
+
+    /// <summary>Resolves + unpacks the vminit init image, once, cached — see <see cref="InitImageResolver"/>.</summary>
+    private readonly InitImageResolver _initImageResolver;
 
     /// <summary>Last time a fallback warning was logged for a given route, keyed by XPC route name —
     /// backs the "once per minute" throttle in <see cref="WarnFallback"/>.</summary>
@@ -73,6 +91,11 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         _capabilities = capabilities;
         _options = options;
         _logger = logger;
+
+        _imagesClient = new ImagesServiceClient(images);
+        _kernelCache = new KernelCache(apiserver);
+        _imageSnapshotEnsurer = new ImageSnapshotEnsurer(_imagesClient);
+        _initImageResolver = new InitImageResolver(options, _imagesClient, logger);
     }
 
     // ---- system -------------------------------------------------------------------------------
@@ -372,7 +395,13 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     /// <summary>Logs the apiserver-unavailable fallback for <paramref name="route"/> at most once per
     /// <see cref="FallbackWarnInterval"/> — a poller hitting this every few seconds while the
     /// apiserver is down must not flood the log.</summary>
-    private void WarnFallback(string route, XpcException ex)
+    private void WarnFallback(string route, XpcException ex) => WarnFallback(route, ex.Message);
+
+    /// <summary>Same throttled-once-per-minute warning as the <see cref="XpcException"/> overload, for
+    /// a client-side precondition failure (kernel/image-snapshot/init-image resolution) that never
+    /// produced one of its own — <see cref="CreateContainerAsync"/>'s Fallback rule treats both the
+    /// same way (task fix direction §4).</summary>
+    private void WarnFallback(string route, string reason)
     {
         var now = DateTimeOffset.UtcNow;
         var last = _lastFallbackWarnAt.GetOrAdd(route, DateTimeOffset.MinValue);
@@ -382,7 +411,7 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         }
 
         _lastFallbackWarnAt[route] = now;
-        _logger.LogWarning("xpc {Route} unavailable ({Reason}); falling back to the CLI", route, ex.Message);
+        _logger.LogWarning("xpc {Route} unavailable ({Reason}); falling back to the CLI", route, reason);
     }
 
     private static async Task<T> GuardAsync<T>(Func<Task<T>> action)
@@ -438,19 +467,11 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     // X10, networks/volumes writes X11, cp/export X12) can find and remove its own entries here as it
     // ports them, without having to re-audit the whole interface.
 
-    public Task CreateContainerAsync(ContainerSpec spec, CancellationToken ct) => _cliFallback.CreateContainerAsync(spec, ct);
+    // CreateContainerAsync/RemoveContainerAsync/StopContainerAsync/KillContainerAsync are ported —
+    // see XpcContainerRuntime.Create.cs (task cider-ede.6).
 
     public Task<IContainerProcess> StartContainerAsync(string runtimeId, StartOptions options, CancellationToken ct) =>
         _cliFallback.StartContainerAsync(runtimeId, options, ct);
-
-    public Task StopContainerAsync(string runtimeId, int? timeoutSeconds, string? signal, CancellationToken ct) =>
-        _cliFallback.StopContainerAsync(runtimeId, timeoutSeconds, signal, ct);
-
-    public Task KillContainerAsync(string runtimeId, string signal, CancellationToken ct) =>
-        _cliFallback.KillContainerAsync(runtimeId, signal, ct);
-
-    public Task RemoveContainerAsync(string runtimeId, bool force, CancellationToken ct) =>
-        _cliFallback.RemoveContainerAsync(runtimeId, force, ct);
 
     public Task<(int ExitCode, DateTimeOffset ExitedAt)?> WaitContainerAsync(string runtimeId, CancellationToken ct) =>
         _cliFallback.WaitContainerAsync(runtimeId, ct);
