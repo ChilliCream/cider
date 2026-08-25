@@ -36,6 +36,14 @@ public sealed partial class ContainerManager
         var containerName = ReserveName(name);
         var allocatedPorts = new List<PortSpec>();
 
+        // Debug-only regression guard (cider-ede.17): a create used to cost ~7 runtime round trips
+        // before the actual create (image inspect/list resolved twice, container ls twice). This
+        // counts the ones this method can see — image resolution plus the create call itself — and
+        // logs the total once the container exists, so a future change that reintroduces a needless
+        // round trip shows up here instead of only in a burst-latency regression.
+        var runtimeCalls = 0;
+        void CountRuntimeCall() => runtimeCalls++;
+
         try
         {
             // Real dockerd never pulls on create: a missing image is a 404 "No such image: …" and
@@ -46,7 +54,8 @@ public sealed partial class ContainerManager
             RuntimeImageDetail image;
             try
             {
-                image = await _images.EnsureImageAsync(request.Image, platform, auth: null, pullIfMissing: false, progress: null, ct);
+                image = await _images.EnsureImageAsync(
+                    request.Image, platform, auth: null, pullIfMissing: false, progress: null, ct, CountRuntimeCall);
             }
             catch (RuntimeException ex)
             {
@@ -200,6 +209,7 @@ public sealed partial class ContainerManager
 
             try
             {
+                CountRuntimeCall();
                 await _runtime.CreateContainerAsync(spec, ct);
             }
             catch (RuntimeException ex)
@@ -251,6 +261,10 @@ public sealed partial class ContainerManager
             GetHandle(id);
             Publish(record, "create");
             RaiseStateChanged(record, "create");
+
+            _logger.LogDebug(
+                "container create for {Image} ({Container}) made {RuntimeCalls} runtime call(s)",
+                request.Image, id, runtimeCalls);
 
             return new ContainerCreateResponse { Id = id, Warnings = warnings };
         }

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Formats.Tar;
 using System.IO.Compression;
 using Cider.Core.Configuration;
@@ -19,6 +20,24 @@ public sealed class ImageManager
     private readonly EventBus _events;
     private readonly CiderOptions _options;
     private readonly ILogger<ImageManager> _logger;
+
+    // ---- image detail cache --------------------------------------------
+    //
+    // `POST /containers/create` used to cost ~4 image runtime calls (inspect + a list fallback,
+    // twice — once to resolve the image, once again for the config merge) before the actual
+    // create. A create no longer re-derives the image config, and this cache means a *second*
+    // create of the same reference costs zero: FindImageDetailAsync serves it straight from here.
+    //
+    // Keyed by the image id (`sha256:…`) and by every normalized reference (`name:tag`,
+    // `name@digest`) known for it, all stamped with the cache's current version. A version bump
+    // (on every mutation that goes through this manager — pull, load, build, tag, rmi, prune,
+    // commit, import) invalidates the whole cache at once rather than trying to reason about which
+    // entries a given mutation could have touched (a `tag` can retarget a reference that used to
+    // point elsewhere, a `prune` can drop several images at once, etc.).
+    private long _imageCacheVersion;
+    private readonly ConcurrentDictionary<string, CachedImageDetail> _imageCache = new(StringComparer.Ordinal);
+
+    private readonly record struct CachedImageDetail(RuntimeImageDetail Detail, long Version);
 
     public ImageManager(IContainerRuntime runtime, EventBus events, CiderOptions options, ILogger<ImageManager> logger)
     {
@@ -67,15 +86,20 @@ public sealed class ImageManager
         return ToInspectResponse(detail);
     }
 
+    /// <param name="onRuntimeCall">
+    /// Invoked once per actual runtime round trip this resolution makes (a cache hit makes none) —
+    /// <c>ContainerManager.CreateAsync</c> uses it to log the per-create runtime call count.
+    /// </param>
     public async Task<RuntimeImageDetail> EnsureImageAsync(
         string reference,
         string? platform,
         RegistryAuth? auth,
         bool pullIfMissing,
         IProgress<ProgressEvent>? progress,
-        CancellationToken ct)
+        CancellationToken ct,
+        Action? onRuntimeCall = null)
     {
-        var existing = await FindImageDetailAsync(reference, ct).ConfigureAwait(false);
+        var existing = await FindImageDetailAsync(reference, ct, onRuntimeCall).ConfigureAwait(false);
         if (existing is not null)
         {
             return existing;
@@ -87,6 +111,7 @@ public sealed class ImageManager
         }
 
         var normalized = ImageReference.Parse(reference).Normalize().ToString();
+        onRuntimeCall?.Invoke();
         try
         {
             await _runtime.PullImageAsync(normalized, platform, auth, progress ?? NullProgress, ct).ConfigureAwait(false);
@@ -96,7 +121,8 @@ public sealed class ImageManager
             throw ex.ToDockerError();
         }
 
-        return await FindImageDetailAsync(reference, ct).ConfigureAwait(false)
+        InvalidateImageCache();
+        return await FindImageDetailAsync(reference, ct, onRuntimeCall).ConfigureAwait(false)
             ?? throw DockerErrors.NoSuchImage(reference);
     }
 
@@ -174,6 +200,7 @@ public sealed class ImageManager
             throw ex.ToDockerError();
         }
 
+        InvalidateImageCache();
         ReportHeaderOnce();
         if (pendingError is not null)
         {
@@ -251,6 +278,7 @@ public sealed class ImageManager
             throw ex.ToDockerError();
         }
 
+        InvalidateImageCache();
         _events.Publish(DockerEvents.Image("tag", source.Id, ImageReference.Parse(targetNormalized).Familiar()));
     }
 
@@ -358,6 +386,7 @@ public sealed class ImageManager
             throw ex.ToDockerError();
         }
 
+        InvalidateImageCache();
         return items;
     }
 
@@ -505,6 +534,7 @@ public sealed class ImageManager
                 }
             }
 
+            InvalidateImageCache();
             foreach (var reference in loaded)
             {
                 var familiar = ImageReference.TryParse(reference, out var parsed) ? parsed.Familiar() : reference;
@@ -716,6 +746,11 @@ public sealed class ImageManager
             _events.Publish(DockerEvents.Image("delete", image.Id, image.Id));
         }
 
+        if (deleted.Count > 0)
+        {
+            InvalidateImageCache();
+        }
+
         return new ImagePruneResponse { ImagesDeleted = deleted, SpaceReclaimed = space };
     }
 
@@ -808,6 +843,7 @@ public sealed class ImageManager
                 throw ex.ToDockerError();
             }
 
+            InvalidateImageCache();
             if (request.Quiet)
             {
                 progress.Report(new JsonMessage { Stream = $"{imageId}\n" });
@@ -871,19 +907,29 @@ public sealed class ImageManager
 
     private static readonly IProgress<ProgressEvent> NullProgress = new Progress<ProgressEvent>();
 
-    private async Task<RuntimeImageDetail?> FindImageDetailAsync(string reference, CancellationToken ct)
+    /// <param name="onRuntimeCall">See <see cref="EnsureImageAsync"/>.</param>
+    private async Task<RuntimeImageDetail?> FindImageDetailAsync(string reference, CancellationToken ct, Action? onRuntimeCall = null)
     {
         if (string.IsNullOrWhiteSpace(reference))
         {
             return null;
         }
 
+        var cacheKey = CacheKeyFor(reference);
+        if (cacheKey is not null && TryGetCachedDetail(cacheKey, out var cached))
+        {
+            return cached;
+        }
+
+        onRuntimeCall?.Invoke();
         var direct = await _runtime.InspectImageAsync(reference, ct).ConfigureAwait(false);
         if (direct is not null)
         {
+            CacheDetail(direct);
             return direct;
         }
 
+        onRuntimeCall?.Invoke();
         var images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
         var candidate = MatchImage(images, reference);
         if (candidate is null)
@@ -893,20 +939,80 @@ public sealed class ImageManager
 
         if (candidate is RuntimeImageDetail detail)
         {
+            CacheDetail(detail);
             return detail;
         }
 
         foreach (var candidateRef in candidate.References.Append(candidate.Id))
         {
+            onRuntimeCall?.Invoke();
             var byRef = await _runtime.InspectImageAsync(candidateRef, ct).ConfigureAwait(false);
             if (byRef is not null)
             {
+                CacheDetail(byRef);
                 return byRef;
             }
         }
 
         return null;
     }
+
+    /// <summary>
+    /// The stable cache key for an exact reference — the image id (<c>sha256:…</c>) or the fully
+    /// normalized <c>name:tag</c>/<c>name@digest</c> form. <c>null</c> for a reference that cannot
+    /// be resolved without scanning the whole image list (a short hex prefix, which is ambiguous
+    /// until every image is known; or one that fails to parse at all).
+    /// </summary>
+    private static string? CacheKeyFor(string reference)
+    {
+        var stripped = reference.StartsWith("sha256:", StringComparison.Ordinal) ? reference["sha256:".Length..] : reference;
+        if (DockerId.IsFullId(stripped))
+        {
+            return "sha256:" + stripped;
+        }
+
+        if (DockerId.IsHexPrefix(stripped))
+        {
+            return null;
+        }
+
+        return ImageReference.TryParse(reference, out var parsed) ? parsed.Normalize().ToString() : null;
+    }
+
+    private bool TryGetCachedDetail(string cacheKey, out RuntimeImageDetail detail)
+    {
+        if (_imageCache.TryGetValue(cacheKey, out var cached) && cached.Version == Interlocked.Read(ref _imageCacheVersion))
+        {
+            detail = cached.Detail;
+            return true;
+        }
+
+        detail = null!;
+        return false;
+    }
+
+    /// <summary>Indexes a freshly resolved detail under its id and every reference it carries.</summary>
+    private void CacheDetail(RuntimeImageDetail detail)
+    {
+        var entry = new CachedImageDetail(detail, Interlocked.Read(ref _imageCacheVersion));
+        _imageCache["sha256:" + IdWithoutPrefix(detail.Id)] = entry;
+        foreach (var reference in detail.References)
+        {
+            if (ImageReference.TryParse(reference, out var parsed))
+            {
+                _imageCache[parsed.Normalize().ToString()] = entry;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Bumps the cache's version so every entry currently in <see cref="_imageCache"/> reads as
+    /// stale — called after any runtime call that can change what an image reference resolves to.
+    /// A version bump rather than <c>Clear()</c>: cheaper (no dictionary walk) and race-free against
+    /// a concurrent read that is mid-<see cref="CacheDetail"/> for data already stale by the time it
+    /// writes (it stamps the version it read before the bump, so it cannot un-invalidate anything).
+    /// </summary>
+    private void InvalidateImageCache() => Interlocked.Increment(ref _imageCacheVersion);
 
     private static RuntimeImage? MatchImage(IReadOnlyList<RuntimeImage> images, string reference)
     {
@@ -1326,6 +1432,7 @@ public sealed class ImageManager
                 }
             }
 
+            InvalidateImageCache();
             return id;
         }
         finally

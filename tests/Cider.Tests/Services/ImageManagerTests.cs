@@ -182,6 +182,112 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Empty(messages);
     }
 
+    // ---- image detail cache (cider-ede.17) ---------------------------------------------------
+
+    [Fact]
+    public async Task EnsureImageAsync_SecondResolutionOfTheSameReference_MakesNoRuntimeCalls()
+    {
+        var (manager, runtime) = CreateManager();
+
+        var first = await manager.EnsureImageAsync("alpine:latest", null, null, pullIfMissing: false, null, CancellationToken.None);
+        var callsAfterFirst = runtime.Calls.Count;
+        Assert.True(callsAfterFirst > 0, "the first resolution should have hit the runtime at least once");
+
+        var second = await manager.EnsureImageAsync("alpine:latest", null, null, pullIfMissing: false, null, CancellationToken.None);
+
+        Assert.Equal(first.Id, second.Id);
+        Assert.Equal(callsAfterFirst, runtime.Calls.Count);
+    }
+
+    [Fact]
+    public async Task EnsureImageAsync_ResolutionsByDifferentEquivalentReferences_ShareTheCache()
+    {
+        var (manager, runtime) = CreateManager();
+
+        // Familiar name, fully qualified name and image id all name the same image; once any one
+        // of them has been resolved, the other spellings should be cache hits too.
+        var byName = await manager.EnsureImageAsync("alpine:latest", null, null, pullIfMissing: false, null, CancellationToken.None);
+        var callsAfterFirst = runtime.Calls.Count;
+
+        var byQualifiedName = await manager.EnsureImageAsync(
+            "docker.io/library/alpine:latest", null, null, pullIfMissing: false, null, CancellationToken.None);
+        var byId = await manager.EnsureImageAsync(byName.Id, null, null, pullIfMissing: false, null, CancellationToken.None);
+
+        Assert.Equal(byName.Id, byQualifiedName.Id);
+        Assert.Equal(byName.Id, byId.Id);
+        Assert.Equal(callsAfterFirst, runtime.Calls.Count);
+    }
+
+    [Fact]
+    public async Task PullAsync_InvalidatesTheCache_SoASubsequentLookupSeesTheNewDigest()
+    {
+        var (manager, runtime) = CreateManager();
+        var oldDigest = "sha256:" + new string('1', 64);
+        var newDigest = "sha256:" + new string('2', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = oldDigest,
+            References = ["docker.io/library/refreshed:latest"],
+            Size = 100,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        var before = await manager.InspectAsync("refreshed:latest", CancellationToken.None);
+        Assert.Equal(oldDigest, before.Id);
+
+        // A registry re-push landing a new digest under the same tag while cider wasn't looking —
+        // simulated by reseeding the fake directly (bypassing ImageManager) the way a real pull
+        // would land new content on the runtime side.
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = newDigest,
+            References = ["docker.io/library/refreshed:latest"],
+            Size = 200,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        // Proves the cache, not coincidence, is what is being exercised: the runtime already moved
+        // on, but a read through the manager should still be serving the id it cached before.
+        var stillCached = await manager.InspectAsync("refreshed:latest", CancellationToken.None);
+        Assert.Equal(oldDigest, stillCached.Id);
+
+        var messages = new List<JsonMessage>();
+        var progress = new SyncProgress<JsonMessage>(messages.Add);
+        await manager.PullAsync("refreshed", null, null, null, progress, CancellationToken.None);
+
+        var after = await manager.InspectAsync("refreshed:latest", CancellationToken.None);
+        Assert.Equal(newDigest, after.Id);
+    }
+
+    [Fact]
+    public async Task TagAsync_InvalidatesTheCache_SoARemoveSeesTheNewReference()
+    {
+        var (manager, _) = CreateManager();
+
+        // Primes the cache with alpine's detail from before the tag exists.
+        await manager.InspectAsync("alpine:latest", CancellationToken.None);
+
+        await manager.TagAsync("alpine:latest", "alpine-renamed", null, CancellationToken.None);
+
+        // If TagAsync had not invalidated the cache, RemoveAsync would resolve "alpine:latest" back
+        // to the pre-tag detail (a single reference), conclude it is the last one and delete the
+        // whole image outright instead of just untagging it — losing "alpine-renamed" along the way.
+        var items = await manager.RemoveAsync("alpine:latest", force: false, noPrune: false, CancellationToken.None);
+
+        var untagged = Assert.Single(items);
+        Assert.Equal("alpine:latest", untagged.Untagged);
+        Assert.Null(untagged.Deleted);
+
+        var stillThere = await manager.InspectAsync("alpine-renamed:latest", CancellationToken.None);
+        Assert.Contains("alpine-renamed:latest", stillThere.RepoTags);
+    }
+
     [Fact]
     public async Task PushAsync_MissingImage_Throws404WithoutWritingAnyProgress()
     {

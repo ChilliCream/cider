@@ -82,6 +82,40 @@ public sealed class ContainerManagerCreateTests
         Assert.Equal("alpine:latest", created.Actor.Attributes["image"]);
     }
 
+    // ---- fast-create hot path (cider-ede.17) -------------------------------------------------
+
+    [Fact]
+    public async Task Create_DoesNotListContainers()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        await harness.CreateAsync("alpine", "web");
+
+        // The record store is authoritative for Docker names, and the runtime's own "exists" error
+        // (mapped to Conflict) covers a runtime-side name collision — a create never needs to list
+        // the engine's containers first.
+        Assert.DoesNotContain(harness.Runtime.Calls, c => c.StartsWith("ListContainersAsync", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Create_ForAnAlreadyResolvedImage_MakesNoFurtherImageRuntimeCalls()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        await harness.CreateAsync("alpine", "first");
+        var imageCallsAfterFirst = CountImageRuntimeCalls(harness.Runtime);
+        Assert.True(imageCallsAfterFirst > 0, "the first create should have resolved the image against the runtime");
+
+        await harness.CreateAsync("alpine", "second");
+
+        Assert.Equal(imageCallsAfterFirst, CountImageRuntimeCalls(harness.Runtime));
+    }
+
+    private static int CountImageRuntimeCalls(FakeContainerRuntime runtime) =>
+        runtime.Calls.Count(c =>
+            c.StartsWith("InspectImageAsync:", StringComparison.Ordinal) ||
+            c.StartsWith("ListImagesAsync", StringComparison.Ordinal));
+
     [Fact]
     public async Task HostConfig_Sysctls_and_an_explicit_stop_signal_land_on_the_engine_spec()
     {
