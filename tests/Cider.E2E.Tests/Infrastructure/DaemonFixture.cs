@@ -55,6 +55,15 @@ public class DaemonFixture : IAsyncLifetime
 
     private readonly ConcurrentQueue<string> _log = new();
 
+    // Snapshotted right after the daemon comes up, before any test runs. The in-process daemon
+    // adopts every container Apple's runtime already knows about as a read-only record
+    // (ContainerManager.Reconcile.cs), so `docker ps -aq` through it returns developer containers
+    // the suite never created (e.g. a hand-started reference container, Apple's `buildkit` VM) right
+    // alongside the suite's own. Teardown must never touch anything captured here.
+    private readonly HashSet<string> _preExistingContainerIds = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _preExistingNetworkNames = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _preExistingVolumeNames = new(StringComparer.Ordinal);
+
     /// <summary>Overridable so the daemon-restart test can rebuild a daemon on the same data dir.</summary>
     protected virtual string InstanceSuffix => "";
 
@@ -97,6 +106,42 @@ public class DaemonFixture : IAsyncLifetime
         LinkCliPlugins();
 
         await StartDaemonAsync();
+        await SnapshotPreExistingDockerObjectsAsync();
+    }
+
+    /// <summary>
+    /// Records every container/network/volume the daemon already knows about right after startup
+    /// (its own startup reconcile adopts whatever Apple's runtime already has, not just what this
+    /// suite goes on to create), so teardown can tell "the suite's own" from "was already there"
+    /// apart and never remove the latter.
+    /// </summary>
+    private async Task SnapshotPreExistingDockerObjectsAsync()
+    {
+        try
+        {
+            var containers = await DockerAsync(["ps", "-aq"], timeout: TimeSpan.FromSeconds(60));
+            foreach (var id in containers.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                _preExistingContainerIds.Add(id);
+            }
+
+            var networks = await DockerAsync(["network", "ls", "--format", "{{.Name}}"], timeout: TimeSpan.FromSeconds(60));
+            foreach (var network in networks.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                _preExistingNetworkNames.Add(network);
+            }
+
+            var volumes = await DockerAsync(["volume", "ls", "--format", "{{.Name}}"], timeout: TimeSpan.FromSeconds(60));
+            foreach (var volume in volumes.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                _preExistingVolumeNames.Add(volume);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException)
+        {
+            // Best-effort: if this fails, cleanup below still runs but with an empty snapshot, i.e.
+            // no worse than before this fix. It is not worth failing fixture startup over.
+        }
     }
 
     /// <summary>Builds and starts the daemon on the current options, then waits for <c>/_ping</c>.</summary>
@@ -242,33 +287,66 @@ public class DaemonFixture : IAsyncLifetime
         RemoveFile(Options.SocketPath);
     }
 
-    /// <summary>Force-removes everything this daemon still knows about, so nothing outlives the run.</summary>
+    /// <summary>
+    /// Force-removes everything this suite created, so nothing outlives the run — but never anything
+    /// that was already there when the fixture started (see <see cref="_preExistingContainerIds"/>).
+    /// </summary>
     protected async Task CleanupDockerObjectsAsync()
     {
         try
         {
             var containers = await DockerAsync(["ps", "-aq"], timeout: TimeSpan.FromSeconds(60));
-            var ids = containers.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var allIds = containers.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var ids = allIds.Where(id => !_preExistingContainerIds.Contains(id)).ToArray();
+            LogSkipped("container", allIds.Length - ids.Length);
             if (ids.Length > 0)
             {
                 await DockerAsync(["rm", "-f", "-v", .. ids], timeout: TimeSpan.FromSeconds(180));
             }
 
-            await DockerAsync(["volume", "prune", "-f"], timeout: TimeSpan.FromSeconds(60));
+            var volumes = await DockerAsync(["volume", "ls", "--format", "{{.Name}}"], timeout: TimeSpan.FromSeconds(60));
+            var allVolumes = volumes.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var volumeNames = allVolumes.Where(name => !_preExistingVolumeNames.Contains(name)).ToArray();
+            LogSkipped("volume", allVolumes.Length - volumeNames.Length);
+            if (volumeNames.Length > 0)
+            {
+                await DockerAsync(["volume", "rm", "-f", .. volumeNames], timeout: TimeSpan.FromSeconds(60));
+            }
 
             var networks = await DockerAsync(["network", "ls", "--format", "{{.Name}}"], timeout: TimeSpan.FromSeconds(60));
-            foreach (var network in networks.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            var allNetworks = networks.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var skippedNetworks = 0;
+            foreach (var network in allNetworks)
             {
                 if (network is "bridge" or "host" or "none")
                 {
                     continue;
                 }
 
+                if (_preExistingNetworkNames.Contains(network))
+                {
+                    skippedNetworks++;
+                    continue;
+                }
+
                 await DockerAsync(["network", "rm", network], timeout: TimeSpan.FromSeconds(60));
             }
+
+            LogSkipped("network", skippedNetworks);
         }
         catch (Exception ex) when (ex is IOException or InvalidOperationException)
         {
+        }
+    }
+
+    /// <summary>Notes in <see cref="DaemonLog"/> how many pre-existing objects teardown left alone.</summary>
+    private void LogSkipped(string kind, int count)
+    {
+        if (count > 0)
+        {
+            _log.Enqueue(
+                $"{DateTime.Now:HH:mm:ss.fff} Information DaemonFixture: teardown skipped {count} pre-existing " +
+                $"{kind}(s) that existed before this fixture started");
         }
     }
 
