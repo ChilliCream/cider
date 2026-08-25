@@ -254,17 +254,28 @@ public class XpcClientE2ETests
         (await client.SendAsync(new XpcMessage("ping"), XpcCallOptions.Default)).Dispose();
         var sharedGeneration = client.DebugConnectionGeneration;
 
-        // Already-cancelled token, LongRunning's null Timeout: SendOnDedicatedConnectionAsync's
-        // `timeout is null && !ct.CanBeCanceled` fast path is skipped (ct.CanBeCanceled is true),
-        // so this deterministically routes into `sendTask.WaitAsync(ct)` and, since ct is already
-        // cancelled, straight into the timeout/ct catch (XpcClient.cs) that cancels this call's own
+        // The token must NOT be cancelled before the call starts: SendAsync's up-front
+        // `ct.ThrowIfCancellationRequested()` (XpcClient.cs:111) runs before dispatch ever reaches
+        // SendOnDedicatedConnectionAsync, so a pre-cancelled token would only ever exercise that
+        // early guard, never the dedicated path's own timeout/ct catch. Instead, start the send with
+        // a live token and cancel only after `SendAsync` has been invoked (not awaited). Everything
+        // synchronous in SendOnDedicatedConnectionAsync — the mach-service connection create/
+        // activate/awaiting-scope retain (XpcClient.cs:182-211) and the LongRunning
+        // `Task.Factory.StartNew` (XpcClient.cs:222) — runs on this thread before the first `await`
+        // inside it can yield, so by the time `SendAsync(...)` returns control to us here, the guard
+        // at line 111 has already observed an un-cancelled token and the dedicated send is in flight,
+        // suspended at `sendTask.WaitAsync(ct)` (XpcClient.cs:237). Cancelling now is what drives that
+        // `WaitAsync` into the timeout/ct catch (XpcClient.cs:239-257), which cancels this call's own
         // dedicated connection and releases the awaiting-scope retain — the branch neither existing
-        // LongRunning fact above exercises.
+        // LongRunning fact above exercises. The only race is the dedicated connection's full
+        // mach-service handshake and reply beating the immediate `Cancel()` below, which is
+        // overwhelmingly unlikely and — critically — cannot produce a false pass: if it happened, the
+        // send would simply succeed and `ThrowsAnyAsync` would fail loudly rather than pass vacuously.
         using var cts = new CancellationTokenSource();
-        await cts.CancelAsync();
+        var sendTask = client.SendAsync(new XpcMessage("ping"), XpcCallOptions.LongRunning, cts.Token);
+        cts.Cancel();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            client.SendAsync(new XpcMessage("ping"), XpcCallOptions.LongRunning, cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sendTask);
 
         // The shared connection must be entirely untouched by the dedicated call's own cancellation.
         Assert.Same(sharedGeneration, client.DebugConnectionGeneration);
