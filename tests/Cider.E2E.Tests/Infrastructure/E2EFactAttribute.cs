@@ -35,3 +35,24 @@ public sealed class AppleModePortFactAttribute : FactAttribute
         }
     }
 }
+
+/// <summary>
+/// An E2E fact that also needs <c>CIDER_E2E_LARGE=1</c>: it moves a genuinely large (default
+/// 200 MiB) build context through the real Apple builder VM, which is slow and whose outcome is
+/// evidence for a follow-up task rather than something worth paying for on every run.
+/// </summary>
+public sealed class LargeContextFactAttribute : FactAttribute
+{
+    /// <summary>Applies the skip reason unless the suite is enabled and opted into the large-context run.</summary>
+    public LargeContextFactAttribute()
+    {
+        if (DaemonFixture.SkipReason is { } reason)
+        {
+            Skip = reason;
+        }
+        else if (!string.Equals(Environment.GetEnvironmentVariable("CIDER_E2E_LARGE"), "1", StringComparison.Ordinal))
+        {
+            Skip = "set CIDER_E2E_LARGE=1 to run the large build-context characterization (slow; feeds cider-ger.15)";
+        }
+    }
+}

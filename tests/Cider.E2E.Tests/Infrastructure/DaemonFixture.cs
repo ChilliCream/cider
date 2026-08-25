@@ -264,6 +264,15 @@ public class DaemonFixture : IAsyncLifetime
             ["DOCKER_CONFIG"] = DockerConfigDir,
             ["DOCKER_TLS_VERIFY"] = null,
             ["DOCKER_CERT_PATH"] = null,
+
+            // BuildKit tests exercise the *default* builder (buildx's `docker` driver, talking to
+            // cider's own /grpc + /session — no `docker buildx create`). A BUILDX_BUILDER left over
+            // in the developer's shell would silently point builds at some other (possibly
+            // docker-container) builder instead, and BUILDX_NO_DEFAULT_LOAD would suppress the
+            // load-into-the-local-store behaviour the untagged/dangling-image tests depend on; both
+            // are stripped unconditionally so every child starts from the same clean slate.
+            ["BUILDX_BUILDER"] = null,
+            ["BUILDX_NO_DEFAULT_LOAD"] = null,
         };
 
         if (extra is not null)
@@ -309,11 +318,20 @@ public class DaemonFixture : IAsyncLifetime
             return;
         }
 
-        await CleanupDockerObjectsAsync();
-        await StopDaemonAsync();
-        await CleanupForwarderAsync();
-        RemoveDirectory(Options.DataDir);
-        RemoveFile(Options.SocketPath);
+        try
+        {
+            // Deliberately not swallowed: a vanished builder VM (see CleanupDockerObjectsAsync) is a
+            // real regression the run must fail loudly on. `finally` still tears down the daemon
+            // process and scratch state below so a failure here never leaks either.
+            await CleanupDockerObjectsAsync();
+        }
+        finally
+        {
+            await StopDaemonAsync();
+            await CleanupForwarderAsync();
+            RemoveDirectory(Options.DataDir);
+            RemoveFile(Options.SocketPath);
+        }
     }
 
     /// <summary>
@@ -329,6 +347,16 @@ public class DaemonFixture : IAsyncLifetime
                 "snapshot unavailable, not removing any containers/volumes/networks");
             return;
         }
+
+        // Snapshotted *before* the blanket `docker rm -f -v` sweep below, straight through the Apple
+        // CLI rather than through cider: per cider-ger.3/T4b the builder VM is a system container
+        // cider hides from `docker ps` entirely, so it can never show up in `ids` and get swept up by
+        // that command directly — but a regression that stopped hiding it (or a teardown that stopped
+        // going through cider and reached the runtime directly) would silently kill the developer's
+        // builder VM. Compared again once the sweep is done, below — deliberately outside the
+        // catch-and-ignore block that follows, so a real regression here fails loudly instead of being
+        // swallowed along with ordinary teardown flakiness.
+        var builderStateBefore = await AppleBuilderStateAsync();
 
         try
         {
@@ -373,6 +401,54 @@ public class DaemonFixture : IAsyncLifetime
         }
         catch (Exception ex) when (ex is IOException or InvalidOperationException)
         {
+        }
+
+        if (string.Equals(builderStateBefore, "running", StringComparison.Ordinal))
+        {
+            var builderStateAfter = await AppleBuilderStateAsync();
+            if (!string.Equals(builderStateAfter, "running", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Apple's builder VM ('buildkit') was running before this fixture's teardown swept " +
+                    $"containers and is not anymore (state now: {builderStateAfter ?? "<gone>"}). This is " +
+                    "a regression of cider-ger.3/T4b (the builder must stay hidden from `docker ps -aq` " +
+                    "so a suite-wide `docker rm -f -v` never reaches it) — not something teardown may " +
+                    "silently paper over.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// <c>container builder status</c>'s state column for the <c>buildkit</c> row, straight through
+    /// the Apple CLI — not through cider, which (per cider-ger.3/T4b) treats the builder VM as a
+    /// system container and hides it from <c>docker ps</c> entirely, so there is no way to observe it
+    /// through the daemon under test. <c>null</c> when there is no such row (builder never created) or
+    /// the query itself failed.
+    /// </summary>
+    public static async Task<string?> AppleBuilderStateAsync()
+    {
+        try
+        {
+            var result = await Cmd.RunAsync("container", ["builder", "status"], timeout: TimeSpan.FromSeconds(30));
+            if (!result.Ok)
+            {
+                return null;
+            }
+
+            foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var columns = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (columns.Length >= 3 && string.Equals(columns[0], "buildkit", StringComparison.Ordinal))
+                {
+                    return columns[2];
+                }
+            }
+
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException)
+        {
+            return null;
         }
     }
 

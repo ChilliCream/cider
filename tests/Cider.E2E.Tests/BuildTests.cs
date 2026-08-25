@@ -1,17 +1,20 @@
-using System.Net;
-using Cider.Daemon.Hosting;
 using Cider.E2E.Tests.Infrastructure;
 using Xunit;
 
 namespace Cider.E2E.Tests;
 
-/// <summary>E2E #6 — the classic builder works with <c>DOCKER_BUILDKIT=0</c>, BuildKit is refused.</summary>
+/// <summary>
+/// E2E #6 — the classic (non-BuildKit) builder works with <c>DOCKER_BUILDKIT=0</c>. The BuildKit
+/// path itself (the default builder, buildx, compose/bake, large contexts) is
+/// <see cref="BuildKitTests"/> — this class used to also assert that BuildKit was refused
+/// outright, back when cider spoke no BuildKit at all; T4b/cider-ger.11 replaced that contract, so
+/// that assertion moved to a positive one there instead.
+/// </summary>
 [Collection(DaemonCollection.Name)]
 [Trait("Category", "E2E")]
 public sealed class BuildTests(DaemonFixture daemon)
 {
     private const string Tag = "e2e/built:1";
-    private const string BuildkitTag = "e2e/buildkit:1";
 
     [E2EFact]
     public async Task Classic_builder_builds_tags_and_runs_an_image()
@@ -106,41 +109,6 @@ public sealed class BuildTests(DaemonFixture daemon)
             .Select(id => id.StartsWith("sha256:", StringComparison.Ordinal) ? id["sha256:".Length..] : id)
             .Select(id => id.Length > 12 ? id[..12] : id),
     ];
-
-    [E2EFact]
-    public async Task Buildkit_is_refused_and_a_buildkit_build_never_succeeds()
-    {
-        // The contract: cider speaks no BuildKit, and says so where BuildKit clients look.
-        using var client = DaemonClient.Create(daemon.Options.SocketPath, TimeSpan.FromSeconds(30));
-        foreach (var path in new[] { "/session", "/grpc" })
-        {
-            using var response = await client.PostAsync(new Uri("/v1.47" + path, UriKind.Relative), new StringContent(""));
-            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
-        }
-
-        var ping = await daemon.DockerAsync("version", "--format", "{{.Server.APIVersion}}");
-        Assert.True(ping.Ok, ping.ToString());
-
-        // And a real `docker build` with BuildKit on never produces an image. (With buildx
-        // installed the CLI does not fail fast: it stalls pulling moby/buildkit for its
-        // docker-container driver, so the assertion is "did not succeed within the budget".)
-        var context = await NewContextAsync("buildkit");
-        var build = await daemon.DockerAsync(
-            ["build", "-t", BuildkitTag, "."],
-            timeout: TimeSpan.FromSeconds(60),
-            extraEnvironment: new Dictionary<string, string?>
-            {
-                ["DOCKER_BUILDKIT"] = "1",
-                ["BUILDX_BUILDER"] = null,
-            },
-            workingDirectory: context);
-
-        Assert.False(build.Ok, "the daemon does not speak BuildKit, so this build must not succeed: " + build);
-
-        var images = await daemon.DockerAsync("images", "--format", "{{.Repository}}:{{.Tag}}");
-        Assert.True(images.Ok, images.ToString());
-        Assert.DoesNotContain(BuildkitTag, images.Stdout, StringComparison.Ordinal);
-    }
 
     private async Task<string> NewContextAsync(string suffix)
     {

@@ -29,6 +29,7 @@ tests/compat/
 ├── run-podman-apiv2.sh
 ├── run-docker-py.sh
 ├── run-compose-e2e.sh
+├── run-buildkit.sh
 ├── run-swagger-contract.sh
 ├── diff-vs-orbstack.sh
 ├── fixtures/compose/docker-compose.yml
@@ -225,6 +226,68 @@ Two independent checks:
 No case-level allowlist (this suite is small enough to be pass/fail as a
 whole). **Output:** `reports/compose-e2e.md`. Exit non-zero if the fixture
 smoke test fails, or if part A ran but failed.
+
+## `run-buildkit.sh`
+
+```
+bash tests/compat/run-buildkit.sh
+```
+
+Drives the **default** buildx builder — the `docker` driver, talking
+straight to cider's own `/grpc` + `/session` (cider-ger.5-.11) — through real
+`docker build`/`docker buildx`/`docker compose` commands. There is no
+`docker buildx create` anywhere in this script: the whole point is that
+BuildKit works out of the box, the same as it does against real Docker
+Engine. Mirrors the scenario list in
+`tests/Cider.E2E.Tests/BuildKitTests.cs` (the xunit E2E suite is the primary
+coverage; this script is the same coverage from outside the .NET test host,
+matching every other script in this harness):
+
+- basic build → tag → run
+- `--build-arg` + `--target` on a multi-stage Dockerfile
+- `--secret id=tok,src=<file>` + `RUN --mount=type=secret`
+- `RUN --mount=type=cache` + a heredoc `RUN <<EOF`
+- `--progress plain` contains `#1 [internal] load build definition`
+- `--iidfile` and `-q` both agree with `docker images --no-trunc -q`
+- an untagged build is dangling and `docker image prune -f` removes it
+- `--no-cache`
+- `--output type=local,dest=<dir>` and `--output type=tar,dest=<file>`
+- `docker buildx inspect default --bootstrap` (`Status: running`,
+  `Platforms: linux/arm64`), `docker buildx du`, `docker buildx prune -f`,
+  `docker builder prune -f`
+- `docker compose build` with two services building from the **same**
+  context directory (exercises a shared BuildKit session across bake
+  targets), then `up -d` runs both
+- `docker buildx bake` with an HCL file whose two targets share
+  `context = "."`
+- a build whose context holds a large (default 20 MiB, override via
+  `CIDER_E2E_CONTEXT_MB`) random file, budgeted at 180s — matches the
+  always-on large-context check in the E2E suite; that suite's
+  `CIDER_E2E_LARGE=1`-gated 200 MiB characterization run (evidence for
+  cider-ger.15) is not duplicated here since it does not fit this
+  script's fixed 180s budget
+
+**Builder survival.** After every scenario, `container builder status` is
+checked directly through the Apple CLI — never through cider, since cider
+(per cider-ger.3/T4b) hides the builder VM from `docker ps` entirely, so
+there is no way to see it *through* the daemon under test. The run fails if
+the row is missing or not `running`: this is the regression this script
+exists to catch — a teardown or a build-side bug that reaches the builder
+VM directly instead of going through cider's own container commands, none
+of which touch it.
+
+No `docker buildx create` / custom builder is ever created, and none of
+cider's own state is shared with the developer's real daemon (same
+`lib/daemon.sh` isolation as every other script here) — but this script
+does share the **one real Apple builder VM** with the rest of the machine
+(there is exactly one, machine-wide, like Apple's `container` runtime
+itself), so running it concurrently with anything else that builds is not
+supported.
+
+**Output:** `reports/buildkit.md` — one table row per scenario (PASS/FAIL)
+plus the builder-survival check, with failure output attached per scenario.
+Exit code: non-zero if any scenario failed or the builder VM did not survive
+the run.
 
 ## `run-swagger-contract.sh`
 
