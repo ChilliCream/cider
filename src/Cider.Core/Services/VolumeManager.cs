@@ -172,6 +172,58 @@ public sealed class VolumeManager
         return new VolumePruneResponse { VolumesDeleted = deleted, SpaceReclaimed = space };
     }
 
+    /// <summary>
+    /// One-shot resync used by <see cref="StateSynchronizer"/>: diffs persisted volume records
+    /// against <c>container volume ls</c>, dropping records whose runtime volume is gone and
+    /// adopting runtime volumes with no record as <c>local</c> driver ones. Throws before mutating
+    /// anything when the listing itself fails, so a caller never sees a partially applied pass.
+    /// </summary>
+    internal async Task ReconcileAsync(SyncReport report, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(report);
+
+        var runtimeVolumes = await _runtime.ListVolumesAsync(ct).ConfigureAwait(false);
+        var byName = runtimeVolumes.ToDictionary(v => v.Name, StringComparer.Ordinal);
+
+        foreach (var record in _store.GetAll().ToList())
+        {
+            if (byName.ContainsKey(record.Name))
+            {
+                continue;
+            }
+
+            _store.Delete(record.Name);
+            _events.Publish(DockerEvents.Volume("destroy", record.Name));
+            report.Volumes.Removed.Add(record.Name);
+        }
+
+        var known = _store.GetAll().Select(r => r.Name).ToHashSet(StringComparer.Ordinal);
+        foreach (var runtimeVolume in runtimeVolumes)
+        {
+            if (known.Contains(runtimeVolume.Name))
+            {
+                continue;
+            }
+
+            var record = new VolumeRecord
+            {
+                Name = runtimeVolume.Name,
+                Request = new VolumeCreateRequest
+                {
+                    Name = runtimeVolume.Name,
+                    Driver = "local",
+                    Labels = new Dictionary<string, string>(runtimeVolume.Labels),
+                    DriverOpts = new Dictionary<string, string>(runtimeVolume.Options),
+                },
+                Created = runtimeVolume.Created ?? DateTimeOffset.UtcNow,
+            };
+
+            _store.Upsert(record.Name, record);
+            _events.Publish(DockerEvents.Volume("create", record.Name));
+            report.Volumes.Adopted.Add(record.Name);
+        }
+    }
+
     public async Task<Volume> EnsureAsync(string name, IReadOnlyDictionary<string, string>? labels, CancellationToken ct)
     {
         var existing = _store.Get(name);

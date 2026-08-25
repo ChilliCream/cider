@@ -113,24 +113,7 @@ public sealed partial class ContainerManager
                 continue;
             }
 
-            var expected = runtimeContainer.State switch
-            {
-                RuntimeContainerState.Running => "running",
-                RuntimeContainerState.Created => "created",
-                _ => "exited",
-            };
-
-            if (!string.Equals(record.State.Status, expected, StringComparison.Ordinal))
-            {
-                record.State.Status = expected;
-                if (expected == "exited")
-                {
-                    record.State.FinishedAt ??= DateTimeOffset.UtcNow;
-                    record.State.Error = "exit code unknown (daemon restarted)";
-                }
-
-                Persist(record);
-            }
+            ReconcileStatus(record, runtimeContainer);
         }
 
         // Containers created directly with the Apple CLI are surfaced read-only.
@@ -142,39 +125,7 @@ public sealed partial class ContainerManager
                 continue;
             }
 
-            var dockerId = ContainerIdentity.ReadDockerId(runtimeContainer.Labels) ?? DockerId.New();
-            var name = ContainerIdentity.ReadDockerName(runtimeContainer.Labels) ?? runtimeContainer.RuntimeId;
-            var argv = runtimeContainer.Argv;
-            var record = new ContainerRecord
-            {
-                Id = dockerId,
-                Name = name,
-                RuntimeId = runtimeContainer.RuntimeId,
-                Created = runtimeContainer.CreatedAt ?? DateTimeOffset.UtcNow,
-                Request = new ContainerCreateRequest
-                {
-                    Image = runtimeContainer.ImageReference,
-                    Tty = runtimeContainer.Tty,
-                    WorkingDir = runtimeContainer.WorkingDir ?? "",
-                    Env = [.. runtimeContainer.Env],
-                    Cmd = [.. argv],
-                    Labels = new Dictionary<string, string>(runtimeContainer.Labels, StringComparer.Ordinal),
-                },
-                ImageRef = runtimeContainer.ImageReference,
-                ImageId = runtimeContainer.ImageDigest ?? "",
-                Path = argv.Count > 0 ? argv[0] : "",
-                Args = argv.Count > 1 ? [.. argv.Skip(1)] : [],
-                Managed = ContainerIdentity.ReadDockerId(runtimeContainer.Labels) is not null,
-                State = new ContainerState
-                {
-                    Status = runtimeContainer.State == RuntimeContainerState.Running ? "running" : "exited",
-                    StartedAt = runtimeContainer.StartedAt,
-                },
-                LogPath = _logs.PathFor(dockerId),
-            };
-
-            Persist(record);
-            GetHandle(dockerId);
+            AdoptContainer(runtimeContainer);
         }
 
         // In proxy mode the host-side listeners live in this process and died with the last one, so
@@ -189,6 +140,81 @@ public sealed partial class ContainerManager
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Corrects one present record's status against what the runtime reports for it, exactly the way
+    /// the per-container loop in <see cref="ReconcileAsync"/> always has. Shared with
+    /// <see cref="StateSynchronizer"/> so an on-demand resync applies the identical rule. Returns
+    /// <c>true</c> when the status actually changed (and was persisted).
+    /// </summary>
+    internal bool ReconcileStatus(ContainerRecord record, RuntimeContainer runtimeContainer)
+    {
+        var expected = runtimeContainer.State switch
+        {
+            RuntimeContainerState.Running => "running",
+            RuntimeContainerState.Created => "created",
+            _ => "exited",
+        };
+
+        if (string.Equals(record.State.Status, expected, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        record.State.Status = expected;
+        if (expected == "exited")
+        {
+            record.State.FinishedAt ??= DateTimeOffset.UtcNow;
+            record.State.Error = "exit code unknown (daemon restarted)";
+        }
+
+        Persist(record);
+        return true;
+    }
+
+    /// <summary>
+    /// Surfaces one container the Apple CLI created directly as a read-only record, exactly the way
+    /// the adoption loop in <see cref="ReconcileAsync"/> always has. Shared with
+    /// <see cref="StateSynchronizer"/>. The caller is expected to have already checked that no
+    /// existing record claims <paramref name="runtimeContainer"/>'s <see cref="RuntimeContainer.RuntimeId"/>.
+    /// </summary>
+    internal ContainerRecord AdoptContainer(RuntimeContainer runtimeContainer)
+    {
+        var dockerId = ContainerIdentity.ReadDockerId(runtimeContainer.Labels) ?? DockerId.New();
+        var name = ContainerIdentity.ReadDockerName(runtimeContainer.Labels) ?? runtimeContainer.RuntimeId;
+        var argv = runtimeContainer.Argv;
+        var record = new ContainerRecord
+        {
+            Id = dockerId,
+            Name = name,
+            RuntimeId = runtimeContainer.RuntimeId,
+            Created = runtimeContainer.CreatedAt ?? DateTimeOffset.UtcNow,
+            Request = new ContainerCreateRequest
+            {
+                Image = runtimeContainer.ImageReference,
+                Tty = runtimeContainer.Tty,
+                WorkingDir = runtimeContainer.WorkingDir ?? "",
+                Env = [.. runtimeContainer.Env],
+                Cmd = [.. argv],
+                Labels = new Dictionary<string, string>(runtimeContainer.Labels, StringComparer.Ordinal),
+            },
+            ImageRef = runtimeContainer.ImageReference,
+            ImageId = runtimeContainer.ImageDigest ?? "",
+            Path = argv.Count > 0 ? argv[0] : "",
+            Args = argv.Count > 1 ? [.. argv.Skip(1)] : [],
+            Managed = ContainerIdentity.ReadDockerId(runtimeContainer.Labels) is not null,
+            State = new ContainerState
+            {
+                Status = runtimeContainer.State == RuntimeContainerState.Running ? "running" : "exited",
+                StartedAt = runtimeContainer.StartedAt,
+            },
+            LogPath = _logs.PathFor(dockerId),
+        };
+
+        Persist(record);
+        GetHandle(dockerId);
+        return record;
     }
 
     /// <summary>Called by <see cref="Restart.RestartSupervisor"/> right before it restarts a container.</summary>

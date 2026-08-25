@@ -6,12 +6,36 @@ public sealed partial class FakeContainerRuntime
 {
     private readonly List<RuntimeVolume> _volumes = new();
 
+    /// <summary>Test hook: fails the next <see cref="ListVolumesAsync"/> with this error.</summary>
+    public RuntimeException? ListVolumesFailure { get; set; }
+
     public Task<IReadOnlyList<RuntimeVolume>> ListVolumesAsync(CancellationToken ct)
     {
         Record("ListVolumesAsync");
+
+        if (ListVolumesFailure is { } failure)
+        {
+            ListVolumesFailure = null;
+            throw failure;
+        }
+
         lock (_sync)
         {
             return Task.FromResult<IReadOnlyList<RuntimeVolume>>(_volumes.ToList());
+        }
+    }
+
+    /// <summary>
+    /// Test-only helper: drops a volume from <see cref="ListVolumesAsync"/>/
+    /// <see cref="InspectVolumeAsync"/> without going through <see cref="RemoveVolumeAsync"/> — the
+    /// way <c>container volume delete</c> run by hand against the Apple CLI leaves cider's record
+    /// behind.
+    /// </summary>
+    public void VanishVolume(string name)
+    {
+        lock (_sync)
+        {
+            _volumes.RemoveAll(v => string.Equals(v.Name, name, StringComparison.Ordinal));
         }
     }
 

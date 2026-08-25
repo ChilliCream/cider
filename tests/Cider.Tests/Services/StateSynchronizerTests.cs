@@ -1,0 +1,134 @@
+using Cider.Core.DockerApi;
+using Cider.Core.DockerApi.Models;
+using Cider.Core.Runtime;
+using Cider.Core.Services;
+using Microsoft.Extensions.Logging.Abstractions;
+using Xunit;
+
+namespace Cider.Tests.Services;
+
+/// <summary>
+/// <see cref="StateSynchronizer"/>: the one-shot resync engine behind the (not yet wired) <c>cider
+/// sync</c> verb. Exercised directly against a <see cref="ContainerTestHarness"/> — no HTTP route
+/// exists yet (cider-eh2).
+/// </summary>
+public sealed class StateSynchronizerTests
+{
+    private static StateSynchronizer NewSynchronizer(ContainerTestHarness harness) => new(
+        harness.Runtime, harness.Containers, harness.Networks, harness.Volumes, harness.Dns,
+        NullLogger<StateSynchronizer>.Instance);
+
+    [Fact]
+    public async Task SyncAsync_DropsVanishedRecords_Immediately_NoConsecutiveMissGuard()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var sync = NewSynchronizer(harness);
+
+        var container = await harness.CreateAsync("alpine", "web");
+        container.State.Status = "running";
+        harness.Store.Upsert(container.Id, container);
+        await harness.Runtime.RemoveContainerAsync("web", force: true, default);
+
+        await harness.Networks.CreateAsync(new NetworkCreateRequest { Name = "vanishing-net" }, default);
+        harness.Runtime.VanishNetwork("vanishing-net");
+
+        await harness.Volumes.CreateAsync(new VolumeCreateRequest { Name = "vanishing-vol" }, default);
+        harness.Runtime.VanishVolume("vanishing-vol");
+
+        var report = await sync.SyncAsync(default);
+
+        // A single miss is enough (unlike the state poller's two-consecutive-miss guard): this is an
+        // explicit, user-requested resync.
+        Assert.Contains("web", report.Containers.Removed);
+        Assert.Null(harness.Store.Get(container.Id));
+        await Assert.ThrowsAsync<DockerApiException>(() => harness.Containers.ResolveAsync("web", default));
+
+        Assert.Contains("vanishing-net", report.Networks.Removed);
+        await Assert.ThrowsAsync<DockerApiException>(() => harness.Networks.ResolveAsync("vanishing-net", default));
+
+        Assert.Contains("vanishing-vol", report.Volumes.Removed);
+        await Assert.ThrowsAsync<DockerApiException>(() => harness.Volumes.InspectAsync("vanishing-vol", default));
+    }
+
+    [Fact]
+    public async Task SyncAsync_AdoptsUnknownRuntimeResources_AsReadOnlyRecords()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var sync = NewSynchronizer(harness);
+
+        harness.Runtime.SeedContainer(new RuntimeContainer
+        {
+            RuntimeId = "outside-cider",
+            State = RuntimeContainerState.Running,
+            ImageReference = "docker.io/library/alpine:latest",
+            Argv = ["sh"],
+        });
+
+        await harness.Runtime.CreateNetworkAsync(
+            new NetworkSpec { Name = "outside-net", Subnet = "192.168.70.0/24" }, default);
+
+        await harness.Runtime.CreateVolumeAsync(new VolumeSpec { Name = "outside-vol" }, default);
+
+        var report = await sync.SyncAsync(default);
+
+        Assert.Contains("outside-cider", report.Containers.Adopted);
+        var adoptedContainer = await harness.Containers.ResolveAsync("outside-cider", default);
+        Assert.False(adoptedContainer.Managed);
+
+        Assert.Contains("outside-net", report.Networks.Adopted);
+        var adoptedNetwork = await harness.Networks.ResolveAsync("outside-net", default);
+        Assert.False(adoptedNetwork.Managed);
+        Assert.Equal("192.168.70.0/24", adoptedNetwork.Request.IPAM?.Config?[0].Subnet);
+
+        Assert.Contains("outside-vol", report.Volumes.Adopted);
+        var adoptedVolume = await harness.Volumes.InspectAsync("outside-vol", default);
+        Assert.Equal("local", adoptedVolume.Driver);
+    }
+
+    [Fact]
+    public async Task SyncAsync_CorrectsStatusDrift_ThenReportsNothingOnASecondRun()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var sync = NewSynchronizer(harness);
+
+        // Created but started directly through the engine, bypassing cider: the record is stale.
+        var record = await harness.CreateShellAsync("sleep 30", "web");
+        Assert.Equal("created", record.State.Status);
+        await harness.Runtime.StartContainerAsync("web", new StartOptions(), default);
+
+        var first = await sync.SyncAsync(default);
+
+        Assert.Equal("running", record.State.Status);
+        Assert.Contains("web", first.Containers.Updated);
+
+        var second = await sync.SyncAsync(default);
+
+        Assert.True(second.Containers.IsEmpty, "a second pass over unchanged state must report nothing");
+        Assert.True(second.Networks.IsEmpty, "a second pass over unchanged state must report nothing");
+        Assert.True(second.Volumes.IsEmpty, "a second pass over unchanged state must report nothing");
+
+        await harness.Runtime.KillContainerAsync("web", "SIGKILL", default);
+    }
+
+    [Fact]
+    public async Task SyncAsync_EngineListFailure_ThrowsAndChangesNothing()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var sync = NewSynchronizer(harness);
+
+        // Would be dropped by a successful pass; must survive an aborted one untouched.
+        var container = await harness.CreateAsync("alpine", "web");
+        container.State.Status = "running";
+        harness.Store.Upsert(container.Id, container);
+        await harness.Runtime.RemoveContainerAsync("web", force: true, default);
+
+        harness.Runtime.ListContainersFailure = RuntimeException.Unavailable("engine unreachable");
+
+        await Assert.ThrowsAsync<RuntimeException>(() => sync.SyncAsync(default));
+
+        // Nothing was touched: the vanished record is still exactly as it was before the pass.
+        var survivor = harness.Store.Get(container.Id);
+        Assert.NotNull(survivor);
+        Assert.Equal("running", survivor!.State.Status);
+    }
+}

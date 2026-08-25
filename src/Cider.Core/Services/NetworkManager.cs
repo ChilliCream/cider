@@ -584,6 +584,72 @@ public sealed class NetworkManager
         _store.Upsert(BridgeName, record);
     }
 
+    /// <summary>
+    /// One-shot resync used by <see cref="StateSynchronizer"/>: diffs persisted network records
+    /// against <c>container network ls</c>, dropping records whose runtime network is gone (never
+    /// the default bridge — <see cref="EnsureDefaultAsync"/> is called first so it always exists) and
+    /// adopting runtime networks with no record as minimal read-only ones. Throws before mutating
+    /// anything when the listing itself fails, so a caller never sees a partially applied pass.
+    /// </summary>
+    internal async Task ReconcileAsync(SyncReport report, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(report);
+
+        await EnsureDefaultAsync(ct).ConfigureAwait(false);
+
+        var runtimeNetworks = await _runtime.ListNetworksAsync(ct).ConfigureAwait(false);
+        var byRuntimeName = runtimeNetworks.ToDictionary(n => n.Name, StringComparer.Ordinal);
+
+        foreach (var record in _store.GetAll().ToList())
+        {
+            if (string.Equals(record.Name, BridgeName, StringComparison.Ordinal) ||
+                byRuntimeName.ContainsKey(record.RuntimeName))
+            {
+                continue;
+            }
+
+            await ReleaseDnsForwarderAsync(record.Name, ct).ConfigureAwait(false);
+            _store.Delete(record.Name);
+            _events.Publish(DockerEvents.Network("destroy", record.Id, record.Name));
+            report.Networks.Removed.Add(record.Name);
+        }
+
+        var knownRuntimeNames = _store.GetAll().Select(r => r.RuntimeName).ToHashSet(StringComparer.Ordinal);
+        foreach (var runtimeNetwork in runtimeNetworks)
+        {
+            if (knownRuntimeNames.Contains(runtimeNetwork.Name))
+            {
+                continue;
+            }
+
+            var record = new NetworkRecord
+            {
+                Id = DockerId.New(),
+                Name = runtimeNetwork.Name,
+                Managed = false,
+                Request = new NetworkCreateRequest
+                {
+                    Name = runtimeNetwork.Name,
+                    Driver = "bridge",
+                    Internal = runtimeNetwork.Internal,
+                    IPAM = new Ipam
+                    {
+                        Config = runtimeNetwork.Subnet is not null
+                            ? [new IpamConfig { Subnet = runtimeNetwork.Subnet, Gateway = runtimeNetwork.Gateway }]
+                            : [],
+                    },
+                    Labels = new Dictionary<string, string>(runtimeNetwork.Labels),
+                },
+                Created = runtimeNetwork.Created ?? DateTimeOffset.UtcNow,
+                RuntimeName = runtimeNetwork.Name,
+            };
+
+            _store.Upsert(record.Name, record);
+            _events.Publish(DockerEvents.Network("create", record.Id, record.Name));
+            report.Networks.Adopted.Add(record.Name);
+        }
+    }
+
     // ---- helpers ------------------------------------------------------
 
     private static NetworkRecord HostRecord => new()

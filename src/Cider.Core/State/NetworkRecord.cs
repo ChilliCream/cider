@@ -18,4 +18,7 @@ public sealed class NetworkRecord
 
     /// <summary>The name the underlying Apple <c>container</c> network is known by (e.g. "default" for "bridge").</summary>
     public string RuntimeName { get; set; } = "";
+
+    /// <summary><c>false</c> for networks discovered on the engine that cider did not create.</summary>
+    public bool Managed { get; set; } = true;
 }

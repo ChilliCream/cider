@@ -168,6 +168,7 @@ public static class DaemonHost
         services.AddSingleton<HealthMonitor>();
         services.AddSingleton<RestartSupervisor>();
         services.AddSingleton<StatePoller>();
+        services.AddSingleton<StateSynchronizer>();
 
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, DaemonLifecycle>());
 

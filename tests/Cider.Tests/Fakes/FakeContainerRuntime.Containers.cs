@@ -308,10 +308,20 @@ public sealed partial class FakeContainerRuntime
         AfterRemove?.Invoke();
     }
 
+    /// <summary>Test hook: fails the next <see cref="ListContainersAsync"/> with this error.</summary>
+    public RuntimeException? ListContainersFailure { get; set; }
+
     /// <inheritdoc />
     public Task<IReadOnlyList<RuntimeContainer>> ListContainersAsync(CancellationToken ct)
     {
         Record("ListContainersAsync");
+
+        if (ListContainersFailure is { } failure)
+        {
+            ListContainersFailure = null;
+            throw failure;
+        }
+
         lock (_sync)
         {
             IReadOnlyList<RuntimeContainer> list = [.. _containerTable.Values.Select(Project)];

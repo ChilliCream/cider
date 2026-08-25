@@ -20,12 +20,36 @@ public sealed partial class FakeContainerRuntime
         },
     ];
 
+    /// <summary>Test hook: fails the next <see cref="ListNetworksAsync"/> with this error.</summary>
+    public RuntimeException? ListNetworksFailure { get; set; }
+
     public Task<IReadOnlyList<RuntimeNetwork>> ListNetworksAsync(CancellationToken ct)
     {
         Record("ListNetworksAsync");
+
+        if (ListNetworksFailure is { } failure)
+        {
+            ListNetworksFailure = null;
+            throw failure;
+        }
+
         lock (_sync)
         {
             return Task.FromResult<IReadOnlyList<RuntimeNetwork>>(_networks.ToList());
+        }
+    }
+
+    /// <summary>
+    /// Test-only helper: drops a network from <see cref="ListNetworksAsync"/>/
+    /// <see cref="InspectNetworkAsync"/> without going through <see cref="RemoveNetworkAsync"/> — the
+    /// way <c>container network delete</c> run by hand against the Apple CLI leaves cider's record
+    /// behind.
+    /// </summary>
+    public void VanishNetwork(string name)
+    {
+        lock (_sync)
+        {
+            _networks.RemoveAll(n => string.Equals(n.Name, name, StringComparison.Ordinal));
         }
     }
 
