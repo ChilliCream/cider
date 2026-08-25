@@ -55,6 +55,7 @@ public static class DaemonHost
         app.UseRouting();
 
         app.MapSystemRoutes();
+        app.MapCiderRoutes();
         app.MapContainerRoutes();
         app.MapExecRoutes();
         app.MapImageRoutes();

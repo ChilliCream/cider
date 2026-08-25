@@ -1,13 +1,15 @@
 using System.Reflection;
+using System.Text.Json;
 using Cider.AppleContainer;
 using Cider.Core.Configuration;
 using Cider.Daemon.Hosting;
 using Cider.Daemon.Install;
+using Cider.Daemon.Routes;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Cider.Daemon;
 
-/// <summary>The <c>cider</c> executable: <c>serve</c> (default), <c>install</c>, <c>uninstall</c>, <c>status</c>, <c>version</c>.</summary>
+/// <summary>The <c>cider</c> executable: <c>serve</c> (default), <c>install</c>, <c>uninstall</c>, <c>status</c>, <c>sync</c>, <c>version</c>.</summary>
 public static class Program
 {
     /// <summary>Entry point; returns the process exit code.</summary>
@@ -26,6 +28,7 @@ public static class Program
                 "install" => await InstallAsync(rest),
                 "uninstall" => await UninstallAsync(rest),
                 "status" => await StatusAsync(rest),
+                "sync" => await SyncAsync(rest),
                 "version" => await VersionAsync(rest),
                 "help" or "--help" or "-h" => Help(0),
                 _ => Unknown(verb),
@@ -141,6 +144,108 @@ public static class Program
         return responding ? 0 : 1;
     }
 
+    /// <summary>
+    /// Resynchronises the running daemon's persisted state against Apple <c>container</c> on demand
+    /// (a container/network/volume deleted with the Apple CLI, Apple services restarted, a
+    /// hard-killed daemon). Never touches <c>&lt;data-dir&gt;/state</c> directly — it only ever POSTs
+    /// to the running daemon, which owns the resync itself (<c>StateSynchronizer</c>).
+    /// </summary>
+    private static async Task<int> SyncAsync(string[] args)
+    {
+        var parsed = CommandLine.Parse(args, ["--socket", "--data-dir"], ["--json"]);
+        var options = CiderOptions.Load(parsed.Value("--data-dir"), parsed.Value("--socket"), null);
+
+        if (!File.Exists(options.SocketPath))
+        {
+            return DaemonNotResponding(options.SocketPath);
+        }
+
+        using var client = DaemonClient.Create(options.SocketPath, TimeSpan.FromMinutes(2));
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await client.PostAsync(new Uri("/_cider/sync", UriKind.Relative), content: null);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException or System.Net.Sockets.SocketException)
+        {
+            return DaemonNotResponding(options.SocketPath);
+        }
+
+        using (response)
+        {
+            var body = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.Error.WriteLine($"cider: sync failed: {body}");
+                return 1;
+            }
+
+            var report = JsonSerializer.Deserialize(body, CiderJsonContext.Default.SyncReportDto)
+                ?? throw new InvalidOperationException("cider: the daemon returned an empty sync report");
+
+            if (parsed.Flag("--json"))
+            {
+                Console.WriteLine(body);
+            }
+            else
+            {
+                PrintSyncSummary(report);
+            }
+
+            return report.Warnings.Count == 0 ? 0 : 1;
+        }
+    }
+
+    private static int DaemonNotResponding(string socketPath)
+    {
+        Console.Error.WriteLine(
+            $"cider: daemon not responding on {socketPath} — start it "
+            + "(launchctl kickstart -k gui/$UID/com.chillicream.cider.daemon) and retry");
+        return 1;
+    }
+
+    private static void PrintSyncSummary(SyncReportDto report)
+    {
+        Console.WriteLine($"containers: {DescribeResource(report.Containers, includeUpdated: true)}");
+        Console.WriteLine($"networks:   {DescribeResource(report.Networks, includeUpdated: false)}");
+        Console.WriteLine($"volumes:    {DescribeResource(report.Volumes, includeUpdated: false)}");
+
+        if (report.Warnings.Count > 0)
+        {
+            Console.WriteLine($"warnings:   {report.Warnings.Count}");
+            foreach (var warning in report.Warnings)
+            {
+                Console.WriteLine($"  - {warning}");
+            }
+        }
+
+        if (report.IsEmpty)
+        {
+            Console.WriteLine("nothing to do — cider's state already matches Apple container.");
+        }
+    }
+
+    private static string DescribeResource(SyncResourceReportDto resource, bool includeUpdated)
+    {
+        var parts = new List<string>
+        {
+            $"{resource.Removed.Count} removed{NameList(resource.Removed)}",
+            $"{resource.Adopted.Count} adopted{NameList(resource.Adopted)}",
+        };
+
+        if (includeUpdated)
+        {
+            parts.Add($"{resource.Updated.Count} updated{NameList(resource.Updated)}");
+        }
+
+        return string.Join(", ", parts);
+    }
+
+    private static string NameList(IReadOnlyCollection<string> names) =>
+        names.Count > 0 ? $" ({string.Join(", ", names)})" : "";
+
     private static async Task<int> VersionAsync(string[] args)
     {
         var parsed = CommandLine.Parse(args, ["--data-dir"], []);
@@ -221,6 +326,7 @@ public static class Program
               cider install [--system-socket] [--force-system-socket] [--no-context] [--socket PATH] [--data-dir DIR]
               cider uninstall [--label LABEL] [--data-dir DIR]
               cider status [--socket PATH]
+              cider sync [--socket PATH] [--data-dir DIR] [--json]
               cider version
               cider help
 
