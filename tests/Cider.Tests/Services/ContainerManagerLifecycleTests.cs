@@ -43,6 +43,22 @@ public sealed class ContainerManagerLifecycleTests
     }
 
     [Fact]
+    public async Task Start_of_a_container_removed_outside_cider_is_a_404_that_says_what_to_do()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var record = await harness.CreateShellAsync("sleep 5", "web");
+
+        // Someone ran `container delete`/`rm -f` (or Apple's services restarted and lost it)
+        // before the poller ever got a chance to notice: the engine has no idea what this id is.
+        await harness.Runtime.RemoveContainerAsync("web", force: true, default);
+
+        var error = await Assert.ThrowsAsync<DockerApiException>(() => harness.Containers.StartAsync(record.Id, default));
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, error.Status);
+        Assert.Contains("removed outside cider", error.Message, StringComparison.Ordinal);
+        Assert.Contains("docker rm web", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Start_registers_the_container_addresses_for_dns()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

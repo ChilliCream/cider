@@ -74,6 +74,22 @@ public sealed partial class FakeContainerRuntime
         }
     }
 
+    /// <summary>
+    /// Test-only helper: drops a container from <see cref="ListContainersAsync"/>/
+    /// <see cref="InspectContainerAsync"/> without touching any held process — the way Apple's
+    /// runtime loses track of a container when its services restart (<c>container ls -a</c> goes
+    /// empty while a process cider is already piped to keeps running), as opposed to
+    /// <see cref="RemoveContainerAsync"/>, which also kills the process the way
+    /// <c>container delete -f</c> would.
+    /// </summary>
+    public void VanishContainer(string runtimeId)
+    {
+        lock (_sync)
+        {
+            _containerTable.Remove(runtimeId);
+        }
+    }
+
     /// <summary>The fake's view of one container, for assertions.</summary>
     public FakeContainer? GetContainer(string runtimeId)
     {

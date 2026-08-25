@@ -60,7 +60,16 @@ public sealed partial class ContainerManager
             {
                 record.State.Error = ex.Message;
                 Persist(record);
-                throw Translate(ex);
+
+                // The engine has no idea what this id is any more: someone ran `container delete`
+                // (or `rm -f`) directly, or Apple's services restarted and lost it (ARCHITECTURE
+                // §6/§9). `docker rm` is the only way out of that, so the 404 says so instead of
+                // repeating the runtime's bare "container not found".
+                throw ex.Kind == RuntimeErrorKind.NotFound
+                    ? DockerErrors.NotFound(
+                        $"container {record.Name} no longer exists in Apple container (removed outside cider); " +
+                        $"run 'docker rm {record.Name}' to drop it")
+                    : Translate(ex);
             }
 
             // Only now that the start has succeeded are the mounted batches marked: the marker turns
@@ -307,6 +316,70 @@ public sealed partial class ContainerManager
         RaiseStateChanged(record, "destroy");
     }
 
+    /// <summary>
+    /// Called by <see cref="StatePoller"/> once a record's runtime container has been missing from
+    /// <c>container ls -a</c> for two consecutive polls: it was removed outside cider (someone ran
+    /// <c>container delete</c>/<c>rm -f</c> directly, or Apple's services restarted and lost it —
+    /// ARCHITECTURE §6/§9). This is the record-side half of <see cref="RemoveAsync"/> without the
+    /// <c>container delete</c> call — there is nothing left on the engine to delete — and it takes
+    /// the same per-container gate <see cref="RemoveAsync"/> does, so it cannot race a create/remove
+    /// already in flight. Anonymous volumes are kept, exactly like <c>docker rm</c> without
+    /// <c>-v</c>.
+    /// </summary>
+    internal async Task ForgetVanishedAsync(ContainerRecord record, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        var handle = GetHandle(record.Id);
+
+        await handle.Gate.WaitAsync(ct);
+        try
+        {
+            // A start, remove or re-create may have raced in while this call waited for the gate
+            // (or the caller's own miss count is stale): bail out and let the next poll re-evaluate
+            // rather than drop a record that is no longer the one the poller looked at.
+            if (_store.Get(record.Id) is not { } current ||
+                !string.Equals(current.RuntimeId, record.RuntimeId, StringComparison.Ordinal) ||
+                handle.Process is not null)
+            {
+                return;
+            }
+
+            var wasRunning = current.State.Running;
+
+            // Mirrors what RemoveAsync does before a running container's "die": without this,
+            // RestartSupervisor would see the "die" below, treat it as a container to restart, and
+            // resurrect the very record this call is meant to drop (Persist inside MarkRestarting
+            // would re-add it to the store).
+            current.UserStopped = true;
+
+            _names.Unregister(current.Id);
+            UnpublishPorts(current.Id);
+            ReleasePorts(current);
+            _logs.Delete(current.Id);
+            DropStagedArchives(current.Id);
+            _store.Delete(current.Id);
+            _handles.TryRemove(current.Id, out _);
+            handle.Removed.TrySetResult(current.State.ExitCode);
+            CompleteAttachments(handle);
+
+            if (wasRunning)
+            {
+                Publish(current, "die", new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["exitCode"] = current.State.ExitCode.ToString(CultureInfo.InvariantCulture),
+                });
+                RaiseStateChanged(current, "die");
+            }
+
+            Publish(current, "destroy");
+            RaiseStateChanged(current, "destroy");
+        }
+        finally
+        {
+            handle.Gate.Release();
+        }
+    }
+
     /// <summary><c>POST /containers/{id}/wait?condition=</c>.</summary>
     public async Task<ContainerWaitResponse> WaitAsync(string idOrName, string condition, CancellationToken ct)
     {
@@ -317,30 +390,30 @@ public sealed partial class ContainerManager
         switch (wanted)
         {
             case "removed":
-            {
-                var code = await handle.Removed.Task.WaitAsync(ct);
-                return new ContainerWaitResponse { StatusCode = code };
-            }
-
-            case "next-exit":
-            {
-                // Capture the pending exit before awaiting: `docker run` waits before it starts.
-                var pending = handle.NextExit.Task;
-                var code = await pending.WaitAsync(ct);
-                return Response(code);
-            }
-
-            default:
-            {
-                if (!record.State.Running)
                 {
-                    return Response(record.State.ExitCode);
+                    var code = await handle.Removed.Task.WaitAsync(ct);
+                    return new ContainerWaitResponse { StatusCode = code };
                 }
 
-                var pending = handle.NextExit.Task;
-                var code = await pending.WaitAsync(ct);
-                return Response(code);
-            }
+            case "next-exit":
+                {
+                    // Capture the pending exit before awaiting: `docker run` waits before it starts.
+                    var pending = handle.NextExit.Task;
+                    var code = await pending.WaitAsync(ct);
+                    return Response(code);
+                }
+
+            default:
+                {
+                    if (!record.State.Running)
+                    {
+                        return Response(record.State.ExitCode);
+                    }
+
+                    var pending = handle.NextExit.Task;
+                    var code = await pending.WaitAsync(ct);
+                    return Response(code);
+                }
         }
 
         ContainerWaitResponse Response(int code)

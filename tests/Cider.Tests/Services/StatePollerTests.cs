@@ -1,3 +1,4 @@
+using Cider.Core.DockerApi;
 using Cider.Core.Runtime;
 using Cider.Core.Services;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -26,6 +27,97 @@ public sealed class StatePollerTests
         Assert.Equal("exited", record.State.Status);
         Assert.Equal("exit code unknown (daemon restarted)", record.State.Error);
         await events.WaitForAsync("die");
+    }
+
+    [Fact]
+    public async Task A_container_missing_twice_in_a_row_is_dropped_and_its_name_freed()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await using var events = await harness.CollectEventsAsync();
+        await using var poller = NewPoller(harness);
+
+        var record = await harness.CreateAsync("alpine", "web");
+        record.State.Status = "running";
+        harness.Store.Upsert(record.Id, record);
+
+        // Removed outside cider: gone from the engine's listing entirely.
+        await harness.Runtime.RemoveContainerAsync("web", force: true, default);
+
+        // First miss: today's behaviour — marked exited, record stays.
+        await poller.PollOnceAsync(default);
+        Assert.Equal("exited", record.State.Status);
+        Assert.NotNull(harness.Store.Get(record.Id));
+
+        // Second consecutive miss: dropped for good.
+        await poller.PollOnceAsync(default);
+
+        Assert.Null(harness.Store.Get(record.Id));
+        await Assert.ThrowsAsync<DockerApiException>(() => harness.Containers.ResolveAsync("web", default));
+        await events.WaitForAsync("destroy");
+
+        // The name is free for reuse.
+        var recreated = await harness.CreateAsync("alpine", "web");
+        Assert.NotEqual(record.Id, recreated.Id);
+    }
+
+    [Fact]
+    public async Task A_container_the_daemon_holds_is_never_dropped_even_after_it_vanishes()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await using var poller = NewPoller(harness);
+
+        var record = await harness.RunShellAsync("sleep 30", "web");
+
+        // Apple's services restart and lose track of it (ARCHITECTURE §6/§9), but this daemon still
+        // holds the init process directly — it never went through `RemoveContainerAsync`.
+        harness.Runtime.VanishContainer("web");
+
+        for (var i = 0; i < 5; i++)
+        {
+            await poller.PollOnceAsync(default);
+        }
+
+        // Never dropped: the record (and its name) survive every poll while the process is held.
+        Assert.NotNull(harness.Store.Get(record.Id));
+        var stillThere = await harness.Containers.ResolveAsync("web", default);
+        Assert.Equal(record.Id, stillThere.Id);
+    }
+
+    [Fact]
+    public async Task A_single_miss_does_not_drop_a_container_seen_again_next_poll()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await using var events = await harness.CollectEventsAsync();
+        await using var poller = NewPoller(harness);
+
+        var record = await harness.CreateAsync("alpine", "web");
+        record.State.Status = "running";
+        harness.Store.Upsert(record.Id, record);
+        await harness.Runtime.RemoveContainerAsync("web", force: true, default);
+
+        // One miss: marked exited, miss counter at 1.
+        await poller.PollOnceAsync(default);
+        Assert.Equal("exited", record.State.Status);
+
+        // The container comes back (e.g. re-created directly through the Apple CLI with the same
+        // name) before a second consecutive miss: the counter must reset instead of carrying over.
+        harness.Runtime.SeedContainer(new RuntimeContainer
+        {
+            RuntimeId = "web",
+            State = RuntimeContainerState.Running,
+            ImageReference = "docker.io/library/alpine:latest",
+        });
+        await poller.PollOnceAsync(default);
+
+        Assert.Equal("running", record.State.Status);
+        await events.WaitForAsync("start");
+
+        // One more miss on its own must not drop it: the earlier miss no longer counts.
+        await harness.Runtime.RemoveContainerAsync("web", force: true, default);
+        await poller.PollOnceAsync(default);
+
+        Assert.NotNull(harness.Store.Get(record.Id));
+        Assert.Equal("exited", record.State.Status);
     }
 
     [Fact]

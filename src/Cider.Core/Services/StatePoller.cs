@@ -1,5 +1,6 @@
 using System.Globalization;
 using Cider.Core.Configuration;
+using Cider.Core.DockerApi;
 using Cider.Core.Events;
 using Cider.Core.Runtime;
 using Microsoft.Extensions.Logging;
@@ -20,6 +21,12 @@ public sealed class StatePoller : IAsyncDisposable
 
     private CancellationTokenSource? _cts;
     private Task? _loop;
+
+    // Consecutive polls a record's runtime container has been missing from `container ls -a`.
+    // Reset the moment it is seen again; a single miss stays today's "mark exited" (an incomplete
+    // listing right after the daemon or Apple's services restart must never drop a record), and only
+    // the second consecutive miss is treated as "removed outside cider".
+    private Dictionary<string, int> _missCounts = new(StringComparer.Ordinal);
 
     /// <summary>Creates the poller.</summary>
     public StatePoller(
@@ -111,20 +118,52 @@ public sealed class StatePoller : IAsyncDisposable
             byRuntimeId[container.RuntimeId] = container;
         }
 
+        var missCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+
         foreach (var record in EnumerateRecords())
         {
             if (!byRuntimeId.TryGetValue(record.RuntimeId, out var runtimeContainer))
             {
-                if (record.State.Running)
+                var misses = _missCounts.TryGetValue(record.Id, out var previous) ? previous + 1 : 1;
+
+                if (misses == 1)
                 {
-                    record.State.Status = "exited";
-                    record.State.FinishedAt ??= DateTimeOffset.UtcNow;
-                    record.State.Error = "exit code unknown (daemon restarted)";
-                    Save(record);
-                    _events.Publish(DockerEvents.Container("die", record, new Dictionary<string, string>(StringComparer.Ordinal)
+                    if (record.State.Running)
                     {
-                        ["exitCode"] = record.State.ExitCode.ToString(CultureInfo.InvariantCulture),
-                    }));
+                        record.State.Status = "exited";
+                        record.State.FinishedAt ??= DateTimeOffset.UtcNow;
+                        record.State.Error = "exit code unknown (daemon restarted)";
+                        Save(record);
+                        _events.Publish(DockerEvents.Container("die", record, new Dictionary<string, string>(StringComparer.Ordinal)
+                        {
+                            ["exitCode"] = record.State.ExitCode.ToString(CultureInfo.InvariantCulture),
+                        }));
+                    }
+
+                    missCounts[record.Id] = misses;
+                    continue;
+                }
+
+                // The daemon is holding this container's init process (a `container start -a` it
+                // launched), so the runtime not listing it yet is a transient gap, not a removal.
+                if (IsHeldByUs(record.Id))
+                {
+                    missCounts[record.Id] = misses;
+                    continue;
+                }
+
+                _logger.LogWarning(
+                    "container {Name} ({Id}) no longer exists in Apple container (removed outside cider); dropping its record",
+                    record.Name, record.Id);
+
+                try
+                {
+                    await _containers.ForgetVanishedAsync(record, ct);
+                }
+                catch (Exception ex) when (ex is DockerApiException or RuntimeException)
+                {
+                    _logger.LogDebug(ex, "dropping vanished container {Container} failed", record.Id);
+                    missCounts[record.Id] = misses;
                 }
 
                 continue;
@@ -183,6 +222,8 @@ public sealed class StatePoller : IAsyncDisposable
                 _containers.UnpublishPorts(record.Id);
             }
         }
+
+        _missCounts = missCounts;
     }
 
     private static bool HasUnresolvedAddress(State.ContainerRecord record) =>
