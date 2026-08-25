@@ -204,6 +204,15 @@ public static class DaemonHost
         // CliSessionRegistry.WaitAsync rather than only a synchronous lookup.
         services.AddSingleton<CliSessionRegistry>();
 
+        // The one shared link to buildkitd inside the Apple builder VM (see BuilderConnection).
+        // Registered unconditionally -- CiderOptions.BuildKitEnabled is checked inside GetAsync, not
+        // here -- so tests can replace it via settings.ConfigureServices below regardless of that
+        // setting.
+        services.AddSingleton<IBuilderConnection>(sp => new BuilderConnection(
+            sp.GetRequiredService<IContainerRuntime>(),
+            options,
+            sp.GetRequiredService<ILogger<BuilderConnection>>()));
+
         services.AddGrpc(grpc =>
         {
             grpc.IgnoreUnknownServices = true;

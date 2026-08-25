@@ -4,6 +4,7 @@ using Cider.Core.Net;
 using Cider.Core.Restart;
 using Cider.Core.Runtime;
 using Cider.Core.Services;
+using Cider.Daemon.BuildKit;
 using Cider.Daemon.Dns;
 
 namespace Cider.Daemon.Hosting;
@@ -21,6 +22,7 @@ public sealed class DaemonLifecycle(
     HealthMonitor health,
     RestartSupervisor restarts,
     IPortPublisher ports,
+    IBuilderConnection builder,
     CiderOptions options,
     IServiceProvider services,
     IHostApplicationLifetime lifetime,
@@ -65,6 +67,21 @@ public sealed class DaemonLifecycle(
         await SafeAsync("start the health monitor", () => health.StartAsync(cancellationToken));
         await SafeAsync("start the restart supervisor", () => restarts.StartAsync(cancellationToken));
 
+        if (options.BuildKitEnabled)
+        {
+            // Best-effort: a build only actually needs the builder link once BuildKit talks to us,
+            // so a failure here never keeps the daemon from serving everything else -- it just means
+            // the first build pays the dial cost instead of this warm-up doing it upfront.
+            try
+            {
+                await builder.GetAsync(cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(ex, "the Apple builder is not ready; BuildKit builds will retry on demand");
+            }
+        }
+
         logger.LogInformation("cider is listening on {Socket}", options.SocketPath);
     }
 
@@ -84,6 +101,16 @@ public sealed class DaemonLifecycle(
         {
             await SafeAsync("stop the DNS server", _dns.StopAsync);
         }
+
+        // Kills the CLI child behind the current builder link, if any; the builder VM itself keeps
+        // running (see BuilderConnection.DisposeAsync), matching classic Docker/buildx behaviour.
+        await SafeAsync("dispose the builder link", async () =>
+        {
+            if (builder is IAsyncDisposable disposable)
+            {
+                await disposable.DisposeAsync();
+            }
+        });
 
         try
         {
