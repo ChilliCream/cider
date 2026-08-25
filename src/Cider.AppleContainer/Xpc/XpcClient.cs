@@ -131,7 +131,11 @@ internal sealed class XpcClient : IDisposable
         // ct here would let an already-cancelled (or concurrently cancelled) token make Task.Run
         // return a cancelled task without ever calling SendSync, leaking that retain. ct still
         // governs the wait below, exactly like the Swift client's purely client-side timeout (§1.4).
-        var sendTask = Task.Run(() => SendSync(connection, request), CancellationToken.None);
+        var sendTask = Task.Factory.StartNew(
+            () => SendSync(connection, request),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
         if (timeout is not { } budget)
         {
             return await sendTask.ConfigureAwait(false);
@@ -152,10 +156,12 @@ internal sealed class XpcClient : IDisposable
             // tear that connection down — only a real connection-level error, observed reactively in
             // SendSync/OnConnectionEvent, may mark it broken. So unlike
             // SendOnDedicatedConnectionAsync below, this deliberately leaves the connection alone:
-            // the abandoned sync send's native thread stays blocked until the daemon eventually
-            // replies (or the connection is later torn down for an unrelated reason) — a bounded,
-            // accepted leak (pre-cb184d0 behavior for this path). The abandoned task is only
-            // observed, never awaited further, so its eventual fault (or success, which must still
+            // the abandoned sync send stays blocked until the daemon eventually replies (or the
+            // connection is later torn down for an unrelated reason) — a bounded, accepted leak
+            // (pre-cb184d0 behavior for this path) of one dedicated native thread per abandoned
+            // timeout (LongRunning above, same as the dedicated-connection path, rather than a
+            // pool thread that would otherwise progressively starve the thread pool). The abandoned
+            // task is only observed, never awaited further, so its eventual fault (or success, which must still
             // be disposed rather than leaked) can never surface as an unobserved exception, or leaked
             // reply, once the caller has already moved on with an exception of its own. Rethrowing
             // (not wrapping) preserves the original exception type/identity for the caller.
@@ -202,44 +208,65 @@ internal sealed class XpcClient : IDisposable
         XpcNative.xpc_connection_set_event_handler(handle, block);
         XpcNative.xpc_connection_activate(handle);
 
+        // Awaiting-scope retain, on top of the one reference xpc_connection_create_mach_service
+        // handed out above. SendSyncDedicated's finally (via CancelAndReleaseConnection) only ever
+        // releases the send task's own reference, never this one, so cancelling below on
+        // timeout/ct always runs against a live handle regardless of whether the send task's
+        // finally has already run — see the finally right below and this method's own doc comment.
+        XpcNative.xpc_retain(handle);
+
         var connection = new Connection { Handle = handle, Block = block };
-
-        // LongRunning, not the thread pool: these calls (wait/logs/dial) can legitimately block for
-        // a long time, and unlike RunWithTimeoutAsync's Task.Run there is no shared-retain balancing
-        // concern forcing CancellationToken.None here either way — SendSyncDedicated always cancels
-        // and releases this single-use connection itself, in its own finally, however it completes.
-        var sendTask = Task.Factory.StartNew(
-            () => SendSyncDedicated(connection, request),
-            CancellationToken.None,
-            TaskCreationOptions.LongRunning,
-            TaskScheduler.Default);
-
-        if (timeout is null && !ct.CanBeCanceled)
-        {
-            return await sendTask.ConfigureAwait(false);
-        }
 
         try
         {
-            return timeout is { } budget
-                ? await sendTask.WaitAsync(budget, ct).ConfigureAwait(false)
-                : await sendTask.WaitAsync(ct).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is TimeoutException || ex is OperationCanceledException)
-        {
-            // Safe unconditionally, unlike RunWithTimeoutAsync's shared connection: nothing else
-            // ever sends on this connection, so cancelling it here can never race or
-            // collateral-damage a concurrent call. SendSyncDedicated's own finally will also cancel
-            // (idempotent) and release it once the abandoned send actually returns.
-            XpcNative.xpc_connection_cancel(handle);
-            ObserveAbandoned(sendTask);
+            // LongRunning, not the thread pool: these calls (wait/logs/dial) can legitimately block
+            // for a long time, and unlike RunWithTimeoutAsync's Task.Run there is no shared-retain
+            // balancing concern forcing CancellationToken.None here either way — SendSyncDedicated
+            // always cancels and releases its own reference to this single-use connection in its
+            // own finally, however it completes.
+            var sendTask = Task.Factory.StartNew(
+                () => SendSyncDedicated(connection, request),
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
 
-            if (ex is TimeoutException)
+            if (timeout is null && !ct.CanBeCanceled)
             {
-                throw XpcException.Timeout($"XPC timeout for request to {_serviceName}/{request.Route}");
+                return await sendTask.ConfigureAwait(false);
             }
 
-            throw;
+            try
+            {
+                return timeout is { } budget
+                    ? await sendTask.WaitAsync(budget, ct).ConfigureAwait(false)
+                    : await sendTask.WaitAsync(ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is TimeoutException || ex is OperationCanceledException)
+            {
+                // Safe unconditionally, unlike RunWithTimeoutAsync's shared connection: nothing else
+                // ever sends on this connection, so cancelling it here can never race or
+                // collateral-damage a concurrent call. Also safe regardless of whether the abandoned
+                // send task's own finally has already run: this call holds the awaiting-scope retain
+                // taken above, which SendSyncDedicated's finally never touches, so the handle is
+                // guaranteed live here even if the send task raced ahead and already released its
+                // own reference.
+                XpcNative.xpc_connection_cancel(handle);
+                ObserveAbandoned(sendTask);
+
+                if (ex is TimeoutException)
+                {
+                    throw XpcException.Timeout($"XPC timeout for request to {_serviceName}/{request.Route}");
+                }
+
+                throw;
+            }
+        }
+        finally
+        {
+            // Balances the awaiting-scope retain taken above — released on every exit path (fast
+            // path, successful wait, and the timeout/ct catch above) regardless of what the
+            // abandoned send task's own finally does with its own separate reference.
+            XpcNative.xpc_release(handle);
         }
     }
 
@@ -292,7 +319,11 @@ internal sealed class XpcClient : IDisposable
     /// <summary>The dedicated-connection counterpart of <see cref="SendSync"/>: same blocking call
     /// and the same reply decoding (<see cref="DecodeReply"/>), but <paramref name="connection"/> is
     /// single-use, so unlike <see cref="SendSync"/> this always cancels it — not just releases the
-    /// retain — regardless of outcome, since nothing will ever send on it again.</summary>
+    /// retain — regardless of outcome, since nothing will ever send on it again. This releases only
+    /// the send task's own reference: <see cref="SendOnDedicatedConnectionAsync"/> holds a second,
+    /// awaiting-scope reference of its own (taken right after activation) that this method never
+    /// touches, so the handle stays live for that caller's own cancel/release even if this method's
+    /// finally has already run.</summary>
     private XpcDictionary SendSyncDedicated(Connection connection, XpcMessage request)
     {
         try

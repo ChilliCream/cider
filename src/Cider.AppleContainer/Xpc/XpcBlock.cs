@@ -30,8 +30,16 @@ namespace Cider.AppleContainer.Xpc;
 /// <c>XpcClient</c>/<c>XpcListener</c> both call it from their terminal
 /// <c>XPC_ERROR_CONNECTION_INVALID</c> handler, which runs on this exact call stack. Freeing memory
 /// the CPU is actively executing code from is undefined behavior, not merely racy, so a connection's
-/// event-handler block is leaked once per connection generation rather than freed there — connections
-/// are recreated only on reconnect/apiserver-restart, not per call, so this is bounded.
+/// event-handler block is leaked rather than freed there. On the shared connection that is bounded by
+/// reconnect frequency (a fresh generation only on reconnect/apiserver-restart, not per call), but
+/// <c>SendOnDedicatedConnectionAsync</c> allocates a fresh single-use connection — and block — on
+/// every dedicated-connection call (<c>containerWait</c>/<c>Logs</c>/<c>Dial</c>), so in aggregate
+/// this is one ~48-byte block+descriptor leaked per shared-connection generation *and* per dedicated
+/// call: unbounded over the process's lifetime, though tiny per call, and only ever stopped from
+/// routing (not freed) by <see cref="Detach"/>. If this needs to actually be bounded later, the
+/// candidate fix is deferring the free to just after the terminal <c>XPC_ERROR_CONNECTION_INVALID</c>
+/// event returns from its own invoke (e.g. one GC-visible tick later) rather than from inside it —
+/// not implemented here.
 /// </summary>
 internal static unsafe class XpcBlock
 {
