@@ -1,0 +1,155 @@
+[
+  {
+    "configuration": {
+      "id": "dualstack-app",
+      "image": {
+        "reference": "docker.io/library/alpine:3.20",
+        "descriptor": {
+          "mediaType": "application/vnd.oci.image.index.v1+json",
+          "digest": "sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc",
+          "size": 9226
+        }
+      },
+      "initProcess": {
+        "executable": "sleep",
+        "arguments": ["60"],
+        "environment": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+        "workingDirectory": "/",
+        "terminal": false,
+        "user": { "id": { "uid": 0, "gid": 0 } },
+        "supplementalGroups": [],
+        "rlimits": []
+      },
+      "mounts": [],
+      "publishedPorts": [],
+      "publishedSockets": [],
+      "labels": {},
+      "sysctls": {},
+      "networks": [{ "network": "default", "options": { "hostname": "dualstack-app", "mtu": 1280 } }],
+      "dns": { "nameservers": [], "searchDomains": [], "options": [] },
+      "rosetta": false,
+      "platform": { "os": "linux", "architecture": "arm64" },
+      "resources": { "cpus": 4, "memoryInBytes": 1073741824, "cpuOverhead": 1 },
+      "runtimeHandler": "container-runtime-linux",
+      "virtualization": false,
+      "ssh": false,
+      "readOnly": false,
+      "useInit": false,
+      "capAdd": [],
+      "capDrop": [],
+      "creationDate": 809330969.025174
+    },
+    "status": "running",
+    "networks": [
+      {
+        "network": "default",
+        "hostname": "dualstack-app",
+        "ipv4Address": "192.168.64.2/24",
+        "ipv4Gateway": "192.168.64.1",
+        "ipv6Address": "fd3e:bc7a:df05:1995:f4b2:c1ff:fe2d:3baa/64",
+        "macAddress": "f6:b2:c1:2d:3b:aa",
+        "variant": "reserved"
+      }
+    ],
+    "startedDate": 809331000.5
+  },
+  {
+    "configuration": {
+      "id": "stopped-app",
+      "image": {
+        "reference": "docker.io/library/alpine:3.20",
+        "descriptor": {
+          "mediaType": "application/vnd.oci.image.index.v1+json",
+          "digest": "sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc",
+          "size": 9226
+        }
+      },
+      "initProcess": {
+        "executable": "sleep",
+        "arguments": ["60"],
+        "environment": [],
+        "workingDirectory": "/",
+        "terminal": false,
+        "user": { "id": { "uid": 0, "gid": 0 } },
+        "supplementalGroups": [],
+        "rlimits": []
+      },
+      "mounts": [],
+      "publishedPorts": [],
+      "publishedSockets": [],
+      "labels": {},
+      "sysctls": {},
+      "networks": [{ "network": "default", "options": { "hostname": "stopped-app", "mtu": 1280 } }],
+      "dns": { "nameservers": [], "searchDomains": [], "options": [] },
+      "rosetta": false,
+      "platform": { "os": "linux", "architecture": "arm64" },
+      "resources": { "cpus": 4, "memoryInBytes": 1073741824, "cpuOverhead": 1 },
+      "runtimeHandler": "container-runtime-linux",
+      "virtualization": false,
+      "ssh": false,
+      "readOnly": false,
+      "useInit": false,
+      "capAdd": [],
+      "capDrop": [],
+      "creationDate": 809330000.0
+    },
+    "status": "stopped",
+    "networks": []
+  },
+  {
+    "configuration": {
+      "id": "mount-port-app",
+      "image": {
+        "reference": "docker.io/library/alpine:3.20",
+        "descriptor": {
+          "mediaType": "application/vnd.oci.image.index.v1+json",
+          "digest": "sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc",
+          "size": 9226
+        }
+      },
+      "initProcess": {
+        "executable": "/bin/sh",
+        "arguments": ["-c", "sleep 3600"],
+        "environment": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+        "workingDirectory": "/",
+        "terminal": false,
+        "user": { "id": { "uid": 0, "gid": 0 } },
+        "supplementalGroups": [],
+        "rlimits": []
+      },
+      "mounts": [
+        { "type": { "virtiofs": {} }, "source": "/Users/michael/data", "destination": "/data", "options": ["ro"] },
+        { "type": { "tmpfs": {} }, "source": "tmpfs", "destination": "/run", "options": [] }
+      ],
+      "publishedPorts": [
+        { "hostAddress": "0.0.0.0", "hostPort": 8080, "containerPort": 80, "proto": "tcp", "count": 1 }
+      ],
+      "publishedSockets": [],
+      "labels": { "com.chillicream.cider.system": "app" },
+      "sysctls": {},
+      "networks": [{ "network": "default", "options": { "hostname": "mount-port-app", "mtu": 1280 } }],
+      "dns": { "nameservers": ["1.1.1.1"], "searchDomains": [], "options": [] },
+      "rosetta": false,
+      "platform": { "os": "linux", "architecture": "arm64" },
+      "resources": { "cpus": 2, "memoryInBytes": 1073741824, "cpuOverhead": 1 },
+      "runtimeHandler": "container-runtime-linux",
+      "virtualization": false,
+      "ssh": false,
+      "readOnly": false,
+      "useInit": false,
+      "capAdd": [],
+      "capDrop": [],
+      "creationDate": 809330969.025174
+    },
+    "status": "running",
+    "networks": [
+      {
+        "network": "default",
+        "hostname": "mount-port-app",
+        "ipv4Address": "192.168.64.5/24",
+        "ipv4Gateway": "192.168.64.1"
+      }
+    ],
+    "startedDate": 809331500.0
+  }
+]

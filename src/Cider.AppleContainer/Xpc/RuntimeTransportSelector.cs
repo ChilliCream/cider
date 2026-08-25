@@ -15,19 +15,22 @@ public sealed record RuntimeSelection(IContainerRuntime Runtime, RuntimeCapabili
 /// for the runtime and its capabilities through here — no other type constructs the CLI fallback
 /// runtime for daemon use.
 ///
-/// Until cider-ede.5 lands <c>XpcContainerRuntime</c>, <see cref="RuntimeSelection.Runtime"/> is
-/// always the CLI-backed <see cref="AppleContainerRuntime"/>, even when
-/// <see cref="RuntimeSelection.Capabilities"/> reports <see cref="RuntimeTransportKind.Xpc"/>: the
-/// version-gate decision and its logging already run for real (task item 4 — "the selector returns
-/// the CLI runtime for now but already performs the ping/version logic and logs it, so this task is
-/// testable alone"), but nothing yet exists to make an XPC decision behave differently for a caller
-/// of <see cref="RuntimeSelection.Runtime"/>. cider-ede.5 is expected to swap that runtime construction
-/// for a real <c>XpcContainerRuntime</c> when the decision is <see cref="RuntimeTransportKind.Xpc"/>.
+/// When the decision is <see cref="RuntimeTransportKind.Xpc"/>, <see cref="RuntimeSelection.Runtime"/>
+/// is a <c>XpcContainerRuntime</c> wrapping the CLI-backed <see cref="AppleContainerRuntime"/> as its
+/// own fallback (task cider-ede.5's fix direction §1) — every read that runtime has not yet ported,
+/// and every write (write paths are cider-ede.6+), still ultimately runs over the CLI, transparently.
 /// </summary>
 public static class RuntimeTransportSelector
 {
     /// <summary>docs/spikes/xpc/02-apiserver-xpc-protocol.md §1.1.</summary>
     internal const string ApiServerService = "com.apple.container.apiserver";
+
+    /// <summary>The separate images-service mach service (docs/spikes/xpc/02-apiserver-xpc-protocol.md
+    /// §1.1): <c>ClientImage</c>/<c>RemoteContentStoreClient</c> never talk to
+    /// <see cref="ApiServerService"/>. Not yet used by any route this task ports (image routes are
+    /// cider-ede.10) — the client is constructed here regardless so <c>XpcContainerRuntime</c> already
+    /// owns it and later tasks do not need to touch this wiring.</summary>
+    internal const string ImagesService = "com.apple.container.core.container-core-images";
 
     /// <summary><c>ping</c>'s own timeout (task fix direction §2; also
     /// docs/spikes/xpc/02-apiserver-xpc-protocol.md line 86, "ping from system status").</summary>
@@ -82,9 +85,8 @@ public static class RuntimeTransportSelector
         ArgumentNullException.ThrowIfNull(loggerFactory);
 
         var logger = loggerFactory.CreateLogger("Cider.AppleContainer.Xpc.RuntimeTransportSelector");
-        var cli = new AppleContainerRuntime(
-            new AppleContainerOptions { CliPath = options.ContainerCliPath, TmpDir = options.TmpDir },
-            loggerFactory.CreateLogger<AppleContainerRuntime>());
+        var appleOptions = new AppleContainerOptions { CliPath = options.ContainerCliPath, TmpDir = options.TmpDir };
+        var cli = new AppleContainerRuntime(appleOptions, loggerFactory.CreateLogger<AppleContainerRuntime>());
 
         var requested = ParseRequestedTransport(options.RuntimeTransport);
         if (requested == RequestedTransport.Cli)
@@ -162,13 +164,23 @@ public static class RuntimeTransportSelector
             "runtime transport: xpc, apiserver {Version} ({Build} {Commit}), min {Minimum}, tested {Tested}",
             version.Semver, version.Build, version.Commit, ApiServerVersion.Minimum, ApiServerVersion.Tested);
 
-        return new RuntimeSelection(cli, new RuntimeCapabilities
+        var capabilities = new RuntimeCapabilities
         {
             Transport = RuntimeTransportKind.Xpc,
             ApiServerVersion = version,
             NetworkCreate = NetworkCreateSupported(),
             MaskedPaths = version.Semver >= MaskedPathsMinimum,
-        });
+        };
+
+        var runtime = new XpcContainerRuntime(
+            cli,
+            new XpcClient(ApiServerService, loggerFactory.CreateLogger("Cider.AppleContainer.Xpc.XpcClient[apiserver]")),
+            new XpcClient(ImagesService, loggerFactory.CreateLogger("Cider.AppleContainer.Xpc.XpcClient[images]")),
+            capabilities,
+            appleOptions,
+            loggerFactory.CreateLogger<XpcContainerRuntime>());
+
+        return new RuntimeSelection(runtime, capabilities);
     }
 
     /// <summary>Sends one <c>ping</c> on its own short-lived client. Returns <c>(null, reason)</c> on
