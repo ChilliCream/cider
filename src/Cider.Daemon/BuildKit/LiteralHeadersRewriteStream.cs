@@ -247,8 +247,13 @@ internal sealed class LiteralHeadersRewriteStream : Stream
     /// bookkeeping, and — since this repeats the one field buildkitd's session manager needs many
     /// copies of — never accidentally re-indexes a later value onto an earlier one's table slot the
     /// way an indexing representation could.
+    /// <para>
+    /// Internal rather than private solely so <c>LiteralHeadersRewriteStreamTests</c> can call it
+    /// directly instead of reaching it through reflection (<c>InternalsVisibleTo("Cider.Tests")</c>,
+    /// see <c>Install/AssemblyInfo.cs</c>) — it carries no public contract of its own.
+    /// </para>
     /// </summary>
-    private static byte[] EncodeLiteralFields(IReadOnlyList<(string Name, string Value)> fields)
+    internal static byte[] EncodeLiteralFields(IReadOnlyList<(string Name, string Value)> fields)
     {
         using var block = new MemoryStream();
         foreach (var (name, value) in fields)

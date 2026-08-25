@@ -373,6 +373,61 @@ public sealed class SessionBridgeTests : IAsyncLifetime
         handle.Release();
     }
 
+    /// <summary>
+    /// cider-ger.16 comment #43 follow-up: <see cref="SessionBridge.OpenAsync"/> used to dispose the
+    /// per-attach exec process (<c>owner</c>), channel, invoker and handler only for
+    /// <see cref="RpcException"/>/<see cref="IOException"/>/<see cref="InvalidOperationException"/> --
+    /// any other exception between a successful <see cref="IRawSessionDialer.DialAsync"/> and
+    /// <see cref="SessionBridgeHandle"/> construction leaked all of it. This drives that exact
+    /// scenario organically rather than by injecting a fault: <see cref="NullDuplexRawSessionDialer"/>
+    /// "succeeds" (DialAsync returns, so <c>owner</c> is genuinely assigned in <c>OpenAsync</c>'s
+    /// scope, exactly like a real dial) but hands back a <see langword="null"/> duplex stream, which
+    /// <see cref="LiteralHeadersRewriteStream"/>'s own constructor immediately rejects with
+    /// <see cref="ArgumentNullException"/> -- a type the old narrow catch filter did not cover.
+    /// Asserts the tracked owner's <see cref="IAsyncDisposable.DisposeAsync"/> ran anyway.
+    /// </summary>
+    [Fact]
+    public async Task AttachAsync_disposes_the_owner_when_an_uncovered_exception_follows_a_successful_dial()
+    {
+        var owner = new TrackedOwner();
+        var dialer = new NullDuplexRawSessionDialer(owner);
+        var bridge = new SessionBridge(
+            _daemon.Services.GetRequiredService<TunnelTransport>(),
+            _daemon.Services.GetRequiredService<CiderOptions>(),
+            dialer,
+            _daemon.Services.GetRequiredService<ILogger<SessionBridge>>());
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            async () => await bridge.AttachAsync(_cliSession, _link, CancellationToken.None));
+
+        Assert.True(owner.Disposed);
+    }
+
+    /// <summary>An <see cref="IAsyncDisposable"/> that records whether it was disposed.</summary>
+    private sealed class TrackedOwner : IAsyncDisposable
+    {
+        public bool Disposed { get; private set; }
+
+        public ValueTask DisposeAsync()
+        {
+            Disposed = true;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// An <see cref="IRawSessionDialer"/> whose <see cref="DialAsync"/> completes successfully --
+    /// exactly like a real dial, so the caller's <c>owner</c> local is genuinely assigned -- but hands
+    /// back a <see langword="null"/> duplex stream, which is not something a real dialer would ever
+    /// do but stands in for any exception <see cref="SessionBridge.OpenAsync"/> can hit between a
+    /// completed dial and handle construction that is not one of the three specifically-caught types.
+    /// </summary>
+    private sealed class NullDuplexRawSessionDialer(IAsyncDisposable owner) : IRawSessionDialer
+    {
+        public Task<(Stream Duplex, IAsyncDisposable Owner)> DialAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<(Stream, IAsyncDisposable)>((null!, owner));
+    }
+
     private async Task<WebApplication> CreateHostAsync(Action<IServiceCollection> configureServices, Action<WebApplication> map)
     {
         var builder = WebApplication.CreateSlimBuilder();

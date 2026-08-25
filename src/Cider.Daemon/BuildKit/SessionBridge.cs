@@ -171,6 +171,7 @@ public sealed class SessionBridge
         GrpcChannel? channel = null;
         HttpMessageInvoker? invoker = null;
         AsyncDuplexStreamingCall<BytesMessage, BytesMessage>? call = null;
+        var handedOff = false;
         try
         {
             // A dedicated connection, not link.CallInvoker's shared one -- see IRawSessionDialer's
@@ -193,32 +194,44 @@ public sealed class SessionBridge
             var serveTask = _tunnel.ServeAsync(bytesStream, TunnelKind.Session, cli.Id, cancellationToken: tunnelCts.Token);
 
             var handle = new SessionBridgeHandle(this, cli, call, bytesStream, tunnelCts, serveTask, channel, invoker, handler, owner, _logger);
+            handedOff = true;
             _logger.LogDebug("attached session bridge {SessionId} ({MethodCount} methods)", cli.Id, methods.Count);
             return handle;
         }
         catch (Exception ex) when (ex is RpcException or IOException or InvalidOperationException)
         {
             _logger.LogWarning(ex, "buildkitd rejected the session bridge for {SessionId}", cli.Id);
-            call?.Dispose();
-            invoker?.Dispose();
-            if (channel is not null)
-            {
-                try
-                {
-                    await channel.ShutdownAsync().ConfigureAwait(false);
-                }
-                catch (Exception shutdownEx) when (shutdownEx is InvalidOperationException or ObjectDisposedException)
-                {
-                }
-            }
-
-            handler?.Dispose();
-            if (owner is not null)
-            {
-                await owner.DisposeAsync().ConfigureAwait(false);
-            }
-
             throw;
+        }
+        finally
+        {
+            // Unconditional: SessionBridgeHandle is the only thing that takes ownership of
+            // call/invoker/channel/handler/owner (via its own DisposeAsync), so ANY exception between
+            // a successful DialAsync and the handle actually being constructed -- not just the three
+            // types the catch above logs specially -- must dispose everything dialed so far here, or
+            // it leaks (the per-attach exec process behind `owner` included). `handedOff` is set the
+            // instant the handle exists, so this is a no-op on the success path.
+            if (!handedOff)
+            {
+                call?.Dispose();
+                invoker?.Dispose();
+                if (channel is not null)
+                {
+                    try
+                    {
+                        await channel.ShutdownAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception shutdownEx) when (shutdownEx is InvalidOperationException or ObjectDisposedException)
+                    {
+                    }
+                }
+
+                handler?.Dispose();
+                if (owner is not null)
+                {
+                    await owner.DisposeAsync().ConfigureAwait(false);
+                }
+            }
         }
     }
 

@@ -1,4 +1,3 @@
-using System.Reflection;
 using System.Text;
 using Cider.Daemon.BuildKit;
 using Xunit;
@@ -42,6 +41,13 @@ public sealed class LiteralHeadersRewriteStreamTests
         var actual = InvokeEncodeLiteralFields(fields);
         var expected = HandEncodeLiteralNewName(fields);
 
+        // NOTE: expected is produced by HandEncodeLiteralNewName, which structurally mirrors
+        // EncodeLiteralFields rather than being an independent implementation -- this equality only
+        // pins the current encoding against accidental change (a refactor that silently alters the
+        // byte layout), it does not by itself prove HPACK-spec correctness. That correctness comes
+        // from the decode round trip right below (a decoder written to the RFC 7541 spec, not to this
+        // class's internals) and from the Kestrel-decoded header assertions in
+        // SessionBridgeTests/ControlProxyTests, which exercise a real HPACK decoder end to end.
         Assert.Equal(expected, actual);
 
         // Every field is "Literal Header Field without Indexing -- New Name" (indicator byte 0x00),
@@ -249,18 +255,18 @@ public sealed class LiteralHeadersRewriteStreamTests
         return frame;
     }
 
-    private static byte[] InvokeEncodeLiteralFields(IReadOnlyList<(string Name, string Value)> fields)
-    {
-        var method = typeof(LiteralHeadersRewriteStream).GetMethod(
-            "EncodeLiteralFields", BindingFlags.NonPublic | BindingFlags.Static)
-            ?? throw new InvalidOperationException("cider: LiteralHeadersRewriteStream.EncodeLiteralFields not found -- test needs updating");
-        return (byte[])method.Invoke(null, [fields])!;
-    }
+    private static byte[] InvokeEncodeLiteralFields(IReadOnlyList<(string Name, string Value)> fields) =>
+        LiteralHeadersRewriteStream.EncodeLiteralFields(fields);
 
     /// <summary>
-    /// An independent (from production code) hand encoder for exactly the representation
-    /// <c>EncodeLiteralFields</c> is documented to produce -- RFC 7541 §6.2.2 "Literal Header Field
-    /// without Indexing -- New Name" for every field, un-Huffman-coded string literals throughout.
+    /// A hand encoder for exactly the representation <c>EncodeLiteralFields</c> is documented to
+    /// produce -- RFC 7541 §6.2.2 "Literal Header Field without Indexing -- New Name" for every field,
+    /// un-Huffman-coded string literals throughout. This structurally mirrors the production helpers
+    /// it is pinning byte-for-byte (see <see cref="EncodeLiteralFields_produces_exact_expected_HPACK_bytes_for_repeated_keys"/>'s
+    /// own doc comment for what that equality assertion does and does not prove); it is not an
+    /// independent implementation, and spec correctness is carried elsewhere -- by
+    /// <see cref="DecodeLiteralNewNameFields"/>'s round trip below and by the Kestrel-decoded
+    /// assertions in <c>SessionBridgeTests</c>/<c>ControlProxyTests</c>.
     /// </summary>
     private static byte[] HandEncodeLiteralNewName(IReadOnlyList<(string Name, string Value)> fields)
     {
