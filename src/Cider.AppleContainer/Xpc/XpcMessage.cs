@@ -65,6 +65,8 @@ internal sealed class XpcMessage : IDisposable
 
     public int DupFd(string key) => _dict.DupFd(key);
 
+    public int DupArrayFd(string key, int index) => _dict.DupArrayFd(key, index);
+
     public void SetValue(string key, XpcObject value) => _dict.SetValue(key, value);
 
     public bool ContainsKey(string key) => _dict.ContainsKey(key);

@@ -101,6 +101,23 @@ internal sealed class XpcDictionary : XpcObject
     /// <summary>Duplicates the fd the peer placed at <paramref name="key"/> into this process.</summary>
     public int DupFd(string key) => Use(h => XpcNative.xpc_dictionary_dup_fd(h, key));
 
+    /// <summary>Duplicates the fd at <paramref name="index"/> of the xpc array stored at
+    /// <paramref name="key"/> into this process — <c>containerLogs</c>'s two-fd <c>logs</c> array
+    /// (docs/spikes/xpc/02-apiserver-xpc-protocol.md §8.10: <c>xpc_array_dup_fd(logs, 0)</c> for
+    /// <c>stdio.log</c>, <c>(logs, 1)</c> for <c>vminitd.log</c>). The array is dictionary-owned —
+    /// <see cref="Use{T}"/> pins this dictionary alive for the duration of the call, which keeps the
+    /// array valid too.</summary>
+    public int DupArrayFd(string key, int index) => Use(h =>
+    {
+        var array = XpcNative.xpc_dictionary_get_value(h, key);
+        if (array == 0)
+        {
+            throw new InvalidOperationException($"xpc reply carried no '{key}' array");
+        }
+
+        return XpcNative.xpc_array_dup_fd(array, (nuint)index);
+    });
+
     /// <summary>Stores a raw <c>xpc_object_t</c> value (an endpoint, a nested array/dictionary, …)
     /// under <paramref name="key"/> without taking ownership away from <paramref name="value"/>.</summary>
     public void SetValue(string key, XpcObject value) =>

@@ -1,4 +1,5 @@
 using System.Globalization;
+using Cider.Daemon.Hosting;
 using Cider.E2E.Tests.Infrastructure;
 using Xunit;
 
@@ -132,6 +133,72 @@ public sealed class LifecycleTests(DaemonFixture daemon)
         finally
         {
             await daemon.DockerAsync(["rm", "-f", name], timeout: TimeSpan.FromMinutes(2));
+        }
+    }
+
+    /// <summary>
+    /// cider-ede.9: <c>docker logs</c> for a container the Apple CLI started directly (never went
+    /// through cider's own <c>LogStore</c> capture — <c>ContainerManager.LogsAsync</c>,
+    /// <c>_logs.HasCapture</c> is false) reads the apiserver's merged <c>stdio.log</c> fd through
+    /// <c>XpcContainerRuntime.OpenLogsAsync</c> (docs/spikes/xpc/02-apiserver-xpc-protocol.md §8.10),
+    /// exactly like today's CLI-fallback behaviour (docs/spikes/xpc/03-limitations-audit-1.3.md "Logs
+    /// merged for containers the daemon did not start" row) — and <c>docker logs -f</c> ends once the
+    /// container stops, even though the merged file itself never signals that on its own
+    /// (<see cref="Cider.AppleContainer.Xpc.XpcContainerRuntime"/>'s stop-watcher supplies it).
+    /// </summary>
+    [E2EFact]
+    public async Task Logs_on_a_container_started_outside_cider_read_the_merged_apiserver_file()
+    {
+        var name = DaemonFixture.NewName("ext");
+        var run = await Cmd.RunAsync(
+            "container",
+            ["run", "-d", "--name", name, Image, "sh", "-c", "echo hi; sleep 30"],
+            timeout: TimeSpan.FromMinutes(4));
+        Assert.True(run.Ok, run.ToString());
+
+        try
+        {
+            // cider never created this container — StatePoller only reconciles records it already
+            // has (StatePoller.PollOnceAsync: EnumerateRecords), so a container the Apple CLI
+            // started directly is only adopted by an explicit sync — POST /_cider/sync, the
+            // endpoint behind `cider sync` (StateSynchronizer, SyncTests.PostSyncAsync).
+            using (var client = DaemonClient.Create(daemon.Options.SocketPath, TimeSpan.FromMinutes(2)))
+            using (var sync = await client.PostAsync(new Uri("/_cider/sync", UriKind.Relative), content: null))
+            {
+                var body = await sync.Content.ReadAsStringAsync();
+                Assert.True(sync.IsSuccessStatusCode, $"POST /_cider/sync -> {(int)sync.StatusCode}: {body}");
+            }
+
+            var ps = await daemon.DockerAsync(["ps", "-a", "--format", "{{.Names}}"], timeout: TimeSpan.FromSeconds(30));
+            Assert.True(ps.Ok, ps.ToString());
+            Assert.Contains(name, ps.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
+            var sawHi = await DaemonFixture.EventuallyAsync(
+                async () =>
+                {
+                    var logs = await daemon.DockerAsync("logs", name);
+                    return logs.Ok && logs.Stdout.Contains("hi", StringComparison.Ordinal);
+                },
+                TimeSpan.FromSeconds(30));
+            var final = await daemon.DockerAsync("logs", name);
+            Assert.True(sawHi, "expected 'hi' from the foreign container's merged apiserver log: " + final);
+
+            // docker logs -f must end on its own once the container stops — the stop-watcher polls
+            // containerList and calls FollowingFileStream.Stop the moment it is no longer running.
+            var followTask = daemon.DockerAsync(["logs", "-f", name], timeout: TimeSpan.FromSeconds(45));
+            await Task.Delay(TimeSpan.FromSeconds(1));
+
+            var stop = await Cmd.RunAsync("container", ["stop", name], timeout: TimeSpan.FromSeconds(60));
+            Assert.True(stop.Ok, stop.ToString());
+
+            var follow = await followTask;
+            Assert.True(follow.Ok, follow.ToString());
+            Assert.Contains("hi", follow.Stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await daemon.DockerAsync(["rm", "-f", name], timeout: TimeSpan.FromMinutes(2));
+            await Cmd.RunAsync("container", ["delete", "-f", name], timeout: TimeSpan.FromSeconds(30));
         }
     }
 }
