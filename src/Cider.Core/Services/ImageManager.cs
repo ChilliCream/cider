@@ -766,10 +766,39 @@ public sealed class ImageManager
 
             try
             {
-                // Apple's `image delete` only resolves a *reference*, not a bare digest (see
-                // RuntimeReferenceFor) — a dangling image's synthetic tag is exactly such a
-                // reference, so it must be used here too or the delete silently fails below.
-                await _runtime.RemoveImageAsync(RuntimeReferenceFor(image, image.Id), false, ct).ConfigureAwait(false);
+                // Apple's `image delete <ref>` only resolves a *reference*, not a bare digest (see
+                // RuntimeReferenceFor), and it drops just that one reference — it only reclaims the
+                // blobs once the last reference is gone (see RemoveAsync's `deleteAll` loop, which
+                // this mirrors). A dangling image can carry several duplicate `cider-build-*` tags
+                // that all resolved to the same content digest (the same untagged Dockerfile built
+                // more than once); removing only the first of them left the digest alive under the
+                // rest, so it kept reappearing as dangling until as many more `prune -f` calls as it
+                // had leftover tags. Every reference has to go for the image to actually disappear.
+                var targets = image.References.Count > 0
+                    ? image.References.Select(NormalizedOf).Distinct(StringComparer.Ordinal).ToList()
+                    : [RuntimeReferenceFor(image, image.Id)];
+
+                RuntimeException? missing = null;
+                var removedAny = false;
+                foreach (var target in targets)
+                {
+                    try
+                    {
+                        await _runtime.RemoveImageAsync(target, false, ct).ConfigureAwait(false);
+                        removedAny = true;
+                    }
+                    catch (RuntimeException ex) when (ex.Kind == RuntimeErrorKind.NotFound)
+                    {
+                        // A reference the runtime no longer knows is not a failure as long as one of
+                        // the others did remove the image.
+                        missing ??= ex;
+                    }
+                }
+
+                if (!removedAny && missing is not null)
+                {
+                    throw missing;
+                }
             }
             catch (RuntimeException)
             {

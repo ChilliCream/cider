@@ -8,6 +8,7 @@ using Cider.Core.Configuration;
 using Cider.Core.DockerApi;
 using Cider.Core.DockerApi.Models;
 using Cider.Core.Events;
+using Cider.Core.Ids;
 using Cider.Core.Runtime;
 using Cider.Core.Services;
 using Cider.Tests.Fakes;
@@ -798,6 +799,53 @@ public sealed class ImageManagerTests : IDisposable
         var delete = Assert.Single(runtime.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
         Assert.DoesNotContain("sha256:", delete, StringComparison.Ordinal);
         Assert.Contains("cider-build-", delete, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PruneAsync_DuplicateSyntheticBuildTagsSharingOneDigest_AllGoInOneCall()
+    {
+        // cider-ger.17: building the exact same untagged Dockerfile content twice in one daemon
+        // instance leaves one digest carrying two `cider-build-*` synthetic tags (Apple lists one
+        // row per reference, merged into a single RuntimeImage with two References here). Real
+        // Docker's `image prune -f` clears every dangling reference for that digest in one call;
+        // before this fix ImageManager only ever removed the *first* reference
+        // (RuntimeReferenceFor's FirstOrDefault), so the digest survived under the second tag and
+        // kept reappearing as dangling until a second `prune -f`.
+        var (manager, runtime) = CreateManager();
+        var imageId = "sha256:" + new string('d', 64);
+        var tagA = SyntheticBuildTag.New();
+        var tagB = SyntheticBuildTag.New();
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = imageId,
+            References = [tagA, tagB],
+            Size = 1_000,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+            Layers = ["layer-dup-1"],
+        });
+
+        var response = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
+
+        // One prune call reports the digest deleted exactly once…
+        Assert.Single(response.ImagesDeleted, i => i.Deleted == imageId);
+
+        // …and both underlying tags actually went, so the digest is gone for good — not merely
+        // down to one leftover reference that would still be dangling.
+        var removeCalls = runtime.Calls.Where(c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal)).ToList();
+        Assert.Equal(2, removeCalls.Count);
+        Assert.Contains(removeCalls, c => c.Contains(tagA, StringComparison.Ordinal));
+        Assert.Contains(removeCalls, c => c.Contains(tagB, StringComparison.Ordinal));
+
+        var ex = await Assert.ThrowsAsync<DockerApiException>(
+            () => manager.InspectAsync(imageId, CancellationToken.None));
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, ex.Status);
+
+        // A second prune call must find nothing left to do — the whole point of the fix.
+        var second = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
+        Assert.DoesNotContain(second.ImagesDeleted, i => i.Deleted == imageId);
     }
 
     [Fact]
