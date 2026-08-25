@@ -10,6 +10,13 @@ public static class LaunchdInstaller
     private const string PathEnvironmentValue = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
     /// <summary>
+    /// launchd.plist(5): "Interactive jobs run with the same resource limitations as apps, i.e.
+    /// none." Anything else (Background/Standard/Adaptive) makes macOS throttle CPU/IO for this
+    /// process and every child it spawns -- including every `container` CLI call cider makes.
+    /// </summary>
+    private const string ProcessTypeValue = "Interactive";
+
+    /// <summary>
     /// Runs an external command (<c>launchctl</c>, <c>id</c>). Production is <see cref="ProcessRunner.RunAsync"/>;
     /// tests substitute a stub so the uninstall wiring can be exercised without touching the machine's launchd.
     /// </summary>
@@ -83,7 +90,7 @@ public static class LaunchdInstaller
         sb.Append("\t</dict>\n");
 
         AppendKey(sb, "ProcessType");
-        AppendString(sb, "Background");
+        AppendString(sb, ProcessTypeValue);
 
         AppendKey(sb, "WorkingDirectory");
         AppendString(sb, options.DataDir);
@@ -109,10 +116,25 @@ public static class LaunchdInstaller
             var plistPath = PlistPath(options.Label);
             var plistDir = Path.GetDirectoryName(plistPath)!;
             Directory.CreateDirectory(plistDir);
+
+            // Read the previous plist's ProcessType (if any) before it's overwritten below, so we
+            // can tell the user when a stale Background-QoS install is about to be fixed.
+            string? previousProcessType = null;
+            if (File.Exists(plistPath))
+            {
+                previousProcessType = ExtractProcessType(await File.ReadAllTextAsync(plistPath, ct).ConfigureAwait(false));
+            }
+
             var plistXml = GeneratePlist(options);
             await File.WriteAllTextAsync(plistPath, plistXml, ct).ConfigureAwait(false);
             steps.Add($"Wrote plist: {plistPath}");
             Log(log, steps[^1]);
+
+            if (previousProcessType is not null && !string.Equals(previousProcessType, ProcessTypeValue, StringComparison.Ordinal))
+            {
+                steps.Add($"ProcessType changed: {previousProcessType} -> {ProcessTypeValue} (restarting the daemon so the new resource class takes effect)");
+                Log(log, steps[^1]);
+            }
 
             var uid = await GetUidAsync(RunExternalAsync, ct).ConfigureAwait(false);
             var target = $"gui/{uid}/{options.Label}";
@@ -335,6 +357,36 @@ public static class LaunchdInstaller
         }
 
         return (running, pid, lastExitStatus);
+    }
+
+    /// <summary>
+    /// Pulls the &lt;string&gt; value that follows &lt;key&gt;ProcessType&lt;/key&gt; out of a plist's XML,
+    /// or <c>null</c> if the key isn't present. Used to detect and report a stale ProcessType from a
+    /// previous install rather than relying on a full XML parser for one field.
+    /// </summary>
+    internal static string? ExtractProcessType(string plistXml)
+    {
+        const string keyTag = "<key>ProcessType</key>";
+        var keyIndex = plistXml.IndexOf(keyTag, StringComparison.Ordinal);
+        if (keyIndex < 0)
+        {
+            return null;
+        }
+
+        var stringStart = plistXml.IndexOf("<string>", keyIndex + keyTag.Length, StringComparison.Ordinal);
+        if (stringStart < 0)
+        {
+            return null;
+        }
+        stringStart += "<string>".Length;
+
+        var stringEnd = plistXml.IndexOf("</string>", stringStart, StringComparison.Ordinal);
+        if (stringEnd < 0)
+        {
+            return null;
+        }
+
+        return plistXml[stringStart..stringEnd];
     }
 
     private static async Task<bool> WaitForSocketAsync(string socketPath, TimeSpan timeout, CancellationToken ct)

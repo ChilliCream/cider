@@ -76,7 +76,13 @@ This writes a per-user launchd agent at
 restarts it after a non-zero exit), bootstraps and kickstarts it under `gui/<uid>`, waits up to 10 s
 for the socket to appear, and — unless `--no-context` — creates a `cider` docker context. It does
 **not** switch your current context, and it does **not** touch `/var/run/docker.sock` unless you ask.
-<!-- LaunchdInstaller.cs:30 plist path, :62-69 RunAtLoad/KeepAlive, :150 setCurrent:false; Models.cs:11 Label "com.chillicream.cider.daemon", :12 ContextName "cider" -->
+
+The plist sets `ProcessType` to `Interactive`, not the launchd default. Every container operation
+cider runs is a child `container` CLI process, and macOS applies background CPU/IO throttling to a
+job's whole process tree, not just the job itself — an interactive-class job is the only one launchd
+never throttles. Re-running `cider install` rewrites the plist and restarts the job, so it also fixes
+an older install that was still on the throttled class.
+<!-- LaunchdInstaller.cs:36 plist path, :68-75 RunAtLoad/KeepAlive, :172 setCurrent:false; Models.cs:11 Label "com.chillicream.cider.daemon", :12 ContextName "cider" -->
 
 The other verbs:
 
@@ -392,6 +398,17 @@ Orphaned `cider-dns-*` CoreDNS forwarders come from the same mechanism and are r
 Check both switches: `docker context ls`, and `readlink /var/run/docker.sock`. The docker context and
 the system socket are independent and can disagree — most often after a reboot, which clears the
 symlink but not the context.
+
+### Container creates take seconds / Testcontainers fails with "Initialization has been cancelled"
+
+Check `ProcessType` in the plist — installs made with 0.1.4 or earlier used `Background`, which
+throttles CPU/IO for every child `container` process the daemon spawns, so container operations can
+take seconds instead of tens of milliseconds; under load that is slow enough for Testcontainers'
+Ryuk to hit its 60 s init budget and throw. Re-run `cider install`.
+
+```bash
+grep -A1 ProcessType ~/Library/LaunchAgents/com.chillicream.cider.daemon.plist
+```
 
 ## Testing
 

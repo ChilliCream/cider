@@ -122,7 +122,7 @@ public class LaunchdInstallerTests
             $"\t\t<string>{XmlEscape(home)}</string>\n" +
             "\t</dict>\n" +
             "\t<key>ProcessType</key>\n" +
-            "\t<string>Background</string>\n" +
+            "\t<string>Interactive</string>\n" +
             "\t<key>WorkingDirectory</key>\n" +
             "\t<string>/Users/testuser/.cider &amp; data</string>\n" +
             "</dict>\n" +
@@ -131,6 +131,41 @@ public class LaunchdInstallerTests
         var actual = LaunchdInstaller.GeneratePlist(options);
 
         Assert.Equal(expected, actual);
+    }
+
+    [Fact]
+    public void GeneratePlist_UsesInteractiveProcessType_NeverBackground()
+    {
+        var options = new InstallOptions(
+            ExecutablePath: "/usr/local/bin/cider",
+            SocketPath: "/Users/testuser/.cider/docker.sock",
+            DataDir: "/Users/testuser/.cider",
+            LogLevel: null);
+
+        var xml = LaunchdInstaller.GeneratePlist(options);
+
+        // Background QoS throttles CPU/IO for this process and every `container` CLI child it
+        // spawns (cider-8ok); Interactive is the only ProcessType launchd applies no throttling to.
+        Assert.Contains("<key>ProcessType</key>\n\t<string>Interactive</string>\n", xml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Background", xml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ExtractProcessType_ReadsTheStringFollowingTheProcessTypeKey()
+    {
+        const string plist =
+            "<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>x</string>\n" +
+            "\t<key>ProcessType</key>\n\t<string>Background</string>\n</dict>\n</plist>\n";
+
+        Assert.Equal("Background", LaunchdInstaller.ExtractProcessType(plist));
+    }
+
+    [Fact]
+    public void ExtractProcessType_ReturnsNull_WhenKeyIsAbsent()
+    {
+        const string plist = "<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>x</string>\n</dict>\n</plist>\n";
+
+        Assert.Null(LaunchdInstaller.ExtractProcessType(plist));
     }
 
     [Fact]
