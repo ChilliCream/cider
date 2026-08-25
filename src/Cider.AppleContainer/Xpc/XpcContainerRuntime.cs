@@ -17,9 +17,10 @@ namespace Cider.AppleContainer.Xpc;
 /// container list/inspect/stats, disk usage, network/volume list/inspect); cider-ede.6 ports
 /// create/delete/stop/kill (<c>XpcContainerRuntime.Create.cs</c>, its own sibling partial file, plus
 /// <c>ContainerConfigurationBuilder</c>/<c>KernelCache</c>/<c>InitImageResolver</c>/
-/// <c>ImageSnapshotEnsurer</c>/<c>ImagesServiceClient</c>). Every other <see cref="IContainerRuntime"/>
-/// member is listed in the <c>// FALLBACK</c> block at the bottom and delegates straight to the CLI
-/// runtime until later tasks (X7, X9, X11, X12) port it.
+/// <c>ImageSnapshotEnsurer</c>/<c>ImagesServiceClient</c>); cider-ede.11 ports network/volume
+/// create/delete (<c>XpcContainerRuntime.Resources.cs</c>). Every other
+/// <see cref="IContainerRuntime"/> member is listed in the <c>// FALLBACK</c> block at the bottom and
+/// delegates straight to the CLI runtime until later tasks (X7, X9, X12) port it.
 /// Mapping from the wire models to <c>Cider.Core.Runtime</c> types lives in the sibling
 /// <c>XpcContainerRuntime.Mapping.cs</c> file of this partial class.
 /// </summary>
@@ -469,11 +470,13 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     // Every IContainerRuntime member cider-ede.5 does not port. Each delegates straight to the CLI
     // runtime — no XPC attempted, no fallback warning (there is nothing to fall back *from*). Listed
     // explicitly, one line each, so a later task (write paths X6, process model X6, logs X9, images
-    // X10, networks/volumes writes X11, cp/export X12) can find and remove its own entries here as it
-    // ports them, without having to re-audit the whole interface.
+    // X10, cp/export X12) can find and remove its own entries here as it ports them, without having
+    // to re-audit the whole interface.
 
     // CreateContainerAsync/RemoveContainerAsync/StopContainerAsync/KillContainerAsync are ported —
-    // see XpcContainerRuntime.Create.cs (task cider-ede.6).
+    // see XpcContainerRuntime.Create.cs (task cider-ede.6). CreateNetworkAsync/RemoveNetworkAsync/
+    // CreateVolumeAsync/RemoveVolumeAsync are ported — see XpcContainerRuntime.Resources.cs (task
+    // cider-ede.11).
 
     public Task<IContainerProcess> StartContainerAsync(string runtimeId, StartOptions options, CancellationToken ct) =>
         _cliFallback.StartContainerAsync(runtimeId, options, ct);
@@ -523,15 +526,6 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         _cliFallback.BuildImageAsync(spec, progress, ct);
 
     public Task LoginAsync(RegistryAuth auth, CancellationToken ct) => _cliFallback.LoginAsync(auth, ct);
-
-    public Task CreateNetworkAsync(NetworkSpec spec, CancellationToken ct) => _cliFallback.CreateNetworkAsync(spec, ct);
-
-    public Task RemoveNetworkAsync(string name, CancellationToken ct) => _cliFallback.RemoveNetworkAsync(name, ct);
-
-    public Task CreateVolumeAsync(VolumeSpec spec, CancellationToken ct) => _cliFallback.CreateVolumeAsync(spec, ct);
-
-    public Task RemoveVolumeAsync(string name, bool force, CancellationToken ct) =>
-        _cliFallback.RemoveVolumeAsync(name, force, ct);
 
     public Task<BuilderStatus?> GetBuilderStatusAsync(CancellationToken ct) => _cliFallback.GetBuilderStatusAsync(ct);
 
