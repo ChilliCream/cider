@@ -242,30 +242,45 @@ public sealed partial class FakeContainerRuntime
         await tarInput.CopyToAsync(buffer, ct).ConfigureAwait(false);
         LastLoadedTar = buffer.ToArray();
 
-        // A real OCI layout (what OciImageWriter produces for commit/import) is registered under the
-        // id and reference it actually declares, exactly like `container image load` does — Apple
-        // keys the image by the digest of the index blob index.json points at.
-        if (TryReadOciLayout(LastLoadedTar, out var ociReference, out var ociId))
+        // A real OCI layout (what OciImageWriter produces for commit/import, or an index.json with
+        // several manifests for a load-two-tags-at-once test) is registered under the id and
+        // reference(s) it actually declares, exactly like `container image load` does — Apple keys
+        // the image by the digest of the index blob index.json points at. Several manifest entries
+        // sharing one digest is the multi-tag case: one image, several `Loaded image:` lines.
+        if (TryReadOciLayout(LastLoadedTar, out var ociEntries))
         {
             lock (_sync)
             {
-                if (FindImage(ociId) is null)
+                foreach (var group in ociEntries.GroupBy(entry => entry.Id, StringComparer.Ordinal))
                 {
-                    _images.Add(new RuntimeImageDetail
+                    var references = group.Select(entry => entry.Reference).ToList();
+                    var existing = FindImage(group.Key);
+                    if (existing is null)
                     {
-                        Id = ociId,
-                        References = [ociReference],
-                        Size = LastLoadedTar.Length,
-                        Created = DateTimeOffset.UtcNow,
-                        Config = new ImageConfig(),
-                        Architecture = "arm64",
-                        Os = "linux",
-                        Layers = ["layer-loaded-1"],
-                    });
+                        _images.Add(new RuntimeImageDetail
+                        {
+                            Id = group.Key,
+                            References = references,
+                            Size = LastLoadedTar.Length,
+                            Created = DateTimeOffset.UtcNow,
+                            Config = new ImageConfig(),
+                            Architecture = "arm64",
+                            Os = "linux",
+                            Layers = ["layer-loaded-1"],
+                        });
+                    }
+                    else
+                    {
+                        var index = _images.IndexOf(existing);
+                        _images[index] = existing with
+                        {
+                            References = existing.References.Union(references, StringComparer.Ordinal).ToList(),
+                        };
+                    }
                 }
             }
 
-            return [ociReference];
+            return ociEntries.Select(entry => entry.Reference).ToList();
         }
 
         const string reference = "docker.io/library/loaded:latest";
@@ -425,11 +440,10 @@ public sealed partial class FakeContainerRuntime
     private static string IdWithoutPrefix(string id) =>
         id.StartsWith("sha256:", StringComparison.Ordinal) ? id["sha256:".Length..] : id;
 
-    /// <summary>Reads <c>index.json</c> out of an OCI-layout tar: its single descriptor is the image.</summary>
-    private static bool TryReadOciLayout(byte[] tar, out string reference, out string id)
+    /// <summary>Reads <c>index.json</c> out of an OCI-layout tar: one descriptor per referenced tag.</summary>
+    private static bool TryReadOciLayout(byte[] tar, out IReadOnlyList<(string Reference, string Id)> entries)
     {
-        reference = "";
-        id = "";
+        entries = [];
         try
         {
             using var stream = new MemoryStream(tar, writable: false);
@@ -444,11 +458,20 @@ public sealed partial class FakeContainerRuntime
                 using var content = new MemoryStream();
                 entry.DataStream.CopyTo(content);
                 using var document = JsonDocument.Parse(content.ToArray());
-                var descriptor = document.RootElement.GetProperty("manifests")[0];
-                id = descriptor.GetProperty("digest").GetString() ?? "";
-                reference = descriptor.GetProperty("annotations")
-                    .GetProperty("org.opencontainers.image.ref.name").GetString() ?? "";
-                return id.Length > 0 && reference.Length > 0;
+                var found = new List<(string, string)>();
+                foreach (var descriptor in document.RootElement.GetProperty("manifests").EnumerateArray())
+                {
+                    var id = descriptor.GetProperty("digest").GetString() ?? "";
+                    var reference = descriptor.GetProperty("annotations")
+                        .GetProperty("org.opencontainers.image.ref.name").GetString() ?? "";
+                    if (id.Length > 0 && reference.Length > 0)
+                    {
+                        found.Add((reference, id));
+                    }
+                }
+
+                entries = found;
+                return found.Count > 0;
             }
         }
         catch (Exception ex) when (ex is InvalidDataException or JsonException or KeyNotFoundException or IndexOutOfRangeException)

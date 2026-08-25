@@ -462,6 +462,24 @@ public sealed class ImageManager
     public async Task LoadAsync(Stream tarIn, IProgress<JsonMessage> progress, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(progress);
+        await LoadImagesAsync(tarIn, progress, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Same runtime load as <see cref="LoadAsync"/> (<c>POST /images/load</c> delegates here, and its
+    /// progress output is unchanged), but hands back the normalized references that the load actually
+    /// affected — for the BuildKit control proxy (T7), which loads the tar buildkitd's <c>docker</c>
+    /// exporter produced and needs the resulting references to inspect/tag the built image, rather
+    /// than parse them back out of progress lines.
+    /// </summary>
+    /// <returns>
+    /// The normalized references that appeared or were retargeted by the load: a before/after diff of
+    /// <see cref="IContainerRuntime.ListImagesAsync"/>. When the diff is empty — reloading a tar whose
+    /// image and tags are already present, byte for byte — the runtime's own <c>Loaded image:</c>
+    /// names are returned instead, so a re-load never comes back empty.
+    /// </returns>
+    public async Task<IReadOnlyList<string>> LoadImagesAsync(Stream tarIn, IProgress<JsonMessage>? progress, CancellationToken ct)
+    {
         Directory.CreateDirectory(_options.TmpDir);
         var tmpFile = Path.Combine(_options.TmpDir, $"load-{Guid.NewGuid():N}.tar");
         try
@@ -470,6 +488,8 @@ public sealed class ImageManager
             {
                 await tarIn.CopyToAsync(fileStream, ct).ConfigureAwait(false);
             }
+
+            var before = await SnapshotImageIdsByReferenceAsync(ct).ConfigureAwait(false);
 
             IReadOnlyList<string> loaded;
             await using (var readStream = File.OpenRead(tmpFile))
@@ -480,7 +500,7 @@ public sealed class ImageManager
                 }
                 catch (RuntimeException ex)
                 {
-                    progress.Report(new JsonMessage { Error = ex.Message, ErrorDetail = new JsonError { Message = ex.Message } });
+                    progress?.Report(new JsonMessage { Error = ex.Message, ErrorDetail = new JsonError { Message = ex.Message } });
                     throw ex.ToDockerError();
                 }
             }
@@ -488,14 +508,41 @@ public sealed class ImageManager
             foreach (var reference in loaded)
             {
                 var familiar = ImageReference.TryParse(reference, out var parsed) ? parsed.Familiar() : reference;
-                progress.Report(new JsonMessage { Stream = $"Loaded image: {familiar}\n" });
+                progress?.Report(new JsonMessage { Stream = $"Loaded image: {familiar}\n" });
                 _events.Publish(DockerEvents.Image("load", reference, familiar));
             }
+
+            var after = await SnapshotImageIdsByReferenceAsync(ct).ConfigureAwait(false);
+            var changed = after
+                .Where(entry => !before.TryGetValue(entry.Key, out var beforeId) || !string.Equals(beforeId, entry.Value, StringComparison.Ordinal))
+                .Select(entry => entry.Key)
+                .ToList();
+
+            var references = changed.Count > 0 ? changed : loaded;
+            return references
+                .Select(reference => ImageReference.TryParse(reference, out var parsed) ? parsed.Normalize().ToString() : reference)
+                .ToList();
         }
         finally
         {
             TryDeleteFile(tmpFile);
         }
+    }
+
+    /// <summary>Every reference known to the runtime right now, mapped to the image id it points at.</summary>
+    private async Task<Dictionary<string, string>> SnapshotImageIdsByReferenceAsync(CancellationToken ct)
+    {
+        var images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var image in images)
+        {
+            foreach (var reference in image.References)
+            {
+                map[reference] = image.Id;
+            }
+        }
+
+        return map;
     }
 
     /// <summary>

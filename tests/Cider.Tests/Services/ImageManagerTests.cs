@@ -731,6 +731,87 @@ public sealed class ImageManagerTests : IDisposable
         Assert.StartsWith("sha256:", message.Stream, StringComparison.Ordinal);
     }
 
+    // ---- load ----------------------------
+
+    [Fact]
+    public async Task LoadImagesAsync_ATarCarryingTwoTags_ReturnsBothNormalizedReferences()
+    {
+        var (manager, _) = CreateManager();
+        var id = TestDigest("two-tags");
+        await using var tar = BuildOciIndexTar(id, "app:1", "app:2");
+
+        var references = await manager.LoadImagesAsync(tar, progress: null, CancellationToken.None);
+
+        Assert.Equal(["docker.io/library/app:1", "docker.io/library/app:2"], references);
+    }
+
+    [Fact]
+    public async Task LoadImagesAsync_ReloadingTheSameTar_FallsBackToTheLoadedNames()
+    {
+        var (manager, _) = CreateManager();
+        var id = TestDigest("reload-same");
+
+        await using (var first = BuildOciIndexTar(id, "app:1", "app:2"))
+        {
+            await manager.LoadImagesAsync(first, progress: null, CancellationToken.None);
+        }
+
+        // Nothing appeared or changed on the runtime the second time around — the diff of
+        // ListImagesAsync before/after is empty, so the fallback to the runtime's own `loaded`
+        // names must still hand back both references rather than an empty list.
+        await using var second = BuildOciIndexTar(id, "app:1", "app:2");
+        var references = await manager.LoadImagesAsync(second, progress: null, CancellationToken.None);
+
+        Assert.Equal(["docker.io/library/app:1", "docker.io/library/app:2"], references);
+    }
+
+    [Fact]
+    public async Task LoadAsync_DelegatesToLoadImagesAsync_ProgressAndEventsUnchanged()
+    {
+        var (manager, runtime, events) = CreateManagerWithEvents();
+        var since = DateTimeOffset.UtcNow.AddSeconds(-5);
+        var id = TestDigest("progress-tar");
+        await using var tar = BuildOciIndexTar(id, "app:1");
+        var messages = new List<JsonMessage>();
+
+        await manager.LoadAsync(tar, new SyncProgress<JsonMessage>(messages.Add), CancellationToken.None);
+
+        var message = Assert.Single(messages);
+        Assert.Equal("Loaded image: app:1\n", message.Stream);
+        Assert.Contains("LoadImagesAsync", runtime.Calls);
+
+        var published = await DrainEventsAsync(events, since);
+        var loadEvent = Assert.Single(published, e => e.Type == "image" && e.Action == "load");
+        Assert.Equal("app:1", loadEvent.Actor.Attributes["name"]);
+    }
+
+    private static string TestDigest(string seed) =>
+        "sha256:" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(seed)));
+
+    private static MemoryStream BuildOciIndexTar(string id, params string[] references)
+    {
+        var manifests = references.Select(reference => new
+        {
+            mediaType = "application/vnd.oci.image.index.v1+json",
+            digest = id,
+            size = 1,
+            annotations = new Dictionary<string, string> { ["org.opencontainers.image.ref.name"] = reference },
+        });
+        var json = JsonSerializer.Serialize(new { schemaVersion = 2, manifests });
+
+        var stream = new MemoryStream();
+        using (var writer = new TarWriter(stream, TarEntryFormat.Pax, leaveOpen: true))
+        {
+            writer.WriteEntry(new PaxTarEntry(TarEntryType.RegularFile, "index.json")
+            {
+                DataStream = new MemoryStream(Encoding.UTF8.GetBytes(json)),
+            });
+        }
+
+        stream.Position = 0;
+        return stream;
+    }
+
     // ---- commit / import ----------------------------
 
     [Fact]
