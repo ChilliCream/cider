@@ -1,0 +1,5 @@
+{
+  "path": "file:///Users/michael/Library/Application%20Support/com.apple.container/kernels/vmlinux-6.18.15-186",
+  "platform": { "os": "linux", "architecture": "arm64" },
+  "commandLine": { "initArgs": [], "kernelArgs": ["console=hvc0", "tsc=reliable", "panic=0"] }
+}
