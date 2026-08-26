@@ -865,6 +865,39 @@ internal sealed partial class XpcContainerRuntime
     /// of the rule being correct, recorded so nobody mistakes silence in the logs for the fallback
     /// quietly doing its job, or mistakes its narrow bound for it never doing its job at all.
     /// </para>
+    /// <para>
+    /// <b>THIS IS BY DESIGN — not a limitation, not a bug, not a knob to tune.</b> On any store
+    /// that still holds an ordinary multi-arch remaining image, this method cannot fire under normal
+    /// conditions, full stop — that is not an incidental side effect of over-conservative code
+    /// waiting for someone to loosen it, it is the correct output of the safety rule above applied to
+    /// data that genuinely does not support the positive proof the rule requires. The <em>only</em> way
+    /// to make this method fire in that situation is to relax the non-reference proof — and that
+    /// relaxed version is exactly the one <c>task cider-ehn</c>'s planner ruling already considered and
+    /// REJECTED, not an untried idea waiting for a better implementation.
+    /// </para>
+    /// <para>
+    /// <b>The rejected counter-argument, recorded so it is not re-derived.</b> "An unfetched variant's
+    /// layers were never pulled, so they cannot reference an existing blob" — this sounds like it
+    /// closes the gap, and it does not. Layers are shared between images (two multi-arch images can
+    /// pull the same base and land the identical layer digest), so a variant manifest being absent does
+    /// not bound which layer digests were ever in play. Worse: a manifest that is absent because it was
+    /// <em>lost</em> while its variant <em>was</em> pulled is, from every signal this method or
+    /// <see cref="CollectManifestDigestsAsync"/> can observe, indistinguishable from one that was never
+    /// fetched at all — there is no "we meant to have this" flag anywhere in the store. Treating
+    /// "never fetched" as safe to ignore would, on that indistinguishable lost-manifest case, delete
+    /// blobs belonging to the very image whose entry is already damaged — which is precisely the
+    /// failure this method exists to survive, because that failure is exactly the case where
+    /// non-reference cannot be proven. A missing blob is not gracefully recoverable here either: a
+    /// single dangling content reference has taken <c>container image ls</c> down machine-wide
+    /// (observed directly on this machine). The abort stands.
+    /// </para>
+    /// <para>
+    /// If you are reading this because you want the corrupted-store case actually covered — every
+    /// remaining image reliably reclaimable even when one of them is damaged — the fix is not here.
+    /// It is upstream: Apple's whole-store sweep and <c>container image ls</c> are both all-or-nothing
+    /// on a single bad entry instead of skipping it with a warning, and that is what would need to
+    /// change, in <c>apple/container</c>, not in this method.
+    /// </para>
     /// </summary>
     private async Task TryScopedReclaimAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct)
     {
