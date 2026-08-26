@@ -105,6 +105,61 @@ public class WireModelTests
     }
 
     [Fact]
+    public void ContainerConfiguration_missing_optional_keys_decodes_to_swift_defaults()
+    {
+        // ContainerConfiguration's custom init(from:) only requires id/image/initProcess
+        // (ContainerConfiguration.swift:60-94); the docs/spikes/xpc probe confirmed the apiserver
+        // accepts exactly this minimal shape (docs/spikes/xpc/04-dotnet-xpc-probe-report.md,
+        // "minimal containerCreate the server accepted"). Every other key here must decode to the
+        // Swift decoder's default, not `null`/`0`/`false` (cider-ede.25).
+        const string json = """
+            {"id":"myapp","image":{"reference":"docker.io/library/alpine:3.20",
+             "descriptor":{"mediaType":"application/vnd.oci.image.manifest.v1+json",
+             "digest":"sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc","size":1}},
+             "initProcess":{"executable":"sleep","arguments":["60"],"environment":[],
+             "workingDirectory":"/","terminal":false,"user":{"id":{"uid":0,"gid":0}},
+             "supplementalGroups":[],"rlimits":[]}}
+            """;
+
+        var config = XpcJson.Deserialize<ContainerConfiguration>(json);
+
+        Assert.Empty(config.Mounts);
+        Assert.Empty(config.PublishedPorts);
+        Assert.Empty(config.PublishedSockets);
+        Assert.Empty(config.Networks);
+        Assert.Empty(config.Labels);
+        Assert.Empty(config.Sysctls);
+        Assert.Empty(config.CapAdd);
+        Assert.Empty(config.CapDrop);
+        Assert.Null(config.Dns);
+        Assert.False(config.Rosetta);
+        Assert.False(config.Virtualization);
+        Assert.False(config.Ssh);
+        Assert.False(config.ReadOnly);
+        Assert.False(config.UseInit);
+        Assert.NotNull(config.Resources);
+        Assert.Equal(4, config.Resources.Cpus);
+        Assert.Equal(1024UL * 1024 * 1024, config.Resources.MemoryInBytes);
+        Assert.Equal(1, config.Resources.CpuOverhead);
+        Assert.Equal("container-runtime-linux", config.RuntimeHandler);
+        Assert.Equal(DateTimeOffset.UnixEpoch, config.CreationDate);
+        AssertRoundTripIsStable(config);
+    }
+
+    [Fact]
+    public void PublishPort_missing_count_defaults_to_1()
+    {
+        const string json = """
+            {"hostAddress":"0.0.0.0","hostPort":8080,"containerPort":80,"proto":"tcp"}
+            """;
+
+        var port = XpcJson.Deserialize<PublishPort>(json);
+
+        Assert.Equal((ushort)1, port.Count);
+        AssertRoundTripIsStable(port);
+    }
+
+    [Fact]
     public void ContainerSnapshot_round_trips_fixture_derived_from_ref_inspect()
     {
         // docs/spikes/xpc-probe/ref-inspect.json is the CLI's *display* JSON (ISO-8601 dates, a
@@ -420,6 +475,22 @@ public class WireModelTests
         Assert.Equal("myvol", volume.Name);
         Assert.Equal("local", volume.Driver);
         Assert.Null(volume.SizeInBytes);
+        AssertRoundTripIsStable(volume);
+    }
+
+    [Fact]
+    public void VolumeConfiguration_missing_labels_and_options_decodes_to_empty_maps()
+    {
+        // VolumeConfiguration.swift:43-56's custom init(from:) only requires name/driver/format/
+        // source — labels/options/creationDate must decode to their Swift defaults when omitted,
+        // not null (cider-ede.25).
+        const string json = """{"name":"myvol","driver":"local","format":"ext4","source":"/path"}""";
+
+        var volume = XpcJson.Deserialize<VolumeConfiguration>(json);
+
+        Assert.Empty(volume.Labels);
+        Assert.Empty(volume.Options);
+        Assert.Equal(DateTimeOffset.UnixEpoch, volume.CreationDate);
         AssertRoundTripIsStable(volume);
     }
 

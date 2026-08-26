@@ -13,6 +13,13 @@ namespace Cider.AppleContainer.Xpc.Models;
 /// `ContainerConfiguration` (`ContainerConfiguration.swift:20-158`). Has a custom `init(from:)` that
 /// only requires <see cref="Id"/>, <see cref="Image"/> and <see cref="InitProcess"/> (§2.0 rule 11) —
 /// every other member below carries the Swift decoder's default, applied here as the C# default too.
+/// NOTE: the defaulted members below use a plain <c>set</c> accessor, not <c>init</c> — with
+/// System.Text.Json source generation, an `init`-only property whose JSON key is absent is left at
+/// <c>default(T)</c> instead of running its declared field-initializer default (a source-gen-only
+/// quirk; reflection-based serialization does not have it). <c>set</c> does not have that quirk, so
+/// it is what makes an omitted key actually decode to the Swift default instead of `null`/`0`/`false`.
+/// See <see cref="Resources"/> and <see cref="PublishPort"/> below for the same fix, and
+/// <c>VolumeConfiguration</c> in VolumeModels.cs.
 /// </summary>
 internal sealed class ContainerConfiguration
 {
@@ -22,39 +29,39 @@ internal sealed class ContainerConfiguration
 
     public required ProcessConfiguration InitProcess { get; init; }
 
-    public List<Filesystem> Mounts { get; init; } = [];
+    public List<Filesystem> Mounts { get; set; } = [];
 
-    public List<PublishPort> PublishedPorts { get; init; } = [];
+    public List<PublishPort> PublishedPorts { get; set; } = [];
 
-    public List<PublishSocket> PublishedSockets { get; init; } = [];
+    public List<PublishSocket> PublishedSockets { get; set; } = [];
 
-    public Dictionary<string, string> Labels { get; init; } = [];
+    public Dictionary<string, string> Labels { get; set; } = [];
 
-    public Dictionary<string, string> Sysctls { get; init; } = [];
+    public Dictionary<string, string> Sysctls { get; set; } = [];
 
-    public List<AttachmentConfiguration> Networks { get; init; } = [];
+    public List<AttachmentConfiguration> Networks { get; set; } = [];
 
     public DnsConfiguration? Dns { get; init; }
 
-    public bool Rosetta { get; init; }
+    public bool Rosetta { get; set; }
 
-    public Platform Platform { get; init; } = Platform.Current;
+    public Platform Platform { get; set; } = Platform.Current;
 
-    public Resources Resources { get; init; } = new();
+    public Resources Resources { get; set; } = new();
 
-    public string RuntimeHandler { get; init; } = "container-runtime-linux";
+    public string RuntimeHandler { get; set; } = "container-runtime-linux";
 
-    public bool Virtualization { get; init; }
+    public bool Virtualization { get; set; }
 
-    public bool Ssh { get; init; }
+    public bool Ssh { get; set; }
 
-    public bool ReadOnly { get; init; }
+    public bool ReadOnly { get; set; }
 
-    public bool UseInit { get; init; }
+    public bool UseInit { get; set; }
 
-    public List<string> CapAdd { get; init; } = [];
+    public List<string> CapAdd { get; set; } = [];
 
-    public List<string> CapDrop { get; init; } = [];
+    public List<string> CapDrop { get; set; } = [];
 
     public ulong? ShmSize { get; init; }
 
@@ -67,7 +74,7 @@ internal sealed class ContainerConfiguration
 
     /// <summary>Epoch 1970 (Unix zero) if absent on decode, per the Swift custom `init(from:)`.</summary>
     [JsonConverter(typeof(AppleReferenceDateConverter))]
-    public DateTimeOffset CreationDate { get; init; } = DateTimeOffset.UnixEpoch;
+    public DateTimeOffset CreationDate { get; set; } = DateTimeOffset.UnixEpoch;
 
     /// <summary>
     /// Reproduces the `container` CLI's own defaults for a plain create
@@ -146,16 +153,17 @@ internal sealed class Rlimit
 }
 
 /// <summary>`ContainerConfiguration.Resources` (`ContainerConfiguration.swift:132-147`) — all optional
-/// on decode, each with the Swift-side default reproduced here (§2.0 rule 11, §2.2).</summary>
+/// on decode, each with the Swift-side default reproduced here (§2.0 rule 11, §2.2). <c>set</c>, not
+/// <c>init</c> — see the note on <see cref="ContainerConfiguration"/> above.</summary>
 internal sealed class Resources
 {
-    public int Cpus { get; init; } = 4;
+    public int Cpus { get; set; } = 4;
 
-    public ulong MemoryInBytes { get; init; } = 1024UL * 1024 * 1024;
+    public ulong MemoryInBytes { get; set; } = 1024UL * 1024 * 1024;
 
     public ulong? Storage { get; init; }
 
-    public int CpuOverhead { get; init; } = 1;
+    public int CpuOverhead { get; set; } = 1;
 }
 
 /// <summary>`DNSConfiguration` (`ContainerConfiguration.swift:111-130`) — synthesized Codable:
@@ -193,7 +201,8 @@ internal sealed class AttachmentOptions
 }
 
 /// <summary>`PublishPort` (`PublishPort.swift:37-81`) — custom `init(from:)`; <see cref="Count"/>
-/// defaults to 1 when absent (§2.2), everything else the CLI always supplies.</summary>
+/// defaults to 1 when absent (§2.2), everything else the CLI always supplies. <c>Count</c> uses
+/// <c>set</c>, not <c>init</c> — see the note on <see cref="ContainerConfiguration"/> above.</summary>
 internal sealed class PublishPort
 {
     /// <summary>`IPAddress` on the wire — a bare string (§2.0 rule 7, e.g. <c>"0.0.0.0"</c>).</summary>
@@ -207,7 +216,7 @@ internal sealed class PublishPort
     /// <c>"udp"</c>.</summary>
     public required string Proto { get; init; }
 
-    public ushort Count { get; init; } = 1;
+    public ushort Count { get; set; } = 1;
 }
 
 /// <summary>`PublishSocket` (`PublishSocket.swift:21-129`) — `FilePath` fields encode as plain
