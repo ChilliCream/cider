@@ -537,6 +537,44 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Equal(System.Net.HttpStatusCode.NotFound, ex.Status);
     }
 
+    [Fact]
+    public async Task RemoveAsync_WhenTheRuntimeSilentlyNoOpsOnAMismatchedReference_DoesNotReportSuccess()
+    {
+        // cider-eo0: confirmed directly against Apple's 1.3.0 containerization source
+        // (ImageStore+ReferenceManager.delete is a bare `state.removeValue(forKey: reference)` — no
+        // throw, no signal of any kind, when `reference` doesn't literally match a key the store
+        // holds), Apple's own `imageDelete` route can report success while deleting nothing whenever
+        // cider hands it a reference it derived/normalized rather than the runtime's own verbatim
+        // form. This reproduces exactly that: the store holds the image under a raw, non-normalized
+        // reference (the same shape cider-imz's own bug minted before that fix), so RemoveAsync's own
+        // normalization sends a *different* string than the one Apple's real semantics (modeled here
+        // via StrictExactReferenceMatchOnRemove) will match — the delete call itself returns
+        // successfully having removed nothing at all.
+        var (manager, runtime) = CreateManager();
+        var rawId = "sha256:" + new string('7', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = rawId,
+            References = ["legacy-raw-ref"], // raw: no docker.io/library/ prefix, no :latest tag
+            Size = 1_000,
+            Created = DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+        runtime.StrictExactReferenceMatchOnRemove = true;
+
+        var ex = await Assert.ThrowsAsync<DockerApiException>(
+            () => manager.RemoveAsync("legacy-raw-ref", force: false, noPrune: false, CancellationToken.None));
+
+        Assert.Equal(System.Net.HttpStatusCode.InternalServerError, ex.Status);
+
+        // Honest, not a false alarm: the image really is still there, because the runtime's own
+        // no-op really did leave it in place.
+        var images = await manager.ListAsync(all: true, Filters.Empty, digests: false, CancellationToken.None);
+        Assert.Contains(images, i => i.Id == rawId);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

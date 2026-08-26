@@ -274,6 +274,20 @@ public sealed partial class FakeContainerRuntime
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Test hook (cider-eo0): when set, <see cref="RemoveImageAsync"/> stops using this fake's usual
+    /// lenient, normalizing <see cref="FindImage"/> match and instead models Apple's real
+    /// <c>imageDelete</c> route exactly, as confirmed against the 1.3.0 containerization source
+    /// (<c>ImageStore+ReferenceManager.delete</c>: a bare <c>state.removeValue(forKey: reference)</c>
+    /// against the literal reference string) — a <paramref name="reference"/> that is not
+    /// byte-for-byte one of an image's own raw <see cref="RuntimeImageDetail.References"/> entries
+    /// silently does nothing at all: no exception, no state change. This is exactly cider-imz's bug
+    /// shape and cider-eo0's own class-level detection exist to catch, so a regression test needs a
+    /// way to reproduce Apple's real no-op rather than this fake's normal (and more forgiving) match.
+    /// Off by default — every other test keeps this fake's ordinary normalizing behavior below.
+    /// </summary>
+    public bool StrictExactReferenceMatchOnRemove { get; set; }
+
     public Task RemoveImageAsync(string reference, bool force, CancellationToken ct)
     {
         Record($"RemoveImageAsync:{reference}:{force}");
@@ -289,6 +303,31 @@ public sealed partial class FakeContainerRuntime
 
         lock (_sync)
         {
+            if (StrictExactReferenceMatchOnRemove)
+            {
+                var exact = _images.FirstOrDefault(i => i.References.Contains(reference, StringComparer.Ordinal));
+                if (exact is null)
+                {
+                    // Apple's own silent no-op (verified against the real source — see this
+                    // property's doc comment): the reference did not match any key the store holds,
+                    // and imageDelete neither throws nor signals that in any way.
+                    return Task.CompletedTask;
+                }
+
+                var exactIndex = _images.IndexOf(exact);
+                var remaining = exact.References.Where(r => r != reference).ToList();
+                if (remaining.Count == 0)
+                {
+                    _images.RemoveAt(exactIndex);
+                }
+                else
+                {
+                    _images[exactIndex] = exact with { References = remaining };
+                }
+
+                return Task.CompletedTask;
+            }
+
             var image = FindImage(reference) ?? throw RuntimeException.NotFound($"no such image: {reference}");
             var normalizedTag = TryNormalizedTag(reference);
             if (normalizedTag is not null && image.References.Count > 1 && image.References.Contains(normalizedTag, StringComparer.Ordinal))

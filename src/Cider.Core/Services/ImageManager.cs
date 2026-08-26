@@ -369,8 +369,14 @@ public sealed class ImageManager
 
                 RuntimeException? missing = null;
                 var removed = false;
+                var verifyGone = false;
                 foreach (var target in targets)
                 {
+                    if (RequiredNormalization(target, image.References))
+                    {
+                        verifyGone = true;
+                    }
+
                     try
                     {
                         await _runtime.RemoveImageAsync(target, force, ct).ConfigureAwait(false);
@@ -389,12 +395,22 @@ public sealed class ImageManager
                     throw missing;
                 }
 
+                if (verifyGone)
+                {
+                    await VerifyRuntimeDeleteActuallyHappenedAsync(image, reference, expectedGoneTag: null, ct).ConfigureAwait(false);
+                }
+
                 items.Add(new ImageDeleteResponseItem { Deleted = image.Id });
                 _events.Publish(DockerEvents.Image("delete", image.Id, tagBeingRemoved is null ? image.Id : ImageReference.Parse(tagBeingRemoved).Familiar()));
             }
             else
             {
                 await _runtime.RemoveImageAsync(tagBeingRemoved!, force, ct).ConfigureAwait(false);
+                if (RequiredNormalization(tagBeingRemoved!, image.References))
+                {
+                    await VerifyRuntimeDeleteActuallyHappenedAsync(image, reference, expectedGoneTag: tagBeingRemoved!, ct).ConfigureAwait(false);
+                }
+
                 _events.Publish(DockerEvents.Image("untag", image.Id, ImageReference.Parse(tagBeingRemoved!).Familiar()));
             }
         }
@@ -1592,6 +1608,60 @@ public sealed class ImageManager
         }
 
         return image.References.FirstOrDefault() ?? image.Id;
+    }
+
+    /// <summary>
+    /// True when <paramref name="target"/> — the string about to be handed to
+    /// <see cref="IContainerRuntime.RemoveImageAsync"/> — is not byte-for-byte one of
+    /// <paramref name="rawReferences"/>, the runtime's own reported reference forms for this image.
+    /// cider-eo0 (confirmed against Apple's 1.3.0 containerization source,
+    /// <c>ImageStore+ReferenceManager.delete</c>: a bare <c>state.removeValue(forKey: reference)</c>
+    /// with no throw and no signal of any kind on an unmatched key): the *only* way
+    /// <c>imageDelete</c> can silently no-op while still reporting success is a mismatch between the
+    /// reference cider sends and the one Apple's store actually holds — which can only happen when
+    /// cider computed/normalized <paramref name="target"/> rather than passing back a raw reference
+    /// verbatim. Exactly the shape cider-imz's own bug lived in, generalized: this is <c>true</c> only
+    /// for the narrow set of deletes where a mint/delete asymmetry could actually bite, not for every
+    /// <c>rmi</c> (see <see cref="VerifyRuntimeDeleteActuallyHappenedAsync"/>'s own doc comment for why
+    /// that distinction matters).
+    /// </summary>
+    private static bool RequiredNormalization(string target, IReadOnlyList<string> rawReferences) =>
+        !rawReferences.Contains(target, StringComparer.Ordinal);
+
+    /// <summary>
+    /// cider-eo0: catches the runtime's no-op-success failure mode instead of trusting
+    /// <see cref="IContainerRuntime.RemoveImageAsync"/>'s bare return — re-lists and checks whether
+    /// the deletion this call just reported actually happened. Called only when
+    /// <see cref="RequiredNormalization"/> flagged at least one of the just-issued deletes, since a
+    /// verification listing is not free and <c>docker rmi</c> is an interactive path (task's own cost
+    /// constraint) — every other delete keeps trusting the runtime's return exactly as before.
+    /// <paramref name="expectedGoneTag"/> is <c>null</c> for a full delete (the whole image, every
+    /// reference, must be gone) or the one tag an untag-only removal expected to drop (the image
+    /// itself, and its other references, may legitimately remain).
+    /// </summary>
+    private async Task VerifyRuntimeDeleteActuallyHappenedAsync(
+        RuntimeImageDetail imageBefore, string reference, string? expectedGoneTag, CancellationToken ct)
+    {
+        var images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
+        var current = images.FirstOrDefault(i => string.Equals(i.Id, imageBefore.Id, StringComparison.Ordinal));
+
+        var stillThere = expectedGoneTag is null
+            ? current is not null
+            : current is not null && current.References.Contains(expectedGoneTag, StringComparer.Ordinal);
+
+        if (!stillThere)
+        {
+            return;
+        }
+
+        var what = expectedGoneTag is null ? $"image {imageBefore.Id}" : $"reference {expectedGoneTag}";
+        _logger.LogWarning(
+            "image delete {Reference}: the runtime reported success but {What} is still present in its store " +
+            "-- the reference cider sent likely did not match what the runtime holds verbatim",
+            reference, what);
+
+        throw RuntimeException.Internal(
+            $"image delete {reference}: the runtime reported success but {what} is still present in its store");
     }
 
     private static string IdWithoutPrefix(string id) =>
