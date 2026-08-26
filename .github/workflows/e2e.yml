@@ -82,8 +82,18 @@ jobs:
         timeout-minutes: 5
 
       - name: dotnet test (Cider.E2E.Tests, transport=${{ matrix.transport }})
-        run: dotnet test tests/Cider.E2E.Tests -f net10.0
+        run: dotnet test tests/Cider.E2E.Tests -f net10.0 --filter "FullyQualifiedName!~PerfSmokeTests"
         timeout-minutes: 30
+
+      # PerfSmokeTests (cider-ede.15) asserts latency budgets calibrated only against a local
+      # developer machine under real contention, never against this hosted runner (see the class
+      # doc on PerfSmokeTests for the numbers and conditions) — so it must not fail the build on
+      # latency alone yet. continue-on-error keeps it informative without gating; drop that flag
+      # once a run here has actually confirmed the budgets hold on macos-15.
+      - name: dotnet test (Cider.E2E.Tests PerfSmokeTests, transport=${{ matrix.transport }}, non-gating)
+        continue-on-error: true
+        run: dotnet test tests/Cider.E2E.Tests -f net10.0 --filter "FullyQualifiedName~PerfSmokeTests"
+        timeout-minutes: 10
 
       - name: Stop Apple container services
         if: always()
