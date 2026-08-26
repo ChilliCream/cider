@@ -7,6 +7,7 @@ using Cider.Core.State;
 using Cider.Daemon.Dns;
 using Cider.Dns;
 using Cider.Tests.Fakes;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -21,7 +22,8 @@ namespace Cider.Tests.Daemon;
 /// </summary>
 public sealed class DnsForwarderReapingTests
 {
-    private static async Task<(DnsForwarderService Service, FakeContainerRuntime Runtime, CiderOptions Options)> CreateAsync()
+    private static async Task<(DnsForwarderService Service, FakeContainerRuntime Runtime, CiderOptions Options)> CreateAsync(
+        ILogger<DnsForwarderService>? logger = null)
     {
         var options = new CiderOptions
         {
@@ -39,7 +41,7 @@ public sealed class DnsForwarderReapingTests
         await networks.EnsureDefaultAsync(CancellationToken.None);
 
         var service = new DnsForwarderService(
-            runtime, networks, new NullDnsResolver(), options, NullLogger<DnsForwarderService>.Instance);
+            runtime, networks, new NullDnsResolver(), options, logger ?? NullLogger<DnsForwarderService>.Instance);
 
         return (service, runtime, options);
     }
@@ -114,17 +116,25 @@ public sealed class DnsForwarderReapingTests
     }
 
     [Fact]
-    public async Task Unknown_hash_with_no_live_data_dir_is_reaped()
+    public async Task Unidentifiable_legacy_hash_is_not_reaped_but_logged()
     {
-        var (service, runtime, _) = await CreateAsync();
+        // cider-z2h: a label-less (legacy) forwarder whose hash matches no data dir this scan can
+        // find is not thereby PROVEN orphaned -- it may belong to a live daemon with an unconventional
+        // --data-dir this scan never thought to look under. Absence of evidence of ownership must
+        // never be reaped as if it were evidence of orphanhood, so this now survives (and is logged
+        // once as unidentifiable) instead of being force-removed as it used to be.
+        var logger = new RecordingLogger<DnsForwarderService>();
+        var (service, runtime, _) = await CreateAsync(logger);
         const string deadHash = "deadbee0";
         Seed(runtime, "cider-dns-web-" + deadHash, ForwarderLabels(deadHash));
 
         await service.StartAsync(CancellationToken.None);
         await service.StopAsync();
 
-        Assert.Contains("RemoveContainerAsync:cider-dns-web-" + deadHash + ":True", runtime.Calls);
-        Assert.Null(runtime.GetContainer("cider-dns-web-" + deadHash));
+        Assert.DoesNotContain(runtime.Calls, call => call.StartsWith("RemoveContainerAsync:cider-dns-web-" + deadHash, StringComparison.Ordinal));
+        Assert.NotNull(runtime.GetContainer("cider-dns-web-" + deadHash));
+        Assert.Contains(logger.Entries, e => e.Message.Contains("cider-dns-web-" + deadHash, StringComparison.Ordinal)
+            && e.Message.Contains("leaving it alone", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -242,8 +252,13 @@ public sealed class DnsForwarderReapingTests
         // Hash present in the live set: not orphaned.
         Assert.False(DnsForwarderService.IsOrphanedForwarder(ForwarderLabels("live0000"), liveHashes, "own00000"));
 
-        // Unknown hash, no live entry: orphaned.
-        Assert.True(DnsForwarderService.IsOrphanedForwarder(ForwarderLabels("dead0000"), liveHashes, "own00000"));
+        // cider-z2h: unknown legacy hash, no live entry -- NOT proof of orphanhood (a live daemon with
+        // an unconventional --data-dir hashes to something this scan simply has no candidate for), so
+        // this must never be reaped. It is Unidentifiable, not ProvenOrphaned.
+        Assert.False(DnsForwarderService.IsOrphanedForwarder(ForwarderLabels("dead0000"), liveHashes, "own00000"));
+        Assert.Equal(
+            DnsForwarderService.ForwarderOwnership.Unidentifiable,
+            DnsForwarderService.ClassifyForwarder(ForwarderLabels("dead0000"), liveHashes, "own00000"));
 
         // Path label present and the path exists: never orphaned, even for a hash absent from the live set.
         Assert.False(DnsForwarderService.IsOrphanedForwarder(
@@ -264,5 +279,22 @@ public sealed class DnsForwarderReapingTests
     {
         public ValueTask<DnsAnswer?> ResolveAsync(DnsQuestion question, IPEndPoint client, CancellationToken ct) =>
             ValueTask.FromResult<DnsAnswer?>(null);
+    }
+
+    private sealed class RecordingLogger<T> : ILogger<T>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add((logLevel, formatter(state, exception)));
     }
 }
