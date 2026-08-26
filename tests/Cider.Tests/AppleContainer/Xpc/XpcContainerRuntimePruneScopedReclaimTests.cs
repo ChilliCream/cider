@@ -147,6 +147,135 @@ public sealed class XpcContainerRuntimePruneScopedReclaimTests
     }
 
     /// <summary>
+    /// REGRESSION TEST for the "parsed but empty" hole in <see cref="XpcContainerRuntime.CollectManifestDigestsAsync"/>:
+    /// a remaining image whose index descriptor resolves straight to a <b>bare manifest JSON</b>
+    /// (<c>{schemaVersion, config, layers}</c>, no <c>manifests[]</c> wrapper at all) deserializes as an
+    /// <see cref="OciIndex"/> with a null <c>Manifests</c> — before the fix that was accepted as "index
+    /// resolved, zero real variants to walk, so <c>complete</c> stays <c>true</c>", handing back an empty
+    /// digest set as if the remaining image had been fully, positively accounted for. That let a layer
+    /// this remaining image actually shares with the deleted image survive candidacy only by chance (it
+    /// was never subtracted from <c>keep</c> at all) — this test pins that layer to actually being kept,
+    /// which fails on today's code once the sharing is real. Must fail before the fix, pass after.
+    /// </summary>
+    [Fact]
+    public async Task PruneImagesAsync_ScopedFallback_ExcludesASharedLayer_WhenARemainingImagesDescriptorIsABareManifest()
+    {
+        using var tempDir = new TempDir();
+
+        var deletedIndexDigest = RepeatDigest('1');
+        var deletedManifestDigest = RepeatDigest('2');
+        var configDigest = RepeatDigest('3');
+        var uniqueLayerDigest = RepeatDigest('4');
+        var sharedLayerDigest = RepeatDigest('5');
+
+        // The remaining image's own top-level descriptor digest resolves directly to a bare manifest
+        // (config+layers, no index wrapper) — a legitimately single-manifest image, the shape
+        // CollectBareManifestDigestsAsync exists to still walk and still count as proof.
+        var remainingBareManifestDigest = RepeatDigest('6');
+        var remainingConfigDigest = RepeatDigest('8');
+
+        var resolvable = new Dictionary<string, string?>
+        {
+            [deletedIndexDigest] = tempDir.WriteIndex("deleted-index", deletedManifestDigest),
+            [deletedManifestDigest] = tempDir.WriteManifest("deleted-manifest", configDigest, uniqueLayerDigest, sharedLayerDigest),
+            [remainingBareManifestDigest] = tempDir.WriteManifest("remaining-bare-manifest", remainingConfigDigest, sharedLayerDigest),
+        };
+
+        var remaining = new List<ImageDescription> { Description("docker.io/library/kept:latest", remainingBareManifestDigest) };
+        var fake = new FakeImagesServiceClient(DanglingContentFailure(), remaining, resolvable);
+        var runtime = NewRuntime(fake);
+        using var _ = runtime;
+
+        await runtime.PruneImagesAsync([deletedIndexDigest], CancellationToken.None);
+
+        var deleteCall = Assert.Single(fake.ContentDeleteCalls);
+        Assert.Equal(
+            new[] { configDigest, uniqueLayerDigest }.OrderBy(d => d, StringComparer.Ordinal),
+            deleteCall.OrderBy(d => d, StringComparer.Ordinal));
+        Assert.DoesNotContain(sharedLayerDigest, deleteCall);
+        Assert.DoesNotContain(remainingConfigDigest, deleteCall);
+    }
+
+    /// <summary>
+    /// A remaining image whose index itself resolves fine, but whose per-platform manifest blob is
+    /// absent from the store (a narrower corruption shape than the whole index being unreadable) must
+    /// still abort the whole reclaim per the safety rule — <see cref="CollectManifestDigestsAsync"/>'s
+    /// <c>complete</c> tracking already covers this branch; pinned here as explicit coverage per the
+    /// amended-report finding that only the "index is null" abort branch had a test.
+    /// </summary>
+    [Fact]
+    public async Task PruneImagesAsync_ScopedFallback_AbortsWithZeroContentDeleteCalls_WhenARemainingImagesManifestBlobIsAbsent()
+    {
+        using var tempDir = new TempDir();
+
+        var deletedIndexDigest = RepeatDigest('1');
+        var deletedManifestDigest = RepeatDigest('2');
+        var configDigest = RepeatDigest('3');
+        var layerDigest = RepeatDigest('4');
+
+        var remainingIndexDigest = RepeatDigest('6');
+        var remainingManifestDigest = RepeatDigest('7');
+
+        var resolvable = new Dictionary<string, string?>
+        {
+            [deletedIndexDigest] = tempDir.WriteIndex("deleted-index", deletedManifestDigest),
+            [deletedManifestDigest] = tempDir.WriteManifest("deleted-manifest", configDigest, layerDigest),
+            [remainingIndexDigest] = tempDir.WriteIndex("remaining-index", remainingManifestDigest),
+
+            // Deliberately absent: remainingManifestDigest never resolves, even though the index
+            // naming it did.
+        };
+
+        var remaining = new List<ImageDescription>
+        {
+            Description("docker.io/library/kept:latest", remainingIndexDigest),
+        };
+        var fake = new FakeImagesServiceClient(DanglingContentFailure(), remaining, resolvable);
+        var runtime = NewRuntime(fake);
+        using var _ = runtime;
+
+        await runtime.PruneImagesAsync([deletedIndexDigest], CancellationToken.None);
+
+        Assert.Empty(fake.ContentDeleteCalls);
+    }
+
+    /// <summary>
+    /// <c>imageList</c> failing outright must abort the scoped reclaim the same as any other
+    /// enumeration failure — zero <c>contentDelete</c> calls, and (this is the regression half, finding
+    /// 2) <see cref="XpcContainerRuntime.PruneImagesAsync"/> itself must not throw even when the failure
+    /// is not an <see cref="XpcException"/>, since <c>TryScopedReclaimAsync</c>'s own doc comment already
+    /// promised to swallow "any other unexpected failure while gathering that proof".
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task PruneImagesAsync_ScopedFallback_AbortsWithZeroContentDeleteCalls_WhenImageListFails(bool xpcException)
+    {
+        using var tempDir = new TempDir();
+
+        var deletedIndexDigest = RepeatDigest('1');
+        var deletedManifestDigest = RepeatDigest('2');
+        var configDigest = RepeatDigest('3');
+
+        var resolvable = new Dictionary<string, string?>
+        {
+            [deletedIndexDigest] = tempDir.WriteIndex("deleted-index", deletedManifestDigest),
+            [deletedManifestDigest] = tempDir.WriteManifest("deleted-manifest", configDigest),
+        };
+
+        Exception listFailure = xpcException
+            ? XpcException.ApiServer("internalError", "images service unavailable")
+            : new InvalidOperationException("malformed imageList reply");
+        var fake = new FakeImagesServiceClient(DanglingContentFailure(), [], resolvable, listFailure);
+        var runtime = NewRuntime(fake);
+        using var _ = runtime;
+
+        await runtime.PruneImagesAsync([deletedIndexDigest], CancellationToken.None);
+
+        Assert.Empty(fake.ContentDeleteCalls);
+    }
+
+    /// <summary>
     /// Fix direction §4: the scoped reclaim runs under the same <see cref="BlobSweepGate"/> exclusion
     /// as the whole-store sweep it falls back from — a concurrent pull must not be able to start (and
     /// so must not be able to write blobs) while the scoped <c>contentDelete</c> is still in flight.
@@ -259,7 +388,7 @@ public sealed class XpcContainerRuntimePruneScopedReclaimTests
     /// <see cref="XpcContainerRuntimeListImagesToleranceTests.FakeImagesServiceClient"/> already
     /// exercises; <c>contentDelete</c> records the digests it was asked to delete.</summary>
     private sealed class FakeImagesServiceClient(
-        XpcException cleanupFailure, List<ImageDescription> remaining, Dictionary<string, string?> resolvable)
+        XpcException cleanupFailure, List<ImageDescription> remaining, Dictionary<string, string?> resolvable, Exception? listFailure = null)
         : ImagesServiceClient(new XpcClient("com.apple.container.test.images.fake", NullLogger.Instance), TimeSpan.FromSeconds(30))
     {
         private readonly object _sync = new();
@@ -312,6 +441,11 @@ public sealed class XpcContainerRuntimePruneScopedReclaimTests
         public override Task<List<ImageDescription>> ImageListAsync(CancellationToken ct)
         {
             Record("ImageListAsync");
+            if (listFailure is not null)
+            {
+                throw listFailure;
+            }
+
             return Task.FromResult(remaining);
         }
 

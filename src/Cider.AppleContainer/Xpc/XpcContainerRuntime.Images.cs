@@ -831,9 +831,10 @@ internal sealed partial class XpcContainerRuntime
     /// </para>
     /// <para>
     /// Any other unexpected failure while gathering that proof (the images service going away
-    /// mid-walk, an XPC error unrelated to a single missing blob) is treated the same way — caught,
-    /// logged, and answered with zero deletions — rather than turning this best-effort fallback into a
-    /// second way for <c>docker image prune</c> to 500.
+    /// mid-walk, an XPC error unrelated to a single missing blob, a malformed reply that throws
+    /// during JSON deserialization rather than as an <see cref="XpcException"/>) is treated the same
+    /// way — caught, logged, and answered with zero deletions — rather than turning this best-effort
+    /// fallback into a second way for <c>docker image prune</c> to 500.
     /// </para>
     /// </summary>
     private async Task TryScopedReclaimAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct)
@@ -890,7 +891,7 @@ internal sealed partial class XpcContainerRuntime
                 "image prune (scoped fallback): reclaimed {Count} orphaned blob(s), {Size} byte(s) after the whole-store sweep failed",
                 reclaimedDigests.Count, imageSize);
         }
-        catch (XpcException ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "image prune (scoped fallback): could not complete the scoped reclaim; deleting nothing");
         }
@@ -906,17 +907,35 @@ internal sealed partial class XpcContainerRuntime
     /// <see cref="TryScopedReclaimAsync"/> treats that as fatal to the *whole* reclaim when walking a
     /// remaining image (the safety rule its own doc comment states), and as "this one image
     /// contributes nothing" when walking a deleted image.
+    /// <para>
+    /// A blob that parses but yields no config/layer digest is not proof; return false. Concretely:
+    /// if the digest does not resolve to an index shape at all (<see cref="OciIndex.Manifests"/> is
+    /// null — either the blob failed to resolve, or it parsed as something else entirely), the same
+    /// digest is re-read as a bare <see cref="AppleOciManifest"/> — a legitimately single-manifest
+    /// image with no index wrapper still counts as proof as long as it names a config or layer
+    /// digest; anything else does not, and this returns false. And when the index does resolve but
+    /// every one of its entries is attestation-only (<see cref="RealVariants"/> comes back empty),
+    /// that is also not proof — nothing about the image was positively accounted for — so this
+    /// returns false rather than silently treating an attestation-only index as a fully-walked,
+    /// content-free image.
+    /// </para>
     /// </summary>
     private async Task<bool> CollectManifestDigestsAsync(string? digest, HashSet<string> into, CancellationToken ct)
     {
         var index = await GetBlobAsync<OciIndex>(digest, ct).ConfigureAwait(false);
-        if (index is null)
+        if (index?.Manifests is null)
+        {
+            return await CollectBareManifestDigestsAsync(digest, into, ct).ConfigureAwait(false);
+        }
+
+        var variants = RealVariants(index);
+        if (variants.Count == 0)
         {
             return false;
         }
 
         var complete = true;
-        foreach (var variant in RealVariants(index))
+        foreach (var variant in variants)
         {
             if (variant.Digest is not { Length: > 0 } variantDigest)
             {
@@ -949,6 +968,44 @@ internal sealed partial class XpcContainerRuntime
         }
 
         return complete;
+    }
+
+    /// <summary>
+    /// The fallback half of <see cref="CollectManifestDigestsAsync"/>: <paramref name="digest"/> did
+    /// not resolve to an index shape, so re-read the same digest as a bare
+    /// <see cref="AppleOciManifest"/> directly — a legitimately single-manifest image (no index
+    /// wrapper at all) still walks and still counts as proof. Only actually harvesting a config or
+    /// layer digest counts as proof; a manifest that resolves but names neither (or a digest that
+    /// does not resolve as a manifest either) returns false the same as an unreadable index would.
+    /// </summary>
+    private async Task<bool> CollectBareManifestDigestsAsync(string? digest, HashSet<string> into, CancellationToken ct)
+    {
+        var manifest = await GetBlobAsync<AppleOciManifest>(digest, ct).ConfigureAwait(false);
+        if (manifest is null)
+        {
+            return false;
+        }
+
+        var harvested = false;
+        if (manifest.Config?.Digest is { Length: > 0 } configDigest)
+        {
+            into.Add(configDigest);
+            harvested = true;
+        }
+
+        if (manifest.Layers is { Count: > 0 } layers)
+        {
+            foreach (var layer in layers)
+            {
+                if (layer.Digest is { Length: > 0 } layerDigest)
+                {
+                    into.Add(layerDigest);
+                    harvested = true;
+                }
+            }
+        }
+
+        return harvested;
     }
 
     /// <summary>

@@ -846,6 +846,16 @@ public sealed class ImageManager
 
             deleted.Add(new ImageDeleteResponseItem { Deleted = image.Id });
             deletedIndexDigests.AddRange(image.IndexDigests);
+            // cider-ehn fix direction §5, resolved: `image.Size` is already "config.size + sum of
+            // layers[].size across every real variant" (VariantSize/ToRuntimeImage), i.e. every byte
+            // this image's own manifests name — the same bytes the whole-store sweep or the scoped
+            // fallback (TryScopedReclaimAsync) may go on to actually delete from the content store for
+            // this image. Adding PruneImagesAsync's own reclaimed-byte count on top would double-count
+            // those bytes, not report a second, independent reclaim. It would also *overstate* a scoped
+            // reclaim that had to exclude a blob still shared with a surviving image: `image.Size`
+            // already, correctly, does not net that sharing out either way, so it stays the one number
+            // `SpaceReclaimed` is built from. PruneImagesAsync therefore intentionally keeps returning
+            // Task, not a byte count — see the cider-ehn task comment recording this decision.
             space += image.Size;
             _events.Publish(DockerEvents.Image("delete", image.Id, image.Id));
         }
