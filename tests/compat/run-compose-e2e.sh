@@ -40,12 +40,13 @@ fixture_notes=""
 client_log=""
 
 start_daemon || { echo "daemon failed to start" >&2; exit 1; }
+snapshot_images
 
 cleanup_fixture() {
   ( cd "$FIXTURE_DIR" && docker compose -p "$COMPOSE_PROJECT" down -v -t 5 ) >/dev/null 2>&1 || true
   docker network rm cider-compat-net >/dev/null 2>&1 || true
 }
-trap 'cleanup_fixture; stop_daemon' EXIT
+trap 'cleanup_fixture; cleanup_new_images; stop_daemon' EXIT
 
 # KNOWN DAEMON BUG (found via this harness, reported, NOT fixed here per
 # tests/compat ownership boundaries): POST /networks/create returns 500

@@ -56,6 +56,7 @@ cleanup() {
   orb_docker volume rm "$ORB_VOLUME" >/dev/null 2>&1 || true
   cider_docker rm -f "$ORB_CONTAINER" >/dev/null 2>&1 || true
   cider_docker volume rm "$ORB_VOLUME" >/dev/null 2>&1 || true
+  cleanup_new_images
   stop_daemon
   exit $rc
 }
@@ -76,6 +77,7 @@ fi
 # 2. Start our daemon.
 # ---------------------------------------------------------------------------
 start_daemon || { echo "[diff-vs-orbstack] daemon failed to start" >&2; exit 1; }
+snapshot_images
 
 # ---------------------------------------------------------------------------
 # 3. Run the identical scenario against both engines.

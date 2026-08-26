@@ -76,7 +76,8 @@ run_with_timeout() {
 }
 
 start_daemon || { echo "daemon failed to start" >&2; exit 1; }
-trap 'stop_daemon' EXIT
+snapshot_images
+trap 'cleanup_new_images; stop_daemon' EXIT
 
 rm -rf "$WORK"
 mkdir -p "$WORK"

@@ -176,6 +176,7 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
         }
 
         await CleanupStaleForwardersAsync(ct);
+        await ReapOrphanedForwardersAsync(ct);
     }
 
     /// <summary>
@@ -233,6 +234,120 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
         && string.Equals(system, "dns", StringComparison.Ordinal)
         && ContainerIdentity.TryReadLabel(container.Labels, DataDirLabel, LegacyDataDirLabel, out var hash)
         && string.Equals(hash, _dataDirHash, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Removes DNS forwarders belonging to <em>other</em> daemon instances (any data-dir hash, not just
+    /// ours — <see cref="CleanupStaleForwardersAsync"/> already covers our own, by network liveness)
+    /// whose owning daemon is gone for good, per cider-0o3: a hard-killed daemon never runs its own
+    /// shutdown release (<see cref="ReleaseAsync"/>) or this cleanup, so its forwarder VMs (256 MB
+    /// each) would otherwise sit there forever, and a throwaway run's data dir (e.g. the E2E fixture's
+    /// <c>/tmp/cider-e2e-&lt;id&gt;</c>, freshly generated every run) is never reused, so a future
+    /// daemon's own <see cref="_dataDirHash"/> would never again equal the dead one's either.
+    /// <para/>
+    /// <see cref="DataDirLabel"/> carries only a one-way SHA-256 hash of the data dir
+    /// (<see cref="DataDirHash"/>), not the path itself, so "is the owning daemon still around" cannot
+    /// be answered by reversing it. Instead this hashes every data dir this scan can still find on
+    /// disk (see <see cref="ComputeLiveDataDirHashes"/> — this instance's own, the real default, and
+    /// every <c>/tmp/cider-*</c> directory) into the set of "live" hashes, and removes any forwarder
+    /// whose hash is in none of them. A second daemon that is actually still running is always
+    /// protected by this: its data dir necessarily still exists on disk for as long as it is up, so
+    /// its hash is always in the live set.
+    /// <para/>
+    /// Residual (confirmed live against this machine's own accumulated state while building this):
+    /// a data dir this scan does not know to look under (outside <c>/tmp/cider-*</c> and the real
+    /// default) reads as "no live data dir" even for a daemon that is genuinely still running there —
+    /// this covers both a custom <c>--data-dir</c> outside those conventions, and a
+    /// <c>/tmp/cider-*</c> one whose directory a still-running daemon's own process had removed out
+    /// from under it (its listening socket keeps working by inode once opened, so the process can
+    /// stay up with no directory left at its own configured path — observed live on this machine
+    /// during verification, though with no forwarder of its own at the time). Conversely, a data dir
+    /// left on disk by a hard-killed daemon this scan does know to look under reads as "live" until
+    /// something removes it. This is a best-effort machine-wide sweep, not a guarantee, exactly the
+    /// tradeoff cider-0o3 accepts in place of an isolated per-run store.
+    /// </summary>
+    private async Task ReapOrphanedForwardersAsync(CancellationToken ct)
+    {
+        try
+        {
+            var liveHashes = ComputeLiveDataDirHashes();
+            foreach (var container in await _runtime.ListContainersAsync(ct))
+            {
+                if (!ContainerIdentity.TryReadLabel(container.Labels, SystemLabel, LegacySystemLabel, out var system)
+                    || !string.Equals(system, "dns", StringComparison.Ordinal)
+                    || !ContainerIdentity.TryReadLabel(container.Labels, DataDirLabel, LegacyDataDirLabel, out var hash)
+                    || string.Equals(hash, _dataDirHash, StringComparison.Ordinal)
+                    || liveHashes.Contains(hash))
+                {
+                    continue;
+                }
+
+                ContainerIdentity.TryReadLabel(container.Labels, NetworkLabel, LegacyNetworkLabel, out var network);
+                _logger.LogInformation(
+                    "removing orphaned DNS forwarder {Container} for network '{Network}': its data-dir hash " +
+                    "{Hash} matches no data dir this scan can still find, so its owning daemon is gone",
+                    container.RuntimeId,
+                    network,
+                    hash);
+
+                try
+                {
+                    await _runtime.RemoveContainerAsync(container.RuntimeId, force: true, ct);
+                }
+                catch (RuntimeException ex)
+                {
+                    _logger.LogDebug(ex, "could not remove the orphaned DNS forwarder {Container}", container.RuntimeId);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is RuntimeException or IOException)
+        {
+            _logger.LogDebug(ex, "could not scan for orphaned DNS forwarders");
+        }
+    }
+
+    /// <summary>
+    /// Hashes every data dir <see cref="ReapOrphanedForwardersAsync"/> can still find on disk: this
+    /// instance's own, the real default (<c>~/.cider</c>), and every <c>/tmp/cider-*</c> directory —
+    /// the E2E fixture's own convention is <c>/tmp/cider-e2e-&lt;id&gt;</c>
+    /// (<c>DaemonFixture.BuildOptions</c>) and the compat harness's is <c>/tmp/cider-*-data</c>
+    /// (<c>tests/compat/lib/daemon.sh</c>), but ad hoc debugging sessions on this machine are observed
+    /// to use other <c>/tmp/cider-*</c> names too (e.g. <c>cider-repro</c>), so the broadest prefix a
+    /// throwaway data dir under <c>/tmp</c> is ever *not* going to start with is used rather than
+    /// either narrower convention alone — a name that happens to collide without being a real data dir
+    /// (a build work dir, a log file's directory) only over-protects a hash that could never legitimately
+    /// belong to a forwarder anyway, so it costs nothing. A directory that no longer exists contributes
+    /// nothing, by design: it is exactly what marks a forwarder as orphaned.
+    /// </summary>
+    private HashSet<string> ComputeLiveDataDirHashes()
+    {
+        var hashes = new HashSet<string>(StringComparer.Ordinal) { _dataDirHash };
+
+        void AddIfExists(string dir)
+        {
+            if (Directory.Exists(dir))
+            {
+                hashes.Add(DataDirHash(dir));
+            }
+        }
+
+        AddIfExists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cider"));
+
+        // Literal "/tmp", not Path.GetTempPath(): on macOS that resolves to a per-user
+        // /var/folders/.../T/ path from $TMPDIR, but both DaemonFixture.BuildOptions and
+        // tests/compat/lib/daemon.sh hardcode "/tmp/..." directly, so that is what must be scanned.
+        try
+        {
+            foreach (var dir in Directory.EnumerateDirectories("/tmp", "cider-*"))
+            {
+                AddIfExists(dir);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+
+        return hashes;
+    }
 
     /// <summary>Stops the DNS server and releases the held forwarder processes.</summary>
     public async Task StopAsync()

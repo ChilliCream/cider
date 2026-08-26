@@ -169,6 +169,49 @@ wait_for_ping() {
   curl -fsS --max-time 2 --unix-socket "$CIDER_COMPAT_SOCKET" http://localhost/_ping >/dev/null 2>&1
 }
 
+# snapshot_images / cleanup_new_images: cider-0o3 -- every compat run shares
+# one Apple content store with the operator's own images and every other
+# concurrent run (there is exactly one apiserver per user; see cider-0o3's
+# task notes for why that cannot be isolated per run), so images this run
+# built, tagged or pulled must not outlive it, same rule DaemonFixture
+# applies on the E2E side (cider-24v: never remove what the run did not
+# create). By id (--no-trunc), so a multi-tag image is recognised as
+# pre-existing, or removed, under every one of its tags at once, and a
+# caller that never calls snapshot_images gets a no-op cleanup_new_images
+# rather than a guess at what may be safely removed.
+#
+# Since cider-ede.31 a plain `docker rmi` no longer sweeps the store's blob
+# content on the XPC transport (only `docker image prune` does, once per
+# call), so this may free the image *records* here without reclaiming the
+# disk space their blobs used the way it implicitly did before that fix --
+# an explicit store-wide prune from every compat run's teardown would
+# itself be a shared-infrastructure sweep racing every other concurrent
+# run's in-flight builds on that one store, which this harness must not risk.
+_CIDER_COMPAT_IMAGES_BEFORE=""
+
+snapshot_images() {
+  _CIDER_COMPAT_IMAGES_BEFORE="$(mktemp)"
+  docker images -aq --no-trunc 2>/dev/null | sort -u >"$_CIDER_COMPAT_IMAGES_BEFORE"
+}
+
+cleanup_new_images() {
+  if [[ -z "$_CIDER_COMPAT_IMAGES_BEFORE" || ! -f "$_CIDER_COMPAT_IMAGES_BEFORE" ]]; then
+    return 0
+  fi
+
+  local after new_ids
+  after="$(mktemp)"
+  docker images -aq --no-trunc 2>/dev/null | sort -u >"$after"
+  new_ids="$(comm -13 "$_CIDER_COMPAT_IMAGES_BEFORE" "$after")"
+  if [[ -n "$new_ids" ]]; then
+    # shellcheck disable=SC2086  # word-splitting is the point: one id per rmi argument
+    docker rmi -f $new_ids >/dev/null 2>&1 || true
+  fi
+
+  rm -f "$_CIDER_COMPAT_IMAGES_BEFORE" "$after"
+  _CIDER_COMPAT_IMAGES_BEFORE=""
+}
+
 # curl_ad: convenience wrapper — `curl_ad -s /containers/json?all=1`
 curl_ad() {
   curl --unix-socket "$CIDER_COMPAT_SOCKET" "$@"

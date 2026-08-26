@@ -48,7 +48,8 @@ fi
 
 echo "==> Starting daemon"
 start_daemon || exit 1
-trap stop_daemon EXIT
+snapshot_images
+trap 'cleanup_new_images; stop_daemon' EXIT
 
 echo "==> Running schema validation"
 "$VENV/bin/python3" lib/swagger_check.py \

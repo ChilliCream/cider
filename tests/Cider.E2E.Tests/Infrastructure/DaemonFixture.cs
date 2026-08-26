@@ -97,6 +97,7 @@ public class DaemonFixture : IAsyncLifetime
     private readonly HashSet<string> _preExistingContainerIds = new(StringComparer.Ordinal);
     private readonly HashSet<string> _preExistingNetworkNames = new(StringComparer.Ordinal);
     private readonly HashSet<string> _preExistingVolumeNames = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _preExistingImageIds = new(StringComparer.Ordinal);
 
     // Set true only once all three pre-existing lists below have been captured successfully.
     // Teardown refuses to remove anything unless this is true, so a failed snapshot can never
@@ -239,7 +240,26 @@ public class DaemonFixture : IAsyncLifetime
             _preExistingVolumeNames.Add(volume);
         }
 
-        // Only reached once all three lists above were captured successfully; teardown checks this
+        // By id (not tag): a multi-tag image must be recognised as pre-existing under every one of
+        // its tags, and removed as one unit under all of them if the run itself created it -- an id
+        // is the only handle stable across that. cider-24v/cider-0o3: the shared Apple store means an
+        // image already present before this fixture started (the developer's own images, and every
+        // base layer another concurrent run has already pulled) must never be swept up here.
+        var images = await DockerAsync(["images", "-aq", "--no-trunc"], timeout: TimeSpan.FromSeconds(60));
+        if (!images.Ok)
+        {
+            _log.Enqueue(images.ToString());
+            throw new InvalidOperationException(
+                "failed to snapshot pre-existing images; refusing to start the fixture, since " +
+                "teardown must never guess at what it may safely remove:\n" + images);
+        }
+
+        foreach (var id in images.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            _preExistingImageIds.Add(id);
+        }
+
+        // Only reached once all four lists above were captured successfully; teardown checks this
         // before removing anything.
         _snapshotOk = true;
     }
@@ -469,6 +489,26 @@ public class DaemonFixture : IAsyncLifetime
             }
 
             LogSkipped("network", skippedNetworks);
+
+            // Images this run built, tagged or pulled -- including the synthetic `cider-build-*` tags
+            // an untagged build leaves behind (cider-ede.10/ImageManager). By id, so a multi-tag image
+            // is removed in one call under every tag at once, same as `docker rmi -f <id>`.
+            //
+            // Since cider-ede.31, a plain `rmi` no longer sweeps the store's blob content on the XPC
+            // transport (only `docker image prune` does, and only once per prune call) -- so this may
+            // untag/remove the image records without reclaiming the disk space their blobs used the
+            // way it implicitly did before that fix. That tradeoff is deliberate: an explicit
+            // store-wide prune from every fixture's teardown would be a shared-infrastructure sweep
+            // racing every other concurrent run's in-flight (not-yet-tagged) builds on the one Apple
+            // store this machine has, which cider-0o3 is explicit teardown must never risk.
+            var currentImages = await DockerAsync(["images", "-aq", "--no-trunc"], timeout: TimeSpan.FromSeconds(60));
+            var allImageIds = currentImages.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var imageIds = allImageIds.Where(id => !_preExistingImageIds.Contains(id)).ToArray();
+            LogSkipped("image", allImageIds.Length - imageIds.Length);
+            if (imageIds.Length > 0)
+            {
+                await DockerAsync(["rmi", "-f", .. imageIds], timeout: TimeSpan.FromSeconds(180));
+            }
         }
         catch (Exception ex) when (ex is IOException or InvalidOperationException)
         {

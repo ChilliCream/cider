@@ -67,7 +67,8 @@ AT_DIR="$PODMAN_SRC/test/apiv2"
 [[ -d "$AT_DIR" ]] || { echo "ERROR: $AT_DIR not found after clone -- tag layout may have changed" >&2; exit 1; }
 
 start_daemon || exit 1
-trap stop_daemon EXIT
+snapshot_images
+trap 'cleanup_new_images; stop_daemon' EXIT
 
 # shellcheck source=lib/apiv2-runner.sh
 source "$SCRIPT_DIR/lib/apiv2-runner.sh"

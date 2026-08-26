@@ -109,7 +109,8 @@ log "running: pytest ${TEST_TARGETS[*]} -k \"${KEXPR}\""
 # 4. start daemon, run, stop daemon
 # ---------------------------------------------------------------------------
 start_daemon || exit 1
-trap stop_daemon EXIT
+snapshot_images
+trap 'cleanup_new_images; stop_daemon' EXIT
 
 pushd "${SRC_DIR}" >/dev/null
 
