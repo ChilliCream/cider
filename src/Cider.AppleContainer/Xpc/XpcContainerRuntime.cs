@@ -23,7 +23,9 @@ namespace Cider.AppleContainer.Xpc;
 /// <c>CopyFromContainerAsync</c>/<c>CopyToContainerAsync</c>/<c>ExportContainerAsync</c>
 /// (<c>XpcContainerRuntime.Archive.cs</c>); cider-ede.10 ports every image operation
 /// (<c>XpcContainerRuntime.Images.cs</c>, <c>ProgressUpdateListener</c>); cider-ede.8 ports
-/// <c>ExecAsync</c> (<c>XpcContainerRuntime.Process.cs</c>, <c>ProcessConfigurationBuilder</c>).
+/// <c>ExecAsync</c> (<c>XpcContainerRuntime.Process.cs</c>, <c>ProcessConfigurationBuilder</c>);
+/// cider-ede.13 ports <c>GetBuilderStatusAsync</c>/<c>DialBuilderAsync</c>
+/// (<c>XpcContainerRuntime.Builder.cs</c>) — <c>StartBuilderAsync</c> stays delegated.
 /// Every other
 /// <see cref="IContainerRuntime"/> member is listed in the <c>// FALLBACK</c> block at the bottom and
 /// delegates straight to the CLI runtime until a later task ports it.
@@ -522,18 +524,12 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     // (task cider-ede.10). BuildImageAsync stays on the CLI (classic builder, task's non-goals) and
     // LoginAsync stays on the CLI (registry login stores credentials the images service reads, fix
     // direction §2) — neither is this task's job. ExecAsync is ported — see
-    // XpcContainerRuntime.Process.cs/XpcContainerProcess.cs (task cider-ede.8); DialBuilderAsync below
-    // benefits automatically, since it calls ExecAsync.
+    // XpcContainerRuntime.Process.cs/XpcContainerProcess.cs (task cider-ede.8). GetBuilderStatusAsync/
+    // DialBuilderAsync are ported (StartBuilderAsync stays delegated) — see
+    // XpcContainerRuntime.Builder.cs (task cider-ede.13).
 
     public Task<string> BuildImageAsync(BuildSpec spec, IProgress<ProgressEvent> progress, CancellationToken ct) =>
         _cliFallback.BuildImageAsync(spec, progress, ct);
 
     public Task LoginAsync(RegistryAuth auth, CancellationToken ct) => _cliFallback.LoginAsync(auth, ct);
-
-    public Task<BuilderStatus?> GetBuilderStatusAsync(CancellationToken ct) => _cliFallback.GetBuilderStatusAsync(ct);
-
-    public Task StartBuilderAsync(int? cpus, long? memoryBytes, CancellationToken ct) =>
-        _cliFallback.StartBuilderAsync(cpus, memoryBytes, ct);
-
-    public Task<IContainerProcess> DialBuilderAsync(CancellationToken ct) => _cliFallback.DialBuilderAsync(ct);
 }
