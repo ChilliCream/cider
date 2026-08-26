@@ -577,7 +577,6 @@ public class DaemonFixture : IAsyncLifetime
             return [];
         }
 
-        var wanted = new HashSet<string>(candidateIds, StringComparer.Ordinal);
         var listing = await DockerAsync(
             ["images", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}"],
             timeout: TimeSpan.FromSeconds(60));
@@ -588,10 +587,28 @@ public class DaemonFixture : IAsyncLifetime
             return [];
         }
 
+        return ParseOwnedImageIds(listing.Stdout, candidateIds);
+    }
+
+    /// <summary>
+    /// The line-parsing/set logic <see cref="FilterOwnedImageIdsAsync"/> runs over a real <c>docker
+    /// images -a --no-trunc --format "{{.ID}}\t{{.Repository}}:{{.Tag}}"</c> listing, pulled out as a
+    /// pure function (cider-0o3 finding #2) so it is drivable directly in
+    /// <c>DaemonFixtureImageOwnershipTests</c> against captured real CLI output, without a live daemon
+    /// or <c>CIDER_E2E=1</c> — the whole point being that this is the one genuinely destructive step
+    /// in teardown and it previously had zero non-E2E coverage. Fails closed line by line: a line that
+    /// does not split into exactly two tab-separated fields, or whose id is not in
+    /// <paramref name="candidateIds"/>, is ignored rather than guessed at (this is also the one place
+    /// the real CLI's separator matters — the format string above is tab-separated, unlike the plain-
+    /// space-separated shell equivalent in <c>tests/compat/lib/daemon.sh</c>).
+    /// </summary>
+    internal static string[] ParseOwnedImageIds(string listingText, IReadOnlyCollection<string> candidateIds)
+    {
+        var wanted = new HashSet<string>(candidateIds, StringComparer.Ordinal);
         var owned = new HashSet<string>(StringComparer.Ordinal);
         var disqualified = new HashSet<string>(StringComparer.Ordinal);
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var line in listing.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        foreach (var line in listingText.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var parts = line.Split('\t', 2);
             if (parts.Length != 2 || !wanted.Contains(parts[0]))

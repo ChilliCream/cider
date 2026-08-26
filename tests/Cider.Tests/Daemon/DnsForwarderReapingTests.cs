@@ -188,6 +188,50 @@ public sealed class DnsForwarderReapingTests
     }
 
     [Fact]
+    public async Task Relative_data_dir_is_written_to_the_path_label_as_absolute()
+    {
+        // cider-0o3 finding #5: DataDirPathLabel used to carry _options.DataDir verbatim, so a
+        // relative --data-dir would be resolved against whichever daemon's cwd later ran the reap
+        // scan instead of the creating daemon's own. EnsureCoreAsync now writes Path.GetFullPath(...)
+        // -- this drives the real create path (not just the label constant) to pin that.
+        var relativeDataDir = Path.Combine("cider-dns-relative-test", Guid.NewGuid().ToString("n")[..8]);
+        var options = new CiderOptions
+        {
+            DataDir = relativeDataDir,
+            DnsListen = "127.0.0.1:0",
+        };
+        options.EnsureDirectories();
+
+        var runtime = new FakeContainerRuntime();
+        var networks = new NetworkManager(runtime, new InMemoryRecordStore<NetworkRecord>(), new EventBus(), NullLogger<NetworkManager>.Instance);
+        await networks.EnsureDefaultAsync(CancellationToken.None);
+
+        var service = new DnsForwarderService(
+            runtime, networks, new NullDnsResolver(), options, NullLogger<DnsForwarderService>.Instance);
+
+        try
+        {
+            // EnsureAsync is a no-op until StartAsync has run (it bails out early while _server is
+            // null), same as every real caller.
+            await service.StartAsync(CancellationToken.None);
+            await service.EnsureAsync("bridge", CancellationToken.None);
+
+            var containerId = DnsForwarderService.ForwarderName("bridge", DnsForwarderService.DataDirHash(options.DataDir));
+            var spec = runtime.GetSpec(containerId);
+            Assert.NotNull(spec);
+            var path = spec!.Labels[DnsForwarderService.DataDirPathLabel];
+            Assert.True(Path.IsPathRooted(path), $"expected an absolute path, got '{path}'");
+            Assert.Equal(Path.GetFullPath(relativeDataDir), path);
+        }
+        finally
+        {
+            await service.ReleaseAsync("bridge", CancellationToken.None);
+            await service.StopAsync();
+            Directory.Delete(Path.GetFullPath(relativeDataDir), recursive: true);
+        }
+    }
+
+    [Fact]
     public void IsOrphanedForwarder_decision_matrix()
     {
         var liveHashes = new HashSet<string>(StringComparer.Ordinal) { "own00000", "live0000" };

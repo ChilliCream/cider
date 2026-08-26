@@ -547,8 +547,14 @@ container network delete <name>
 cider sync                               # then bring cider's own records back in line
 ```
 
-Orphaned `cider-dns-*` CoreDNS forwarders come from the same mechanism and are removed the same way
-(`container rm -f <name>`); the daemon starts a fresh forwarder on demand.
+Orphaned `cider-dns-*` CoreDNS forwarders are reaped automatically: since cider-0o3, every daemon
+startup runs `DnsForwarderService.ReapOrphanedForwardersAsync`, which stops and deletes any forwarder
+whose owning daemon's data dir no longer exists on disk — so starting or restarting any Cider instance
+cleans these up the same way it recovers the held children above, with no manual step required. A
+forwarder belonging to a still-live daemon (its data dir still on disk) is never touched, including a
+second daemon running against a different `--data-dir`. For a machine where no daemon will be started
+again — the same case the recovery list above is for — remove one by hand instead:
+`container stop <name> && container delete -f <name>`; the daemon starts a fresh forwarder on demand.
 
 ### `docker` talks to the wrong engine
 

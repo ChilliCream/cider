@@ -137,11 +137,68 @@ start_daemon() {
   return 1
 }
 
+# cleanup_forwarders: cider-0o3 -- release this run's own CoreDNS forwarder
+# VM(s), the compat-side mirror of DaemonFixture.CleanupForwarderAsync on the
+# E2E side. A forwarder's engine id is <network>-<hash>, where <hash> is the
+# first 8 hex chars of SHA-256(data dir) (DnsForwarderService.ForwarderName /
+# DataDirHash), so this run's own hash identifies exactly the forwarder(s)
+# its own daemon created -- never a still-live daemon's, including another
+# concurrent compat/E2E run's (cider-24v: never remove what this run did not
+# create). Without this, every forwarder this run's daemon ever started
+# stays behind as a running VM the new reaper can never reap: it carries
+# DataDirPathLabel pointing at $CIDER_COMPAT_DATA_DIR, and as long as that
+# directory still exists on disk (nothing here removed it -- see the
+# `rm -rf "$CIDER_COMPAT_DATA_DIR"` below) it reads as "live" forever.
+#
+# Fail-safe like snapshot_images/cleanup_new_images above: a failed `container
+# ls` listing is never treated as "nothing to clean" vs. "everything to
+# clean" -- it just leaves whatever forwarders exist in place rather than
+# guessing.
+cleanup_forwarders() {
+  command -v container >/dev/null 2>&1 || return 0
+  command -v jq >/dev/null 2>&1 || {
+    _cider_log "cleanup_forwarders: jq not found on PATH; leaving any forwarders in place"
+    return 0
+  }
+
+  local hash
+  hash="$(printf '%s' "$CIDER_COMPAT_DATA_DIR" | shasum -a 256 | cut -c1-8)"
+
+  local listing
+  if ! listing="$(container ls -a --format json 2>/dev/null)"; then
+    _cider_log "cleanup_forwarders: 'container ls -a' failed; leaving any forwarders in place rather than guessing"
+    return 0
+  fi
+  [[ -z "$listing" ]] && return 0
+
+  local names
+  names="$(printf '%s' "$listing" | jq -r --arg suffix "-$hash" \
+    '.[] | (.configuration.id // .id) | select(type == "string" and endswith($suffix))' 2>/dev/null)" || {
+    _cider_log "cleanup_forwarders: could not parse 'container ls -a' output; leaving any forwarders in place"
+    return 0
+  }
+  [[ -z "$names" ]] && return 0
+
+  local name
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    _cider_log "releasing this run's DNS forwarder $name"
+    container stop "$name" >/dev/null 2>&1 || true
+    container delete -f "$name" >/dev/null 2>&1 || true
+  done <<<"$names"
+}
+
 # stop_daemon: kill exactly the PID start_daemon captured via $! at launch
 # (nothing else -- no pgrep/pkill pattern matching, which risks matching an
 # unrelated cider process such as the operator's real installed daemon),
 # wait briefly for graceful shutdown (which unlinks the socket), then
-# force-kill and unlink defensively.
+# force-kill and unlink defensively. Also releases this run's own DNS
+# forwarder VM(s) (see cleanup_forwarders above) and removes the isolated
+# data dir -- it is already rm -rf'd at the top of start_daemon, so nothing
+# depends on it surviving past this point, and removing it here means any
+# forwarder cleanup_forwarders happened to miss becomes reapable by
+# IsOrphanedForwarder's Directory.Exists check on the next daemon start
+# instead of being pinned live forever.
 stop_daemon() {
   local pid=""
   [[ -f "$CIDER_COMPAT_PID_FILE" ]] && pid="$(cat "$CIDER_COMPAT_PID_FILE" 2>/dev/null || true)"
@@ -161,6 +218,10 @@ stop_daemon() {
 
   rm -f "$CIDER_COMPAT_PID_FILE"
   rm -f "$CIDER_COMPAT_SOCKET"
+
+  cleanup_forwarders
+
+  rm -rf "$CIDER_COMPAT_DATA_DIR"
 }
 
 # wait_for_ping: re-check liveness mid-run (used by scripts that expect a

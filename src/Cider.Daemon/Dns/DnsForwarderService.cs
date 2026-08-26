@@ -327,8 +327,13 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
     /// MAJOR #4) without a real <see cref="IContainerRuntime"/>. Not our own forwarder and not a DNS
     /// system container both answer <c>false</c> ("not orphaned" — really "not applicable"). When the
     /// forwarder carries <see cref="DataDirPathLabel"/>, orphanhood is decided from that path's
-    /// existence on disk alone; the hash-set heuristic is used only when the label is absent (a
-    /// forwarder created before this label existed).
+    /// existence on disk alone (the path is written via <see cref="Path.GetFullPath(string)"/>, so a
+    /// relative <c>--data-dir</c> is anchored at forwarder-creation time rather than resolved later
+    /// against whichever daemon happens to run the reap scan — an un-normalized label would otherwise
+    /// let a reaping daemon's own cwd decide a live daemon's forwarder is orphaned); the hash-set
+    /// heuristic is used only when the label is absent — a forwarder created before this label
+    /// existed, which keeps the old hash-set hole documented above <see
+    /// cref="ReapOrphanedForwardersAsync"/> until that legacy population is naturally replaced.
     /// </summary>
     internal static bool IsOrphanedForwarder(
         IReadOnlyDictionary<string, string> labels,
@@ -574,7 +579,7 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
                     [SystemLabel] = "dns",
                     [NetworkLabel] = dockerNetworkName,
                     [DataDirLabel] = _dataDirHash,
-                    [DataDirPathLabel] = _options.DataDir,
+                    [DataDirPathLabel] = Path.GetFullPath(_options.DataDir),
                 },
                 Networks = [_networks.RuntimeNameFor(dockerNetworkName)],
                 Mounts =
