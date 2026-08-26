@@ -501,10 +501,32 @@ public class DaemonFixture : IAsyncLifetime
             // store-wide prune from every fixture's teardown would be a shared-infrastructure sweep
             // racing every other concurrent run's in-flight (not-yet-tagged) builds on the one Apple
             // store this machine has, which cider-0o3 is explicit teardown must never risk.
+            //
+            // "New since our snapshot" alone is not enough: the id space is global content shared
+            // with every other concurrent run and the operator's own images, so anything another run
+            // pulled or built between our snapshot and now would look identical to "this run created
+            // it". A second, ownership test narrows the removal to ids this run can actually claim:
+            // only an id all of whose repo:tag entries carry one of this harness's own prefixes
+            // (cider-build-*/cider-e2e*/cider-compat*) is removed; an untagged id or one carrying any
+            // other tag is left alone -- it may be another run's in-flight build, or a base image
+            // (alpine, nginx, ryuk, ...) newly pulled into the shared cache, which stays in the store
+            // by design. The leak this task measures (this fixture's own synthetic tags) is still
+            // cleaned.
             var currentImages = await DockerAsync(["images", "-aq", "--no-trunc"], timeout: TimeSpan.FromSeconds(60));
             var allImageIds = currentImages.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            var imageIds = allImageIds.Where(id => !_preExistingImageIds.Contains(id)).ToArray();
-            LogSkipped("image", allImageIds.Length - imageIds.Length);
+            var newImageIds = allImageIds.Where(id => !_preExistingImageIds.Contains(id)).ToArray();
+            LogSkipped("image", allImageIds.Length - newImageIds.Length);
+
+            var imageIds = await FilterOwnedImageIdsAsync(newImageIds);
+            var unownedCount = newImageIds.Length - imageIds.Length;
+            if (unownedCount > 0)
+            {
+                _log.Enqueue(
+                    $"{DateTime.Now:HH:mm:ss.fff} Information DaemonFixture: teardown skipped {unownedCount} " +
+                    "new image(s) untagged or tagged outside this fixture's own prefixes -- may belong to " +
+                    "another concurrent run or be a shared base image");
+            }
+
             if (imageIds.Length > 0)
             {
                 await DockerAsync(["rmi", "-f", .. imageIds], timeout: TimeSpan.FromSeconds(180));
@@ -527,6 +549,72 @@ public class DaemonFixture : IAsyncLifetime
                     "silently paper over.");
             }
         }
+    }
+
+    /// <summary>
+    /// The repo-tag prefixes this fixture (and the compat harness, <c>tests/compat/lib/daemon.sh</c>)
+    /// actually tag things with -- the synthetic tags cider-0o3's verification asserts on. Used by
+    /// <see cref="FilterOwnedImageIdsAsync"/> to narrow "new since our snapshot" down to "this run can
+    /// actually claim it".
+    /// </summary>
+    private static readonly string[] OwnedImageTagPrefixes = ["cider-build-", "cider-e2e", "cider-compat"];
+
+    /// <summary>
+    /// Narrows <paramref name="candidateIds"/> (already known to be new since <see
+    /// cref="SnapshotPreExistingDockerObjectsAsync"/>) down to the ids teardown may actually remove:
+    /// an id whose every repo:tag entry carries one of <see cref="OwnedImageTagPrefixes"/>. An id that
+    /// is untagged (<c>&lt;none&gt;</c>) or carries any other tag is left alone -- "new" is not the
+    /// same as "ours" on a store shared with every other concurrent run and the operator's own images
+    /// (cider-0o3); an untagged new layer may just as well be another run's in-flight build, and a
+    /// freshly pulled base image (alpine, nginx, ryuk, ...) is shared content other runs depend on, so
+    /// it stays in the cache by design -- re-pulling it is the cost this filter buys. Fails safe: an
+    /// id the listing does not mention at all (e.g. it vanished between calls) is never returned.
+    /// </summary>
+    private async Task<string[]> FilterOwnedImageIdsAsync(IReadOnlyCollection<string> candidateIds)
+    {
+        if (candidateIds.Count == 0)
+        {
+            return [];
+        }
+
+        var wanted = new HashSet<string>(candidateIds, StringComparer.Ordinal);
+        var listing = await DockerAsync(
+            ["images", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}"],
+            timeout: TimeSpan.FromSeconds(60));
+        if (!listing.Ok)
+        {
+            // Cannot tell what any of these ids are tagged with; refuse to remove any of them rather
+            // than guess.
+            return [];
+        }
+
+        var owned = new HashSet<string>(StringComparer.Ordinal);
+        var disqualified = new HashSet<string>(StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var line in listing.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var parts = line.Split('\t', 2);
+            if (parts.Length != 2 || !wanted.Contains(parts[0]))
+            {
+                continue;
+            }
+
+            var id = parts[0];
+            var repoTag = parts[1];
+            seen.Add(id);
+
+            if (repoTag.EndsWith(":<none>", StringComparison.Ordinal)
+                || !OwnedImageTagPrefixes.Any(prefix => repoTag.StartsWith(prefix, StringComparison.Ordinal)))
+            {
+                disqualified.Add(id);
+            }
+            else
+            {
+                owned.Add(id);
+            }
+        }
+
+        return [.. seen.Where(id => owned.Contains(id) && !disqualified.Contains(id))];
     }
 
     /// <summary>

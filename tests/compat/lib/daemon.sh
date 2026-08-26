@@ -187,29 +187,115 @@ wait_for_ping() {
 # an explicit store-wide prune from every compat run's teardown would
 # itself be a shared-infrastructure sweep racing every other concurrent
 # run's in-flight builds on that one store, which this harness must not risk.
+#
+# Fail-safe (cider-0o3 blocker fix): `docker images` against the daemon this
+# script just started -- the least reliable moment for it -- can exit
+# non-zero (e.g. one dangling blob reference breaking the listing). This
+# file deliberately does not `set -o pipefail` (see header), so a failing
+# left-hand side of a pipeline is invisible to `$?` unless checked directly;
+# snapshot_images therefore captures the docker command into a temp file and
+# checks *its* exit status, never the pipeline's last stage. Teardown must
+# never guess at what it may safely remove (DaemonFixture's stance, mirrored
+# here): cleanup_new_images only ever runs when the snapshot is known-good.
 _CIDER_COMPAT_IMAGES_BEFORE=""
+_CIDER_COMPAT_SNAPSHOT_OK=0
+
+# Repo tag prefixes this harness (and the E2E fixture) actually tags things
+# with -- the only tags a new image may be removed under. An id that carries
+# a tag outside this list, or no tag at all (<none>, i.e. untagged), is left
+# alone: it may be another concurrent run's in-flight build, or a base image
+# (alpine, nginx, ryuk, ...) newly pulled into the shared cache, which stays
+# by design -- re-pulling it is the cost this filter buys. The leak this
+# task actually measures (this harness's own synthetic tags) is still
+# cleaned.
+_CIDER_COMPAT_OWNED_TAG_RE='^(cider-build-|cider-e2e|cider-compat)'
 
 snapshot_images() {
-  _CIDER_COMPAT_IMAGES_BEFORE="$(mktemp)"
-  docker images -aq --no-trunc 2>/dev/null | sort -u >"$_CIDER_COMPAT_IMAGES_BEFORE"
+  local tmp
+  tmp="$(mktemp)"
+  if ! docker images -aq --no-trunc >"$tmp" 2>/dev/null; then
+    _cider_log "snapshot_images: 'docker images' failed; refusing to enable image cleanup for this run"
+    rm -f "$tmp"
+    _CIDER_COMPAT_IMAGES_BEFORE=""
+    _CIDER_COMPAT_SNAPSHOT_OK=0
+    return 1
+  fi
+
+  sort -u -o "$tmp" "$tmp"
+  _CIDER_COMPAT_IMAGES_BEFORE="$tmp"
+  _CIDER_COMPAT_SNAPSHOT_OK=1
 }
 
 cleanup_new_images() {
-  if [[ -z "$_CIDER_COMPAT_IMAGES_BEFORE" || ! -f "$_CIDER_COMPAT_IMAGES_BEFORE" ]]; then
+  if [[ "$_CIDER_COMPAT_SNAPSHOT_OK" != "1" || -z "$_CIDER_COMPAT_IMAGES_BEFORE" || ! -f "$_CIDER_COMPAT_IMAGES_BEFORE" ]]; then
     return 0
   fi
 
   local after new_ids
   after="$(mktemp)"
-  docker images -aq --no-trunc 2>/dev/null | sort -u >"$after"
+  if ! docker images -aq --no-trunc >"$after" 2>/dev/null; then
+    _cider_log "cleanup_new_images: teardown-side 'docker images' failed; skipping image cleanup rather than guessing"
+    rm -f "$_CIDER_COMPAT_IMAGES_BEFORE" "$after"
+    _CIDER_COMPAT_IMAGES_BEFORE=""
+    _CIDER_COMPAT_SNAPSHOT_OK=0
+    return 0
+  fi
+  sort -u -o "$after" "$after"
+
+  # Belt-and-braces: an empty pre-run snapshot with a non-empty after-list
+  # would otherwise diff as "every current image is new". A genuinely empty
+  # store at snapshot time is possible but vanishingly unlikely on a
+  # developer machine; treat it as a signal something upstream is off and
+  # refuse to delete rather than guess.
+  if [[ ! -s "$_CIDER_COMPAT_IMAGES_BEFORE" && -s "$after" ]]; then
+    _cider_log "cleanup_new_images: pre-run snapshot is empty but the store is not; refusing to delete anything"
+    rm -f "$_CIDER_COMPAT_IMAGES_BEFORE" "$after"
+    _CIDER_COMPAT_IMAGES_BEFORE=""
+    _CIDER_COMPAT_SNAPSHOT_OK=0
+    return 0
+  fi
+
   new_ids="$(comm -13 "$_CIDER_COMPAT_IMAGES_BEFORE" "$after")"
   if [[ -n "$new_ids" ]]; then
-    # shellcheck disable=SC2086  # word-splitting is the point: one id per rmi argument
-    docker rmi -f $new_ids >/dev/null 2>&1 || true
+    # Ownership filter: only remove a new id all of whose repo:tag entries
+    # are test-owned (see _CIDER_COMPAT_OWNED_TAG_RE above); an id that is
+    # untagged or carries any other tag may belong to another concurrent
+    # run or be a shared base image, so it is left in the store. The
+    # candidate id list is passed to awk as a *file* (not a `-v` string):
+    # macOS's system awk (onetrueawk) mishandles a `-v` value containing
+    # embedded newlines, which a multi-id new_ids always has.
+    local ids_file owned_ids
+    ids_file="$(mktemp)"
+    printf '%s\n' "$new_ids" >"$ids_file"
+    owned_ids="$(
+      docker images -a --no-trunc --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null \
+        | awk -v idsfile="$ids_file" -v re="$_CIDER_COMPAT_OWNED_TAG_RE" '
+            BEGIN {
+              while ((getline line < idsfile) > 0) if (line != "") want[line] = 1
+              close(idsfile)
+            }
+            ($1 in want) {
+              tagged[$1] = 1
+              if ($2 ~ /:<none>$/ || $2 !~ re) { unowned[$1] = 1 }
+            }
+            END {
+              for (id in want) {
+                if (id in tagged && !(id in unowned)) print id
+              }
+            }
+          '
+    )"
+    rm -f "$ids_file"
+
+    if [[ -n "$owned_ids" ]]; then
+      # shellcheck disable=SC2086  # word-splitting is the point: one id per rmi argument
+      docker rmi -f $owned_ids >/dev/null 2>&1 || true
+    fi
   fi
 
   rm -f "$_CIDER_COMPAT_IMAGES_BEFORE" "$after"
   _CIDER_COMPAT_IMAGES_BEFORE=""
+  _CIDER_COMPAT_SNAPSHOT_OK=0
 }
 
 # curl_ad: convenience wrapper — `curl_ad -s /containers/json?all=1`

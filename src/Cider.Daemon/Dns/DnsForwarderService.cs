@@ -36,6 +36,14 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
     public const string DataDirLabel = "com.chillicream.cider.datadir";
 
     /// <summary>
+    /// Label carrying the literal data-dir path of the daemon instance owning a forwarder (cider-0o3:
+    /// turns <see cref="ReapOrphanedForwardersAsync"/>'s orphan test from a hash-set heuristic into an
+    /// actual liveness check for any forwarder created after this label started being written). Absent
+    /// on forwarders created before this label existed; those fall back to the legacy heuristic.
+    /// </summary>
+    public const string DataDirPathLabel = "com.chillicream.cider.datadir.path";
+
+    /// <summary>
     /// Transitional (rename to Cider): the pre-rename keys of the three labels above. Forwarders
     /// started by an older daemon carry them, and a daemon that could not recognise its own
     /// forwarders would leave them running and unreclaimable. Read, never written; delete once no
@@ -245,25 +253,35 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
     /// daemon's own <see cref="_dataDirHash"/> would never again equal the dead one's either.
     /// <para/>
     /// <see cref="DataDirLabel"/> carries only a one-way SHA-256 hash of the data dir
-    /// (<see cref="DataDirHash"/>), not the path itself, so "is the owning daemon still around" cannot
-    /// be answered by reversing it. Instead this hashes every data dir this scan can still find on
-    /// disk (see <see cref="ComputeLiveDataDirHashes"/> — this instance's own, the real default, and
-    /// every <c>/tmp/cider-*</c> directory) into the set of "live" hashes, and removes any forwarder
-    /// whose hash is in none of them. A second daemon that is actually still running is always
-    /// protected by this: its data dir necessarily still exists on disk for as long as it is up, so
-    /// its hash is always in the live set.
+    /// (<see cref="DataDirHash"/>), not the path itself, so for a label-less (legacy) forwarder "is the
+    /// owning daemon still around" cannot be answered by reversing it. For those this hashes every
+    /// data dir this scan can still find on disk (see <see cref="ComputeLiveDataDirHashes"/> — this
+    /// instance's own, the real default, and every <c>/tmp/cider-*</c> directory, both as-written and
+    /// resolved through the macOS <c>/tmp</c> → <c>/private/tmp</c> symlink) into the set of "live"
+    /// hashes, and removes any such forwarder whose hash is in none of them. A second daemon that is
+    /// actually still running is always protected by this: its data dir necessarily still exists on
+    /// disk for as long as it is up, so its hash is always in the live set.
+    /// <para/>
+    /// A forwarder created after <see cref="DataDirPathLabel"/> started being written carries the
+    /// owning daemon's literal data-dir path and is judged by that alone (<see cref="IsOrphanedForwarder"/>):
+    /// reaped only if that exact path does not exist on disk, never by falling back to the hash-set
+    /// heuristic below. The hash heuristic remains in force only for legacy, label-less forwarders —
+    /// the already-leaked population predating this label that this feature must still clean.
     /// <para/>
     /// Residual (confirmed live against this machine's own accumulated state while building this):
-    /// a data dir this scan does not know to look under (outside <c>/tmp/cider-*</c> and the real
-    /// default) reads as "no live data dir" even for a daemon that is genuinely still running there —
-    /// this covers both a custom <c>--data-dir</c> outside those conventions, and a
-    /// <c>/tmp/cider-*</c> one whose directory a still-running daemon's own process had removed out
-    /// from under it (its listening socket keeps working by inode once opened, so the process can
-    /// stay up with no directory left at its own configured path — observed live on this machine
-    /// during verification, though with no forwarder of its own at the time). Conversely, a data dir
-    /// left on disk by a hard-killed daemon this scan does know to look under reads as "live" until
-    /// something removes it. This is a best-effort machine-wide sweep, not a guarantee, exactly the
-    /// tradeoff cider-0o3 accepts in place of an isolated per-run store.
+    /// for a legacy, label-less forwarder still judged by the hash-set heuristic, a data dir this scan
+    /// does not know to look under (outside <c>/tmp/cider-*</c> and the real default — e.g. a custom
+    /// <c>--data-dir</c> elsewhere) reads as "no live data dir" even for a daemon that is genuinely
+    /// still running there; likewise a <c>/tmp/cider-*</c> directory a still-running daemon's own
+    /// process had removed out from under it (its listening socket keeps working by inode once opened,
+    /// so the process can stay up with no directory left at its own configured path — observed live on
+    /// this machine during verification, though with no forwarder of its own at the time) reads as
+    /// gone. Conversely, a data dir left on disk by a hard-killed legacy daemon this scan does know to
+    /// look under reads as "live" until something removes it. Every forwarder created going forward
+    /// carries <see cref="DataDirPathLabel"/> and is judged on real liveness instead, so this residual
+    /// shrinks to zero as the legacy population is naturally replaced. This remains a best-effort
+    /// machine-wide sweep for the legacy population, not a guarantee — exactly the tradeoff cider-0o3
+    /// accepts in place of an isolated per-run store.
     /// </summary>
     private async Task ReapOrphanedForwardersAsync(CancellationToken ct)
     {
@@ -272,22 +290,21 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
             var liveHashes = ComputeLiveDataDirHashes();
             foreach (var container in await _runtime.ListContainersAsync(ct))
             {
-                if (!ContainerIdentity.TryReadLabel(container.Labels, SystemLabel, LegacySystemLabel, out var system)
-                    || !string.Equals(system, "dns", StringComparison.Ordinal)
-                    || !ContainerIdentity.TryReadLabel(container.Labels, DataDirLabel, LegacyDataDirLabel, out var hash)
-                    || string.Equals(hash, _dataDirHash, StringComparison.Ordinal)
-                    || liveHashes.Contains(hash))
+                if (!IsOrphanedForwarder(container.Labels, liveHashes, _dataDirHash))
                 {
                     continue;
                 }
 
                 ContainerIdentity.TryReadLabel(container.Labels, NetworkLabel, LegacyNetworkLabel, out var network);
+                ContainerIdentity.TryReadLabel(container.Labels, DataDirLabel, LegacyDataDirLabel, out var hash);
+                var path = container.Labels.TryGetValue(DataDirPathLabel, out var labelledPath) ? labelledPath : null;
                 _logger.LogInformation(
-                    "removing orphaned DNS forwarder {Container} for network '{Network}': its data-dir hash " +
-                    "{Hash} matches no data dir this scan can still find, so its owning daemon is gone",
+                    path is { Length: > 0 }
+                        ? "removing orphaned DNS forwarder {Container} for network '{Network}': its labelled data dir {Path} no longer exists, so its owning daemon is gone"
+                        : "removing orphaned DNS forwarder {Container} for network '{Network}': its data-dir hash {Hash} matches no data dir this scan can still find, so its owning daemon is gone",
                     container.RuntimeId,
                     network,
-                    hash);
+                    path is { Length: > 0 } ? path : hash);
 
                 try
                 {
@@ -306,6 +323,39 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
     }
 
     /// <summary>
+    /// The orphan decision for one forwarder, extracted so it is drivable directly in tests (cider-0o3
+    /// MAJOR #4) without a real <see cref="IContainerRuntime"/>. Not our own forwarder and not a DNS
+    /// system container both answer <c>false</c> ("not orphaned" — really "not applicable"). When the
+    /// forwarder carries <see cref="DataDirPathLabel"/>, orphanhood is decided from that path's
+    /// existence on disk alone; the hash-set heuristic is used only when the label is absent (a
+    /// forwarder created before this label existed).
+    /// </summary>
+    internal static bool IsOrphanedForwarder(
+        IReadOnlyDictionary<string, string> labels,
+        HashSet<string> liveDataDirHashes,
+        string ownDataDirHash)
+    {
+        if (!ContainerIdentity.TryReadLabel(labels, SystemLabel, LegacySystemLabel, out var system)
+            || !string.Equals(system, "dns", StringComparison.Ordinal)
+            || !ContainerIdentity.TryReadLabel(labels, DataDirLabel, LegacyDataDirLabel, out var hash))
+        {
+            return false;
+        }
+
+        if (string.Equals(hash, ownDataDirHash, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (labels.TryGetValue(DataDirPathLabel, out var path) && !string.IsNullOrEmpty(path))
+        {
+            return !Directory.Exists(path);
+        }
+
+        return !liveDataDirHashes.Contains(hash);
+    }
+
+    /// <summary>
     /// Hashes every data dir <see cref="ReapOrphanedForwardersAsync"/> can still find on disk: this
     /// instance's own, the real default (<c>~/.cider</c>), and every <c>/tmp/cider-*</c> directory —
     /// the E2E fixture's own convention is <c>/tmp/cider-e2e-&lt;id&gt;</c>
@@ -317,6 +367,13 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
     /// (a build work dir, a log file's directory) only over-protects a hash that could never legitimately
     /// belong to a forwarder anyway, so it costs nothing. A directory that no longer exists contributes
     /// nothing, by design: it is exactly what marks a forwarder as orphaned.
+    /// <para/>
+    /// macOS symlinks <c>/tmp</c> to <c>/private/tmp</c>; <see cref="DataDirHash"/> hashes the raw path
+    /// string with no canonicalization, so a live daemon started with <c>--data-dir /private/tmp/...</c>
+    /// would otherwise hash differently from the <c>/tmp/...</c> entry this scan enumerates (and vice
+    /// versa). Both the literal path and its resolved real path are hashed for every candidate, and the
+    /// <c>/private</c>-prefixed spelling of each <c>/tmp/cider-*</c> entry is added explicitly, so an
+    /// in-convention live daemon started under either spelling is protected either way.
     /// </summary>
     private HashSet<string> ComputeLiveDataDirHashes()
     {
@@ -324,9 +381,26 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
 
         void AddIfExists(string dir)
         {
-            if (Directory.Exists(dir))
+            if (!Directory.Exists(dir))
             {
-                hashes.Add(DataDirHash(dir));
+                return;
+            }
+
+            hashes.Add(DataDirHash(dir));
+
+            // If the directory itself is a symlink (e.g. a hand-configured --data-dir pointed through
+            // one), also hash where it actually resolves to, normalized, so a live daemon's DataDir
+            // hashes the same under either spelling. (The /tmp -> /private/tmp case specifically is
+            // handled below by adding the /private-prefixed sibling directly, since /tmp/cider-* itself
+            // is never a symlink -- only the /tmp path segment above it is, which ResolveLinkTarget on
+            // the leaf directory does not see.)
+            try
+            {
+                var real = Path.GetFullPath(Directory.ResolveLinkTarget(dir, returnFinalTarget: true)?.FullName ?? dir);
+                hashes.Add(DataDirHash(real));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+            {
             }
         }
 
@@ -340,6 +414,12 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
             foreach (var dir in Directory.EnumerateDirectories("/tmp", "cider-*"))
             {
                 AddIfExists(dir);
+
+                // A daemon configured with the /private-prefixed spelling of this same directory
+                // (--data-dir /private/tmp/cider-x) is protected even before ResolveLinkTarget above
+                // would catch it, since /tmp/cider-x itself is not a symlink -- only /tmp is.
+                var name = Path.GetFileName(dir.TrimEnd('/'));
+                AddIfExists("/private/tmp/" + name);
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -494,6 +574,7 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
                     [SystemLabel] = "dns",
                     [NetworkLabel] = dockerNetworkName,
                     [DataDirLabel] = _dataDirHash,
+                    [DataDirPathLabel] = _options.DataDir,
                 },
                 Networks = [_networks.RuntimeNameFor(dockerNetworkName)],
                 Mounts =
