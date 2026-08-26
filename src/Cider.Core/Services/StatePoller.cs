@@ -151,7 +151,7 @@ public sealed class StatePoller : IAsyncDisposable
 
                 if (misses == 1)
                 {
-                    if (record.State.Running)
+                    if (record.State.Running && !IsHeldByUs(record.Id))
                     {
                         record.State.Status = "exited";
                         record.State.FinishedAt ??= DateTimeOffset.UtcNow;

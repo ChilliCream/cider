@@ -57,6 +57,42 @@ public sealed class StatePollerTests
     }
 
     [Fact]
+    public async Task A_single_miss_does_not_steal_the_exit_of_a_held_container()
+    {
+        // cider-ede.33 correction: the single-miss branch above must not treat a transient listing
+        // gap for a container the daemon still holds (`container start -a`) as an adopted
+        // container's exit -- that would resolve `docker wait` with the poller's stand-in exit
+        // code (and rotate NextExit) before HandleExitAsync ever gets to report the real one.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await using var poller = NewPoller(harness);
+
+        var record = await harness.RunShellAsync("sleep 30", "web");
+        var process = harness.Runtime.GetContainer(record.RuntimeId)?.Process;
+        Assert.NotNull(process);
+
+        var nextExit = harness.Containers.WaitAsync(record.Id, "next-exit", default);
+
+        // Apple's services restart and lose track of it for one poll (ARCHITECTURE §6/§9), but
+        // this daemon still holds the init process directly.
+        harness.Runtime.VanishContainer("web");
+        await poller.PollOnceAsync(default);
+
+        Assert.Equal("running", record.State.Status);
+        Assert.False(nextExit.IsCompleted);
+
+        // The held process really exits now (killed directly, since the container table no longer
+        // has an entry to route a signal through -- the same as the real held init process, which
+        // does not depend on Apple's listing service either). HandleExitAsync must be the one to
+        // resolve the pending wait, with the real exit code -- not the poller's stand-in of 0.
+        await process!.KillAsync("SIGKILL", default);
+
+        var response = await nextExit.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(137, response.StatusCode);
+        Assert.Null(response.Error);
+        Assert.Equal("exited", record.State.Status);
+    }
+
+    [Fact]
     public async Task Still_listed_but_no_longer_running_completes_a_pending_docker_wait_for_an_adopted_container()
     {
         // Same gap, the other die path: the engine still lists the container (so this is the

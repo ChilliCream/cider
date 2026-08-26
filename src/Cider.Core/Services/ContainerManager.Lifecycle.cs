@@ -662,24 +662,20 @@ public sealed partial class ContainerManager
     /// <summary>
     /// Completes <paramref name="handle"/>'s pending <c>NextExit</c> waiter (the <c>next-exit</c>
     /// and default <c>not-running</c> `docker wait` conditions) with <paramref name="exitCode"/>
-    /// and swaps in a fresh TaskCompletionSource for the following run. This is the one path both
-    /// <see cref="HandleExitAsync"/> (a process the daemon itself started and held) and
+    /// and atomically swaps in a fresh TaskCompletionSource for the following run. This is the one
+    /// path both <see cref="HandleExitAsync"/> (a process the daemon itself started and held) and
     /// <see cref="StatePoller"/> (a container cider only adopted, with no held process ever able to
     /// drive <see cref="HandleExitAsync"/>) go through when a record's state transitions to exited
     /// -- exit completion is a property of that transition, not of who happened to observe it
     /// (cider-ede.33), so a future third caller cannot reintroduce the gap where the record says
-    /// exited but a `docker wait` is left blocked forever. <c>TrySetResult</c> is a no-op if the
-    /// TCS this call captured a reference to is already completed -- the other caller having raced
-    /// in first for the very same exit, or a later start already having swapped in the next run's
-    /// TCS before this call got here -- so this can never resolve a stale wait with a different
-    /// run's exit code.
+    /// exited but a `docker wait` is left blocked forever. The exchange is atomic
+    /// (<see cref="ContainerHandle.ExchangeNextExit"/>), so a concurrent caller can never capture
+    /// the same TCS this call is retiring and drop a freshly installed one; <c>TrySetResult</c> is
+    /// then a no-op only if the TCS this call retired is already completed -- the other caller
+    /// having raced in first for the very same exit.
     /// </summary>
-    private static void CompleteExitWait(ContainerHandle handle, int exitCode)
-    {
-        var pending = handle.NextExit;
-        handle.NextExit = ContainerHandle.NewExit();
-        pending.TrySetResult(exitCode);
-    }
+    private static void CompleteExitWait(ContainerHandle handle, int exitCode) =>
+        handle.ExchangeNextExit().TrySetResult(exitCode);
 
     private async Task HandleExitAsync(string id, ContainerHandle handle, IContainerProcess process, StringBuilder? stderrTail = null)
     {

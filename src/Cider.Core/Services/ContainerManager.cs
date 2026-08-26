@@ -233,15 +233,17 @@ public sealed partial class ContainerManager : IContainerCounts
 
     /// <summary>
     /// Completes container <paramref name="id"/>'s pending `docker wait` (the <c>next-exit</c> and
-    /// default <c>not-running</c> conditions) with <paramref name="exitCode"/>, for a container
-    /// <see cref="StatePoller"/> observed transition to exited without the daemon ever holding its
-    /// process -- an adopted container. See <see cref="CompleteExitWait(ContainerHandle,int)"/> for
-    /// the shared mechanism this and <c>HandleExitAsync</c> both go through (cider-ede.33). A no-op
-    /// if no handle exists for the id (nothing has ever waited on it).
+    /// default <c>not-running</c> conditions) with <paramref name="exitCode"/>, for an adopted
+    /// container -- one <see cref="StatePoller"/> observed transition to exited without the daemon
+    /// ever holding its process. Defers to <c>HandleExitAsync</c> whenever a held process exists
+    /// for the id: that process is the source of truth for the real exit code, so this is a no-op
+    /// in that case, and also when no handle exists at all (nothing has ever waited on it). See
+    /// <see cref="CompleteExitWait(ContainerHandle,int)"/> for the shared mechanism this and
+    /// <c>HandleExitAsync</c> both go through (cider-ede.33).
     /// </summary>
     internal void CompleteExitWait(string id, int exitCode)
     {
-        if (_handles.TryGetValue(id, out var handle))
+        if (_handles.TryGetValue(id, out var handle) && handle.Process is null)
         {
             CompleteExitWait(handle, exitCode);
         }
@@ -320,7 +322,12 @@ public sealed partial class ContainerManager : IContainerCounts
 
         public Lock AttachGate { get; } = new();
 
-        public TaskCompletionSource<int> NextExit { get; set; } = NewExit();
+        private TaskCompletionSource<int> _nextExit = NewExit();
+
+        public TaskCompletionSource<int> NextExit => Volatile.Read(ref _nextExit);
+
+        /// <summary>Atomically swaps in a fresh TCS for the next run and returns the one being retired.</summary>
+        public TaskCompletionSource<int> ExchangeNextExit() => Interlocked.Exchange(ref _nextExit, NewExit());
 
         public TaskCompletionSource<int> Removed { get; } = NewExit();
 
