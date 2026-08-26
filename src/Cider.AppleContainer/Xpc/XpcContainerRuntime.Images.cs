@@ -836,6 +836,25 @@ internal sealed partial class XpcContainerRuntime
     /// way — caught, logged, and answered with zero deletions — rather than turning this best-effort
     /// fallback into a second way for <c>docker image prune</c> to 500.
     /// </para>
+    /// <para>
+    /// <b>cider-6dw MEASUREMENT: on essentially every realistic store, this method aborts and reclaims
+    /// nothing.</b> This is a direct, intended consequence of the safety rule above, not a separate
+    /// bug — recorded here because nothing about the code otherwise says so, and this method existed
+    /// for a while described only as "the fallback" with no note that the fallback rarely runs.
+    /// <see cref="CollectManifestDigestsAsync"/> requires every real-platform manifest of every
+    /// *remaining* image to resolve, but a real single-platform pull only ever fetches one platform's
+    /// manifest — every other platform an ordinary multi-arch index lists (nearly every official
+    /// docker.io image) is a digest that was never fetched and so never resolves locally. One such
+    /// remaining image is enough to abort the whole method. Proven live against the real,
+    /// verbatim manifest-list digests of a genuine <c>docker.io/library/alpine:3.22</c> pull
+    /// (<see cref="XpcContainerRuntimePruneScopedReclaimTests.PruneImagesAsync_ScopedFallback_AbortsOnARealisticMultiArchRemainingImage"/>
+    /// in Cider.Tests) — the amd64/arm-v6/arm-v7/386/ppc64le/riscv64/s390x manifests genuinely are not
+    /// on disk on a machine that only ever pulled arm64, and this method aborts, exactly as the safety
+    /// rule requires. In practice this method can only reclaim anything when, at the moment it runs,
+    /// no other image remains in the store at all — e.g. pruning the very last image(s) present. Do
+    /// not read this as license to weaken the rule; it is the accepted cost of the rule being correct,
+    /// recorded so nobody mistakes silence in the logs for the fallback quietly doing its job.
+    /// </para>
     /// </summary>
     private async Task TryScopedReclaimAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct)
     {
@@ -918,6 +937,13 @@ internal sealed partial class XpcContainerRuntime
     /// that is also not proof — nothing about the image was positively accounted for — so this
     /// returns false rather than silently treating an attestation-only index as a fully-walked,
     /// content-free image.
+    /// </para>
+    /// <para>
+    /// cider-6dw: "every real-platform manifest" is the reason <see cref="TryScopedReclaimAsync"/>
+    /// aborts on essentially any realistic store — see the measurement recorded on that method's own
+    /// doc comment. A real single-platform pull leaves every non-pulled platform's manifest digest
+    /// genuinely unresolvable, so this returns <c>false</c> for almost any ordinary multi-arch
+    /// *remaining* image, by design.
     /// </para>
     /// </summary>
     private async Task<bool> CollectManifestDigestsAsync(string? digest, HashSet<string> into, CancellationToken ct)

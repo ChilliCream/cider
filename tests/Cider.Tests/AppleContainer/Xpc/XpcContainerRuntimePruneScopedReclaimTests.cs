@@ -147,6 +147,97 @@ public sealed class XpcContainerRuntimePruneScopedReclaimTests
     }
 
     /// <summary>
+    /// cider-6dw MEASUREMENT, not a new rule: does the scoped fallback ever fire on a realistic
+    /// multi-arch store? The index below is <b>the real <c>docker.io/library/alpine:3.22</c>
+    /// manifest-list digests</b>, captured verbatim from a genuine pull on this machine (arch/os
+    /// values and every non-attestation manifest digest match the live content store byte-for-byte;
+    /// only the annotations/sizes, which nothing here reads, were trimmed). Only <c>Arm64Digest</c>
+    /// (<c>v8</c>) is resolvable, because that is the only platform a real single-platform pull ever
+    /// actually fetches — <c>amd64</c>/<c>arm/v6</c>/<c>arm/v7</c>/<c>386</c>/<c>ppc64le</c>/
+    /// <c>riscv64</c>/<c>s390x</c> are not on disk (confirmed live: their blob files do not exist
+    /// under <c>~/Library/Application Support/com.apple.container/content/blobs/sha256</c> either).
+    /// This is not a contrived corruption case; it is what every real multi-arch image on this store
+    /// looks like today.
+    ///
+    /// Answer: the scoped fallback aborts with zero <c>contentDelete</c> calls, for the same reason as
+    /// the unreadable-manifest test above — <see cref="XpcContainerRuntime.RealVariants"/> returns
+    /// all 8 real platforms from the index, and 7 of them fail to resolve, so
+    /// <c>CollectManifestDigestsAsync</c> reports <c>complete: false</c> for this remaining image and
+    /// the safety rule refuses to prove non-reference for any candidate. Since virtually every
+    /// official docker.io image is multi-arch and a real pull only ever fetches one platform, this
+    /// scoped path can be expected to abort on essentially any real store that still holds even one
+    /// ordinary pulled image alongside whatever the sweep is failing on — see the doc comments this
+    /// measurement updates on <see cref="XpcContainerRuntime.TryScopedReclaimAsync"/> and
+    /// <see cref="XpcContainerRuntime.CollectManifestDigestsAsync"/>, and the README's Limitations
+    /// entry, for the recorded conclusion. No behaviour change: this is a regression pin on the
+    /// answer, not a new safety rule.
+    /// </summary>
+    [Fact]
+    public async Task PruneImagesAsync_ScopedFallback_AbortsOnARealisticMultiArchRemainingImage()
+    {
+        const string Amd64Digest = "sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6";
+        const string ArmV6Digest = "sha256:b0abf1688d96e84a504fd95b04bfbcc9f987e9e1d64c1ec63d601e1c77aaa75c";
+        const string ArmV7Digest = "sha256:cb5e421f9eab04b004be85fae259a25abb823e3dd5ac7bd271b636f17084f7cc";
+        const string Arm64Digest = "sha256:2c9d26f410d032d5b1525aa8a873e238b05b90c4ae8618743d4311f0cc827e37";
+        const string I386Digest = "sha256:a31a2d557763b707d5416fb01c50ed63994271df515bbac9b215c25803685932";
+        const string Ppc64leDigest = "sha256:2328de9e4c621f8d3791552c086914c497c3b0cebb3ac83348db6991cf473472";
+        const string Riscv64Digest = "sha256:5a8efeffd035ad4c44b510741dd6120d5425734d18a0d4d9dea0168ec32caa10";
+        const string S390xDigest = "sha256:de3924a64af37fc5d4c7dc75a030a1130f32e27ab091f285c8a9058540c8818d";
+        const string AlpineIndexDigest = "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce";
+
+        using var tempDir = new TempDir();
+
+        var deletedIndexDigest = RepeatDigest('1');
+        var deletedManifestDigest = RepeatDigest('2');
+        var configDigest = RepeatDigest('3');
+        var layerDigest = RepeatDigest('4');
+
+        var alpineIndexPath = tempDir.WriteMultiArchIndex(
+            "alpine-3.22-index",
+            (Amd64Digest, "amd64", "linux", null),
+            (ArmV6Digest, "arm", "linux", "v6"),
+            (ArmV7Digest, "arm", "linux", "v7"),
+            (Arm64Digest, "arm64", "linux", "v8"),
+            (I386Digest, "386", "linux", null),
+            (Ppc64leDigest, "ppc64le", "linux", null),
+            (Riscv64Digest, "riscv64", "linux", null),
+            (S390xDigest, "s390x", "linux", null));
+        var arm64ManifestPath = tempDir.WriteManifest("alpine-3.22-arm64-manifest", RepeatDigest('7'), RepeatDigest('8'));
+
+        var resolvable = new Dictionary<string, string?>
+        {
+            [deletedIndexDigest] = tempDir.WriteIndex("deleted-index", deletedManifestDigest),
+            [deletedManifestDigest] = tempDir.WriteManifest("deleted-manifest", configDigest, layerDigest),
+
+            [AlpineIndexDigest] = alpineIndexPath,
+            [Arm64Digest] = arm64ManifestPath,
+
+            // Deliberately absent, matching this machine's real content store: no other platform's
+            // manifest was ever fetched by a real single-platform pull.
+        };
+
+        var remaining = new List<ImageDescription>
+        {
+            Description("docker.io/library/alpine:3.22", AlpineIndexDigest),
+        };
+        var fake = new FakeImagesServiceClient(DanglingContentFailure(), remaining, resolvable);
+        var logger = new RecordingLogger<XpcContainerRuntime>();
+        var runtime = NewRuntime(fake, logger);
+        using var _ = runtime;
+
+        await runtime.PruneImagesAsync([deletedIndexDigest], CancellationToken.None);
+
+        Assert.Empty(fake.ContentDeleteCalls);
+        Assert.DoesNotContain(fake.Calls, c => c == "ContentDeleteAsync");
+        Assert.Contains(
+            fake.Calls,
+            c => c.StartsWith("ContentGetAsync:", StringComparison.Ordinal) && c.Contains(Amd64Digest, StringComparison.Ordinal));
+
+        var warnings = logger.Entries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Contains(warnings, w => w.Message.Contains("deleting nothing", StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// REGRESSION TEST for the "parsed but empty" hole in <see cref="XpcContainerRuntime.CollectManifestDigestsAsync"/>:
     /// a remaining image whose index descriptor resolves straight to a <b>bare manifest JSON</b>
     /// (<c>{schemaVersion, config, layers}</c>, no <c>manifests[]</c> wrapper at all) deserializes as an
@@ -351,6 +442,24 @@ public sealed class XpcContainerRuntimePruneScopedReclaimTests
             var json = "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[" +
                 "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"" + manifestDigest +
                 "\",\"size\":528,\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}}]}";
+            File.WriteAllText(path, json);
+            return path;
+        }
+
+        /// <summary>An index with one real, non-attestation platform manifest entry per
+        /// <paramref name="platforms"/> — for the cider-6dw measurement test, which needs a genuine
+        /// multi-arch index shape (several real platforms, no attestation entries — those are already
+        /// filtered by <see cref="XpcContainerRuntime.RealVariants"/> before this code ever sees them,
+        /// so they add nothing to what this method needs to model).</summary>
+        public string WriteMultiArchIndex(string name, params (string Digest, string Arch, string Os, string? Variant)[] platforms)
+        {
+            var path = Path.Combine(_dir, $"{name}.json");
+            var manifests = string.Join(",", platforms.Select(p =>
+                "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"" + p.Digest +
+                "\",\"size\":1024,\"platform\":{\"architecture\":\"" + p.Arch + "\",\"os\":\"" + p.Os + "\"" +
+                (p.Variant is null ? "" : ",\"variant\":\"" + p.Variant + "\"") + "}}"));
+            var json = "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[" +
+                manifests + "]}";
             File.WriteAllText(path, json);
             return path;
         }
