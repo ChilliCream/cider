@@ -64,8 +64,9 @@ build_daemon() {
   fi
 }
 
-# start_daemon: build if needed, launch `dotnet run ... serve` in the
-# background against an isolated socket + data dir, wait for /_ping.
+# start_daemon: build if needed, launch the built `cider serve` binary
+# directly in the background against an isolated socket + data dir, wait
+# for /_ping.
 start_daemon() {
   mkdir -p "$CIDER_COMPAT_DOCKER_CONFIG"
 
@@ -90,11 +91,23 @@ start_daemon() {
 
   build_daemon || return 1
 
+  # Launch the built apphost binary directly rather than through `dotnet
+  # run`: `dotnet run` execs a wrapper process whose $! is *not* the actual
+  # `cider serve` PID, which is what previously forced stop_daemon to go
+  # hunting for the real process via pgrep/pkill pattern matching (risking a
+  # false match against an unrelated cider process, e.g. the operator's real
+  # installed daemon). Running the binary itself means $! *is* the daemon's
+  # PID, so cleanup can kill exactly the process this function started.
+  local daemon_bin="$CIDER_REPO_ROOT/src/Cider.Daemon/bin/Release/$CIDER_COMPAT_FRAMEWORK/cider"
+  if [[ ! -x "$daemon_bin" ]]; then
+    _cider_log "daemon binary not found at $daemon_bin (build failed?)"
+    return 1
+  fi
+
   _cider_log "Starting daemon: socket=$CIDER_COMPAT_SOCKET data-dir=$CIDER_COMPAT_DATA_DIR framework=$CIDER_COMPAT_FRAMEWORK"
   (
     cd "$CIDER_REPO_ROOT" || exit 1
-    nohup dotnet run --project src/Cider.Daemon -c Release --no-build \
-      --framework "$CIDER_COMPAT_FRAMEWORK" -- serve --socket "$CIDER_COMPAT_SOCKET" --data-dir "$CIDER_COMPAT_DATA_DIR" \
+    nohup "$daemon_bin" serve --socket "$CIDER_COMPAT_SOCKET" --data-dir "$CIDER_COMPAT_DATA_DIR" \
       >>"$CIDER_COMPAT_DAEMON_LOG" 2>&1 &
     echo $! >"$CIDER_COMPAT_PID_FILE"
   )
@@ -114,40 +127,27 @@ start_daemon() {
   return 1
 }
 
-# stop_daemon: kill the dotnet wrapper *and* its child `cider` process
-# (dotnet run does not reliably forward signals to the app process it
-# launches), wait briefly for graceful shutdown (which unlinks the socket),
-# then force-kill and unlink defensively.
+# stop_daemon: kill exactly the PID start_daemon captured via $! at launch
+# (nothing else -- no pgrep/pkill pattern matching, which risks matching an
+# unrelated cider process such as the operator's real installed daemon),
+# wait briefly for graceful shutdown (which unlinks the socket), then
+# force-kill and unlink defensively.
 stop_daemon() {
-  local wrapper_pid="" child_pid=""
-  [[ -f "$CIDER_COMPAT_PID_FILE" ]] && wrapper_pid="$(cat "$CIDER_COMPAT_PID_FILE" 2>/dev/null || true)"
+  local pid=""
+  [[ -f "$CIDER_COMPAT_PID_FILE" ]] && pid="$(cat "$CIDER_COMPAT_PID_FILE" 2>/dev/null || true)"
 
-  if [[ -n "$wrapper_pid" ]]; then
-    child_pid="$(pgrep -P "$wrapper_pid" 2>/dev/null | head -n1 || true)"
-  fi
+  _cider_log "stopping daemon (pid ${pid:-?})"
 
-  _cider_log "stopping daemon (wrapper pid ${wrapper_pid:-?}, child pid ${child_pid:-?})"
+  if [[ -n "$pid" ]]; then
+    kill -TERM "$pid" 2>/dev/null || true
 
-  # Send SIGTERM to the app process first so it can unlink the socket / exit
-  # cleanly, then the wrapper.
-  [[ -n "$child_pid" ]] && kill -TERM "$child_pid" 2>/dev/null || true
-  [[ -n "$wrapper_pid" ]] && kill -TERM "$wrapper_pid" 2>/dev/null || true
-
-  for _ in $(seq 1 10); do
-    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+    for _ in $(seq 1 10); do
+      kill -0 "$pid" 2>/dev/null || break
       sleep 1
-    else
-      break
-    fi
-  done
+    done
 
-  [[ -n "$child_pid" ]] && kill -9 "$child_pid" 2>/dev/null || true
-  [[ -n "$wrapper_pid" ]] && kill -9 "$wrapper_pid" 2>/dev/null || true
-
-  # Idempotent belt-and-suspenders: catch any stray process bound to our
-  # socket path even if the pid file was stale or missing.
-  pkill -f "cider serve --socket ${CIDER_COMPAT_SOCKET}" 2>/dev/null || true
-  pkill -f "Cider.Daemon.*--socket ${CIDER_COMPAT_SOCKET}" 2>/dev/null || true
+    kill -9 "$pid" 2>/dev/null || true
+  fi
 
   rm -f "$CIDER_COMPAT_PID_FILE"
   rm -f "$CIDER_COMPAT_SOCKET"
