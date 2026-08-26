@@ -1191,6 +1191,28 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Equal(["docker.io/library/app:1", "docker.io/library/app:2"], references);
     }
 
+    /// <summary>
+    /// cider-ede.24 comment 66, "never turn a success into a failure": <see
+    /// cref="ImageManager.LoadImagesAsync"/>'s before/after snapshot diff is a nicety around an
+    /// already-successful runtime load, not a precondition for it. A poisoned Apple store making
+    /// <c>ListImagesAsync</c> throw (comment 66's total-failure branch) must not turn a successful
+    /// <c>image load</c> into a reported failure — the load falls back to the runtime's own <c>Loaded
+    /// image:</c> names, exactly like the empty-diff fallback <see
+    /// cref="LoadImagesAsync_ReloadingTheSameTar_FallsBackToTheLoadedNames"/> already covers.
+    /// </summary>
+    [Fact]
+    public async Task LoadImagesAsync_StillSucceeds_WhenTheSnapshotListingThrows()
+    {
+        var (manager, runtime) = CreateManager();
+        var id = TestDigest("poisoned-snapshot");
+        runtime.ListImagesFailure = RuntimeException.Internal("simulated poisoned image store");
+        await using var tar = BuildOciIndexTar(id, "app:1");
+
+        var references = await manager.LoadImagesAsync(tar, progress: null, CancellationToken.None);
+
+        Assert.Equal(["docker.io/library/app:1"], references);
+    }
+
     [Fact]
     public async Task LoadAsync_DelegatesToLoadImagesAsync_ProgressAndEventsUnchanged()
     {

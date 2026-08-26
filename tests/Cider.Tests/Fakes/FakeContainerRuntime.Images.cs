@@ -118,9 +118,24 @@ public sealed partial class FakeContainerRuntime
         },
     ];
 
+    /// <summary>
+    /// Test hook (cider-ede.24 comment 66): fails every subsequent <see cref="ListImagesAsync"/> call
+    /// with this error, simulating a poisoned Apple image store's <c>ListImagesAsync</c> now throwing
+    /// on a total enumeration failure — so a caller-side test can prove
+    /// <c>ImageManager.LoadAsync</c>/<c>LoadImagesAsync</c> still succeeds (falling back to the
+    /// runtime's own <c>Loaded image:</c> names) when the before/after snapshot diff it uses can no
+    /// longer be trusted.
+    /// </summary>
+    public RuntimeException? ListImagesFailure { get; set; }
+
     public Task<IReadOnlyList<RuntimeImage>> ListImagesAsync(CancellationToken ct)
     {
         Record("ListImagesAsync");
+        if (ListImagesFailure is { } failure)
+        {
+            throw failure;
+        }
+
         lock (_sync)
         {
             return Task.FromResult<IReadOnlyList<RuntimeImage>>(_images.Cast<RuntimeImage>().ToList());

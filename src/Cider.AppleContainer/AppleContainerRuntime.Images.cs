@@ -17,10 +17,18 @@ public sealed partial class AppleContainerRuntime
     /// even though every other entry is fine (cider-ede.24, verified live on this machine: <c>Error:
     /// content with digest sha256:…</c>, the blob gone but <c>state.json</c> still naming it). Cider
     /// must not repair another tool's store, but it also must not let one bad row 500 every
-    /// <c>docker images</c> call — so that specific failure logs one Warning naming the digest and the
-    /// operator remedy, and degrades to an empty listing (Apple gives no partial JSON to salvage; a
-    /// caller after one specific image can still fall back to <c>image inspect &lt;ref&gt;</c>, which
-    /// keeps working). Every other failure still throws exactly as before.
+    /// <c>docker images</c> call — nor may it turn that failure into a false "no images" success
+    /// (planner ruling on cider-ede.24, comment 66: never synthesize an empty 200 out of a failure cider
+    /// could not read — an empty list is a positive assertion, "this machine has no images", that no
+    /// caller can then tell apart from a genuinely empty store). The two outcomes are an explicit
+    /// branch, not <c>count == 0</c>: if the failed call still printed one or more parseable rows on
+    /// stdout, that is <em>enumerated-with-skips</em> — log one Warning naming the digest and the
+    /// operator remedy, and answer 200 with what is enumerable. If nothing parses (no partial output to
+    /// salvage, or what came back is not valid JSON), that is a <em>total</em> failure — the Warning
+    /// still logs once, but the call throws exactly as any other failure would, so a caller after one
+    /// specific image can still fall back to <c>image inspect &lt;ref&gt;</c>, which keeps working.
+    /// Every non-dangling failure throws exactly as before, with no Warning. Only a genuinely
+    /// successful, empty listing (the store really has no images) returns an empty list.
     /// </summary>
     public Task<IReadOnlyList<RuntimeImage>> ListImagesAsync(CancellationToken ct) => GuardAsync(async () =>
     {
@@ -31,9 +39,28 @@ public sealed partial class AppleContainerRuntime
             {
                 var digest = CliErrorMapper.ExtractDanglingDigest(result.Stderr) ?? result.Stderr;
                 _logger.LogWarning("{Message}", CliErrorMapper.DanglingContentRemedy(digest));
-                return (IReadOnlyList<RuntimeImage>)Array.Empty<RuntimeImage>();
+
+                List<AppleImageJson>? partial = null;
+                try
+                {
+                    partial = ContainerCli.ParseJson<List<AppleImageJson>>(result.Stdout, "container image ls");
+                }
+                catch (RuntimeException)
+                {
+                    // Malformed stdout alongside the dangling-content failure: treated as nothing
+                    // parsed, not a second, confusing error on top of the one already logged above.
+                }
+
+                if (partial is { Count: > 0 })
+                {
+                    // Enumerated-with-skips: Apple still printed the rows it could, even though the
+                    // call as a whole exited non-zero over the one dangling entry.
+                    await RecoverContentAddressedIdsAsync(partial, ct);
+                    return RuntimeMapper.ToImages(partial);
+                }
             }
 
+            // TOTAL failure to enumerate (not dangling at all, or dangling with nothing to salvage).
             throw CliErrorMapper.ToException(result, "image ls");
         }
 
@@ -545,22 +572,21 @@ public sealed partial class AppleContainerRuntime
     private const string LoadedImagePrefix = "Loaded image:";
 
     /// <summary>
-    /// Must not depend on a healthy full listing (cider-ede.24): with a dangling content reference in
-    /// the store, <see cref="ListImagesAsync"/> degrades to an empty list (see its own doc comment), so
-    /// a before/after diff of it can no longer be trusted to prove what a successful <c>image load</c>
-    /// just loaded — both sets collapse to empty regardless of what actually loaded, which used to read
-    /// as "loaded nothing" and silently drop the reference from <c>docker load</c>/BuildKit's
-    /// <c>ExportLoader</c>. The primary source is Apple's own stdout echo (<c>Loaded image:
-    /// &lt;ref&gt;</c>), gated on both the line actually carrying that prefix (review correction:
-    /// treating *any* non-empty stdout line as a loaded reference swallowed unrelated CLI chatter) and
-    /// the text after it parsing as a real <see cref="ImageReference"/> — a malformed prefixed line
-    /// is dropped, not trusted. The before/after diff is kept only as a secondary source, unioned in and
-    /// contributing nothing when it found nothing (rather than being trusted as proof nothing loaded).
-    /// If a successful <c>image load</c> still leaves both sources empty, that names a real gap (cider
-    /// could not identify what it just loaded) but not a failed load: the archive did land, so this
-    /// logs a Warning naming the condition rather than throwing (review correction: throwing here turned
-    /// every such <c>docker load</c>/<c>commit</c>/<c>import</c> into a reported failure, a regression
-    /// against working behaviour — planner ruling on cider-ede.24: never turn a success into a failure).
+    /// Must not depend on a healthy full listing (cider-ede.24): <see cref="ListImagesAsync"/> can now
+    /// throw on a total enumeration failure (comment 66's ruling — see its doc comment), so a before/after
+    /// diff of it can no longer be trusted to prove what a successful <c>image load</c> just loaded, nor
+    /// may that throw be allowed to turn a load that genuinely succeeded on Apple's side into a reported
+    /// failure (comment 66, other half: never turn a success into a failure either). The primary source
+    /// is Apple's own stdout echo (<c>Loaded image: &lt;ref&gt;</c>), gated on both the line actually
+    /// carrying that prefix (review correction: treating *any* non-empty stdout line as a loaded
+    /// reference swallowed unrelated CLI chatter) and the text after it parsing as a real
+    /// <see cref="ImageReference"/> — a malformed prefixed line is dropped, not trusted. The before/after
+    /// <see cref="ListReferencesAsync"/> diff is kept only as a secondary source, unioned in and
+    /// contributing nothing when it found nothing — including when the listing call itself throws
+    /// (poisoned store): that is caught and logged at Debug, not allowed to fail an otherwise-successful
+    /// load. If a successful <c>image load</c> still leaves both sources empty, that names a real gap
+    /// (cider could not identify what it just loaded) but not a failed load: the archive did land, so
+    /// this logs a Warning naming the condition rather than throwing.
     /// </summary>
     public Task<IReadOnlyList<string>> LoadImagesAsync(Stream tarInput, CancellationToken ct) => GuardAsync(async () =>
     {
@@ -574,12 +600,18 @@ public sealed partial class AppleContainerRuntime
                 await tarInput.CopyToAsync(file, ct);
             }
 
-            var before = await ListReferencesAsync(ct);
+            var before = await ListReferencesToleratingFailureAsync(ct);
 
             var result = await _cli.RunAsync(["image", "load", "-i", tmp], ct, _options.PullTimeout);
             ContainerCli.ThrowIfFailed(result, "image load");
 
+            // Deduped on the *normalized* reference (a stable key regardless of spelling), not the raw
+            // string: otherwise the same image could be returned twice under 'foo:latest' from stdout
+            // and 'docker.io/library/foo:latest' from the after-listing. The first spelling seen for a
+            // given normalized key wins, so stdout's spelling (the primary source) is preferred over the
+            // secondary listing diff.
             var loaded = new List<string>();
+            var loadedKeys = new HashSet<string>(StringComparer.Ordinal);
             foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
                 var trimmed = line.Trim();
@@ -590,17 +622,25 @@ public sealed partial class AppleContainerRuntime
 
                 var candidate = trimmed[LoadedImagePrefix.Length..].Trim();
                 if (candidate.Length > 0 &&
-                    ImageReference.TryParse(candidate, out _) &&
-                    !loaded.Contains(candidate, StringComparer.Ordinal))
+                    ImageReference.TryParse(candidate, out var parsedCandidate) &&
+                    loadedKeys.Add(parsedCandidate.Normalize().ToString()))
                 {
                     loaded.Add(candidate);
                 }
             }
 
-            var after = await ListReferencesAsync(ct);
+            var after = await ListReferencesToleratingFailureAsync(ct);
             foreach (var reference in after)
             {
-                if (!before.Contains(reference) && !loaded.Contains(reference, StringComparer.Ordinal))
+                if (before.Contains(reference))
+                {
+                    continue;
+                }
+
+                var key = ImageReference.TryParse(reference, out var parsedReference)
+                    ? parsedReference.Normalize().ToString()
+                    : reference;
+                if (loadedKeys.Add(key))
                 {
                     loaded.Add(reference);
                 }
@@ -742,5 +782,26 @@ public sealed partial class AppleContainerRuntime
         }
 
         return references;
+    }
+
+    /// <summary>
+    /// <see cref="ListReferencesAsync"/> for callers that use it only as a secondary, best-effort
+    /// source (<see cref="LoadImagesAsync"/>'s before/after diff): <see cref="ListImagesAsync"/> can now
+    /// throw on a total enumeration failure (comment 66), and a poisoned store must not turn an
+    /// otherwise-successful <c>image load</c> into a reported failure — comment 66's other half, "never
+    /// turn a success into a failure". A throw here is caught, logged at Debug, and treated as an empty
+    /// secondary source, exactly like a genuinely empty listing.
+    /// </summary>
+    private async Task<HashSet<string>> ListReferencesToleratingFailureAsync(CancellationToken ct)
+    {
+        try
+        {
+            return await ListReferencesAsync(ct);
+        }
+        catch (RuntimeException ex)
+        {
+            _logger.LogDebug(ex, "could not list images while identifying an image load's references");
+            return new HashSet<string>(StringComparer.Ordinal);
+        }
     }
 }

@@ -593,11 +593,29 @@ public sealed class ImageManager
         }
     }
 
-    /// <summary>Every reference known to the runtime right now, mapped to the image id it points at.</summary>
+    /// <summary>
+    /// Every reference known to the runtime right now, mapped to the image id it points at. Used only
+    /// as a before/after diff around an already-successful <see cref="LoadImagesAsync"/> load, so a
+    /// listing failure here (e.g. a poisoned Apple image store — cider-ede.24 comment 66) must not turn
+    /// that success into a reported failure: it is caught and logged at Debug, and treated as an empty
+    /// snapshot, which simply contributes nothing to the diff — <c>LoadImagesAsync</c> then falls back
+    /// to the runtime's own <c>Loaded image:</c> names.
+    /// </summary>
     private async Task<Dictionary<string, string>> SnapshotImageIdsByReferenceAsync(CancellationToken ct)
     {
-        var images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        IReadOnlyList<RuntimeImage> images;
+        try
+        {
+            images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
+        }
+        catch (RuntimeException ex)
+        {
+            _logger.LogDebug(ex, "could not list images while snapshotting references for an image load diff");
+            return map;
+        }
+
         foreach (var image in images)
         {
             foreach (var reference in image.References)
