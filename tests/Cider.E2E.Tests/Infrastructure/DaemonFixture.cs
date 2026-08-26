@@ -85,12 +85,16 @@ public class DaemonFixture : IAsyncLifetime
     protected virtual string InstanceSuffix => "";
 
     /// <summary>
-    /// The state poller's interval, in seconds. Overridable so a test that specifically wants to
-    /// exercise <c>POST /_cider/sync</c> (rather than the separate automatic poller-drop behaviour —
-    /// see <see cref="Cider.Daemon.Routes.CiderRoutes"/>) can push it out far enough that the poller
-    /// never races the assertion.
+    /// The state poller's interval, in seconds, or <c>null</c> to leave it unset so <c>CiderOptions</c>
+    /// picks its own transport-aware default (<c>StatePoller</c>: 1s on xpc, 3s on cli — see
+    /// <see cref="CiderOptions.PollIntervalSecondsIsExplicit"/>). Overridable so a test that
+    /// specifically wants to exercise <c>POST /_cider/sync</c> (rather than the separate automatic
+    /// poller-drop behaviour — see <see cref="Cider.Daemon.Routes.CiderRoutes"/>) can push it out far
+    /// enough that the poller never races the assertion. Left at its <c>null</c> default, every other
+    /// fixture (including the shared <see cref="DaemonCollection"/> one) now exercises the real
+    /// transport-aware default end-to-end instead of pinning it to a fixture-chosen value.
     /// </summary>
-    protected virtual int PollIntervalOverride => 2;
+    protected virtual int? PollIntervalOverride => null;
 
     /// <inheritdoc />
     public async Task InitializeAsync()
@@ -120,19 +124,32 @@ public class DaemonFixture : IAsyncLifetime
     /// <c>PortPublishing</c>, <c>LogLevel</c> and <c>DnsEnabled</c> every time it is called for this
     /// instance, but a fresh object each call.
     /// </summary>
-    private CiderOptions BuildOptions(string id) => new()
+    private CiderOptions BuildOptions(string id)
     {
-        // sockaddr_un.sun_path is 104 bytes on macOS: /tmp/cider-e2e-xxxxxxxx.sock is far below it.
-        DataDir = $"/tmp/cider-e2e-{id}",
-        SocketPath = $"/tmp/cider-e2e-{id}.sock",
-        LogLevel = Environment.GetEnvironmentVariable("CIDER_E2E_LOGLEVEL") ?? "Information",
-        PollIntervalSeconds = PollIntervalOverride,
-        DnsEnabled = true,
+        var options = new CiderOptions
+        {
+            // sockaddr_un.sun_path is 104 bytes on macOS: /tmp/cider-e2e-xxxxxxxx.sock is far below it.
+            DataDir = $"/tmp/cider-e2e-{id}",
+            SocketPath = $"/tmp/cider-e2e-{id}.sock",
+            LogLevel = Environment.GetEnvironmentVariable("CIDER_E2E_LOGLEVEL") ?? "Information",
+            DnsEnabled = true,
 
-        // `proxy` by default, like the real daemon; CIDER_PORT_PUBLISHING=apple runs the
-        // suite against Apple's own `-p` forwarder instead.
-        PortPublishing = PortPublishingMode,
-    };
+            // `proxy` by default, like the real daemon; CIDER_PORT_PUBLISHING=apple runs the
+            // suite against Apple's own `-p` forwarder instead.
+            PortPublishing = PortPublishingMode,
+        };
+
+        // Only assign when a fixture actually wants a pinned interval: the setter latches
+        // PollIntervalSecondsIsExplicit, and assigning it unconditionally (even to the constructor's
+        // own default) would pin it right back, defeating the transport-aware default this exists to
+        // let through.
+        if (PollIntervalOverride is { } pollIntervalSeconds)
+        {
+            options.PollIntervalSeconds = pollIntervalSeconds;
+        }
+
+        return options;
+    }
 
     /// <summary>
     /// Replaces <see cref="Options"/> with a freshly built, value-identical copy of itself. A new

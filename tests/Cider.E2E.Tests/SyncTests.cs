@@ -16,7 +16,7 @@ namespace Cider.E2E.Tests;
 public sealed class SyncFixture : DaemonFixture
 {
     /// <inheritdoc />
-    protected override int PollIntervalOverride => 3600;
+    protected override int? PollIntervalOverride => 3600;
 }
 
 /// <summary>The collection <see cref="SyncTests"/> uses so it gets its own daemon.</summary>
