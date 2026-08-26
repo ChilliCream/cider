@@ -43,8 +43,7 @@ public sealed partial class ContainerManager
             // below. This flag only decides whether an empty list is handed onward at all; the
             // invariant that a zero-attachment spec never silently reaches `container create` is
             // enforced again at the runtime boundary itself (Xpc.XpcContainerRuntime.Create.cs's
-            // fallback sites and AppleContainerRuntime.CreateContainerAsync both guard it too), not
-            // relied on here alone.
+            // fallback sites guard it too), not relied on here alone.
             if (networkingConfig?.EndpointsConfig is { Count: > 0 })
             {
                 throw DockerErrors.BadParameter(
