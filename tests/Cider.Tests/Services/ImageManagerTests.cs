@@ -1182,6 +1182,80 @@ public sealed class ImageManagerTests : IDisposable
         Assert.DoesNotContain(listed, i => i.Id == imageId);
     }
 
+    /// <summary>
+    /// cider-ede.32: before <c>IsDangling</c> was defined in terms of <c>VisibleReferences</c> itself,
+    /// the two predicates could disagree — a reference that is neither a synthetic build tag nor
+    /// parseable as an image reference was hidden by <c>VisibleReferences</c> (the image displayed as
+    /// <c>&lt;none&gt;</c>) but still counted as a real tag by the old <c>IsDangling</c> (<c>image.
+    /// References.All(IsSyntheticBuildTag)</c> is false once even one reference is neither synthetic
+    /// nor parseable), so the image showed as <c>&lt;none&gt;</c> yet was excluded from <c>--filter
+    /// dangling=true</c>. Covers all three shapes the task's own verification names in one test: the
+    /// divergent case now agrees with itself, a normally tagged image is neither <c>&lt;none&gt;</c>
+    /// nor dangling, and an only-synthetic-tag image (the untagged-classic-build case cider-ger.20
+    /// fixed) stays dangling exactly as before — the regression guard.
+    /// </summary>
+    [Fact]
+    public async Task IsDangling_AgreesWithVisibleReferences_ForASyntheticTagPlusAnUnparseableReference()
+    {
+        var (manager, runtime) = CreateManager();
+
+        const string divergentId = "sha256:" + "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd";
+        runtime.AddImageDetail(new RuntimeImageDetail
+        {
+            Id = divergentId,
+            // Neither reference is visible: the synthetic tag is always hidden, and "" fails
+            // ImageReference.TryParse outright — the exact shape that used to make VisibleReferences
+            // (display) and IsDangling (filtering) disagree.
+            References = [SyntheticBuildTag.New(), ""],
+            Config = new ImageConfig { Cmd = ["/bin/sh"] },
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        const string taggedId = "sha256:" + "abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678";
+        runtime.AddImageDetail(new RuntimeImageDetail
+        {
+            Id = taggedId,
+            References = ["docker.io/library/ede32-tagged:latest"],
+            Config = new ImageConfig { Cmd = ["/bin/sh"] },
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        const string onlySyntheticId = "sha256:" + "fedcba0987654321fedcba0987654321fedcba0987654321fedcba09876543";
+        runtime.AddImageDetail(new RuntimeImageDetail
+        {
+            Id = onlySyntheticId,
+            References = [SyntheticBuildTag.New()],
+            Config = new ImageConfig { Cmd = ["/bin/sh"] },
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        // Display: the divergent and only-synthetic images both show as <none> (empty RepoTags); the
+        // normally tagged one does not.
+        var divergentInspect = await manager.InspectAsync(divergentId, CancellationToken.None);
+        Assert.Empty(divergentInspect.RepoTags);
+
+        var taggedInspect = await manager.InspectAsync(taggedId, CancellationToken.None);
+        Assert.NotEmpty(taggedInspect.RepoTags);
+
+        var onlySyntheticInspect = await manager.InspectAsync(onlySyntheticId, CancellationToken.None);
+        Assert.Empty(onlySyntheticInspect.RepoTags);
+
+        // Filtering must agree with display for every one of the three: dangling=true reports the
+        // divergent and only-synthetic images, dangling=false reports only the normally tagged one.
+        var dangling = await manager.ListAsync(true, Filters.Parse("""{"dangling":{"true":true}}"""), false, CancellationToken.None);
+        Assert.Contains(dangling, i => i.Id == divergentId);
+        Assert.Contains(dangling, i => i.Id == onlySyntheticId);
+        Assert.DoesNotContain(dangling, i => i.Id == taggedId);
+
+        var notDangling = await manager.ListAsync(true, Filters.Parse("""{"dangling":{"false":true}}"""), false, CancellationToken.None);
+        Assert.DoesNotContain(notDangling, i => i.Id == divergentId);
+        Assert.DoesNotContain(notDangling, i => i.Id == onlySyntheticId);
+        Assert.Contains(notDangling, i => i.Id == taggedId);
+    }
+
     [Fact]
     public async Task BuildAsync_Quiet_EmitsOnlyFinalId()
     {

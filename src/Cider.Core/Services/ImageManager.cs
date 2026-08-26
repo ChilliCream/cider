@@ -1334,11 +1334,20 @@ public sealed class ImageManager
 
     /// <summary>
     /// An image is dangling once none of its references are real: either it has no references at
-    /// all, or the only reference is the synthetic tag the runtime adapter mints for a
-    /// <c>docker build</c> with no <c>-t</c> (real Docker shows that as <c>&lt;none&gt;:&lt;none&gt;</c>).
+    /// all, or every reference is one <see cref="VisibleReferences"/> itself would hide — the
+    /// synthetic tag the runtime adapter mints for a <c>docker build</c> with no <c>-t</c> (real
+    /// Docker shows that as <c>&lt;none&gt;:&lt;none&gt;</c>), or a reference that fails to parse as
+    /// an image reference at all. Defined in terms of <see cref="VisibleReferences"/> itself
+    /// (cider-ede.32) rather than restating its own condition: the two used to diverge for a
+    /// reference that is neither a synthetic tag nor parseable — <c>VisibleReferences</c> hid it (the
+    /// image displayed as <c>&lt;none&gt;</c>) while this checked only <see cref="SyntheticBuildTag"/>
+    /// and so still counted it as a real tag, so an image could show as <c>&lt;none&gt;</c> yet be
+    /// excluded from <c>--filter dangling=true</c>. Defining dangling as "nothing visible" makes that
+    /// drift impossible by construction: whatever <c>VisibleReferences</c> hides from display also
+    /// stops counting as a tag here.
     /// </summary>
     private static bool IsDangling(RuntimeImage image) =>
-        image.References.All(SyntheticBuildTag.IsSyntheticBuildTag);
+        !VisibleReferences(image.References).Any();
 
     private static IEnumerable<string> VisibleReferences(IReadOnlyList<string> references) =>
         references.Where(r => !SyntheticBuildTag.IsSyntheticBuildTag(r) && ImageReference.TryParse(r, out _));

@@ -169,6 +169,22 @@ public sealed partial class FakeContainerRuntime
         }
     }
 
+    /// <summary>
+    /// Test hook (cider-ede.32): appends <paramref name="detail"/> straight to the fixture, bypassing
+    /// every normal write path (build/pull/tag), each of which only ever produces a well-formed
+    /// <c>References</c> entry via <see cref="ImageReference.Parse"/>. A test that needs a reference
+    /// no real write path can produce — e.g. one that fails to parse as an image reference at all, to
+    /// exercise <c>ImageManager</c>'s <c>VisibleReferences</c>/<c>IsDangling</c> edge case — has no
+    /// other way to get it into the fixture.
+    /// </summary>
+    public void AddImageDetail(RuntimeImageDetail detail)
+    {
+        lock (_sync)
+        {
+            _images.Add(detail);
+        }
+    }
+
     public Task<RuntimeImageDetail?> InspectImageAsync(string reference, CancellationToken ct)
     {
         Record($"InspectImageAsync:{reference}");
