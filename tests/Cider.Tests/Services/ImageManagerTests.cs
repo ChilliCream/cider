@@ -974,6 +974,44 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Equal(System.Net.HttpStatusCode.NotFound, ex.Status);
     }
 
+    /// <summary>
+    /// cider-bci: an image whose <c>References</c> are all unparseable (or empty) — the same shape
+    /// cider-ede.32's <c>IsDangling_AgreesWithVisibleReferences_ForASyntheticTagPlusAnUnparseableReference</c>
+    /// test seeds — is correctly selected as dangling, but before this fix <c>PruneAsync</c> built its
+    /// per-image <c>targets</c> list straight from <c>image.References</c> without filtering out the
+    /// unparseable ones first. Handing <c>""</c> to <c>RemoveImageAsync</c> makes the real runtime
+    /// adapter throw <c>ArgumentException</c> (not a <c>RuntimeException</c>), which escapes both the
+    /// per-target and per-image catches and 500s the whole prune — this is bci's actual failure mode.
+    /// A prune over this fixture must not throw, must report the image deleted, and must never call
+    /// <c>RemoveImageAsync</c> with the empty reference.
+    /// </summary>
+    [Fact]
+    public async Task PruneAsync_ImageWithAnUnparseableReference_IsPrunedWithoutCallingRemoveOnIt()
+    {
+        var (manager, runtime) = CreateManager();
+
+        var imageId = "sha256:" + new string('e', 64);
+        runtime.AddImageDetail(new RuntimeImageDetail
+        {
+            Id = imageId,
+            // The same shape cider-ede.32 seeds: a synthetic build tag (always hidden) plus an empty
+            // reference that fails ImageReference.TryParse outright.
+            References = [SyntheticBuildTag.New(), ""],
+            Size = 1_000,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        var response = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
+
+        Assert.Contains(response.ImagesDeleted, i => i.Deleted == imageId);
+
+        // "RemoveImageAsync:{reference}:{force}" — an empty reference records as "RemoveImageAsync::…".
+        Assert.DoesNotContain(runtime.Calls, c => c.StartsWith("RemoveImageAsync::", StringComparison.Ordinal));
+    }
+
     [Fact]
     public async Task RemoveAsync_ByTheNewContentAddressedId_DeletesEndToEnd()
     {

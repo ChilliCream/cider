@@ -805,8 +805,15 @@ public sealed class ImageManager
                 // more than once); removing only the first of them left the digest alive under the
                 // rest, so it kept reappearing as dangling until as many more `prune -f` calls as it
                 // had leftover tags. Every reference has to go for the image to actually disappear.
-                var targets = image.References.Count > 0
-                    ? image.References.Select(NormalizedOf).Distinct(StringComparer.Ordinal).ToList()
+                // cider-bci: an unparseable reference can't be resolved by `image delete`, and an
+                // empty one makes the runtime adapter throw ArgumentException, which is not a
+                // RuntimeException and so bypasses both catches below — that 500s the whole prune
+                // instead of just skipping the one bad reference. Filter to references that actually
+                // parse (TryParse only — synthetic build tags parse fine and must be kept) before
+                // building the target list, and fall back to the id when none of them do.
+                var parseable = image.References.Where(r => ImageReference.TryParse(r, out _)).ToList();
+                var targets = parseable.Count > 0
+                    ? parseable.Select(NormalizedOf).Distinct(StringComparer.Ordinal).ToList()
                     : [RuntimeReferenceFor(image, image.Id)];
 
                 RuntimeException? missing = null;
