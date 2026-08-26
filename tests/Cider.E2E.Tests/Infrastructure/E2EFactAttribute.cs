@@ -37,6 +37,29 @@ public sealed class AppleModePortFactAttribute : FactAttribute
 }
 
 /// <summary>
+/// An E2E fact that only means anything under XPC (<c>CIDER_RUNTIME_TRANSPORT=xpc</c>): a latency
+/// characterization of the fast path <c>auto</c> falls back to the CLI for. Skipped — with a message
+/// naming the env var, per cider-ede.15's fix direction — under <c>cli</c> or the unpinned <c>auto</c>
+/// default, since the latter's actual transport is a runtime decision (<see cref="DaemonFixture.Transport"/>
+/// cannot see it) this attribute must not guess at.
+/// </summary>
+public sealed class XpcOnlyFactAttribute : FactAttribute
+{
+    /// <summary>Applies the skip reason unless the suite explicitly requested XPC.</summary>
+    public XpcOnlyFactAttribute()
+    {
+        if (DaemonFixture.SkipReason is { } reason)
+        {
+            Skip = reason;
+        }
+        else if (!DaemonFixture.XpcTransport)
+        {
+            Skip = "set CIDER_RUNTIME_TRANSPORT=xpc to run this XPC-only fast-path latency characterization";
+        }
+    }
+}
+
+/// <summary>
 /// An E2E fact that also needs <c>CIDER_E2E_LARGE=1</c>: it moves a genuinely large (default
 /// 200 MiB) build context through the real Apple builder VM, which is slow and whose outcome is
 /// evidence for a follow-up task rather than something worth paying for on every run.

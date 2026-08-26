@@ -614,6 +614,17 @@ The Testcontainers and Aspire fixtures (`tests/e2e-testcontainers`, `tests/e2e-a
 in its own `global.json`, because `Aspire.AppHost.Sdk` 13.5.0 cannot build on the .NET 11 preview SDK
 the repository root rolls forward to.
 
+The E2E suite runs against whichever runtime transport the in-process daemon under test picks —
+`auto` by default, pinnable with `CIDER_RUNTIME_TRANSPORT=xpc` or `=cli` (`DaemonFixture.Transport`),
+which is exactly what CI's `.github/workflows/e2e.yml` sets, running the whole suite twice (once per
+transport) against the newest Apple `container` release cider has been exercised against
+(`ApiServerVersion.Tested`). The XPC-only `PerfSmokeTests` (`tests/Cider.E2E.Tests/PerfSmokeTests.cs`)
+guard that the fast create path stays fast and skip outright under `cli`. To characterize the *older
+minimum* supported apiserver (`ApiServerVersion.Minimum`) instead of CI's pinned newest release,
+install that older signed `.pkg` from https://github.com/apple/container/releases locally and run
+`CIDER_E2E=1 CIDER_RUNTIME_TRANSPORT=xpc dotnet test tests/Cider.E2E.Tests` against it — see
+`tests/compat/README.md`'s "Runtime transport" section for the exact commands.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE). Copyright ChilliCream Inc.

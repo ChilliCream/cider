@@ -97,6 +97,34 @@ All paths/timeouts are overridable via env vars (`CIDER_COMPAT_SOCKET`,
 `CIDER_COMPAT_PING_TIMEOUT`, `CIDER_COMPAT_DAEMON_LOG`, `CIDER_COMPAT_PID_FILE`) —
 see the file's header comment.
 
+### Runtime transport
+
+`start_daemon` launches the built `cider serve` binary as a plain child
+process, so it inherits the calling shell's environment — including
+`CIDER_RUNTIME_TRANSPORT` (`auto` the default, or `xpc`/`cli` to pin one; see
+`CiderOptions.RuntimeTransport`). No harness flag is needed: export it before
+sourcing `lib/daemon.sh` (or before running any `run-*.sh`/`diff-*.sh`
+script) to run these suites against one transport specifically, e.g.
+
+```bash
+CIDER_RUNTIME_TRANSPORT=cli bash tests/compat/run-podman-apiv2.sh
+```
+
+To characterize the suites against the *older minimum* supported apiserver
+(`ApiServerVersion.Minimum`, currently 1.2.0) rather than the newest tested
+release, install that release locally before running:
+
+```bash
+curl -fsSL -o container.pkg \
+  https://github.com/apple/container/releases/download/1.2.0/container-1.2.0-installer-signed.pkg
+sudo installer -pkg container.pkg -target /
+container system start --enable-kernel-install
+CIDER_RUNTIME_TRANSPORT=xpc bash tests/compat/run-podman-apiv2.sh
+```
+
+(reinstall the newest release afterwards — `container --version` shows
+what is currently active).
+
 ## `run-podman-apiv2.sh`
 
 ```

@@ -38,6 +38,28 @@ public class DaemonFixture : IAsyncLifetime
     public static bool AppleModePorts =>
         string.Equals(PortPublishingMode, CiderOptions.ApplePortPublishing, StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Which runtime transport the suite requests (<see cref="CiderOptions.AutoRuntimeTransport"/>,
+    /// <see cref="CiderOptions.XpcRuntimeTransport"/>, or <see cref="CiderOptions.CliRuntimeTransport"/>),
+    /// read straight from <c>CIDER_RUNTIME_TRANSPORT</c> the same way <see cref="PortPublishingMode"/>
+    /// reads <c>CIDER_PORT_PUBLISHING</c> — this is what CI's transport matrix sets to run the suite
+    /// once per transport. Left unset (the default), the daemon under test decides for itself
+    /// (<c>RuntimeTransportSelector</c>: ping the apiserver and fall back below the version gate).
+    /// </summary>
+    public static string Transport =>
+        Environment.GetEnvironmentVariable("CIDER_RUNTIME_TRANSPORT") is { Length: > 0 } transport
+            ? transport
+            : CiderOptions.AutoRuntimeTransport;
+
+    /// <summary>
+    /// <c>true</c> only when the suite explicitly requested XPC (<c>CIDER_RUNTIME_TRANSPORT=xpc</c>) —
+    /// not merely when it happens to resolve to XPC under the <c>auto</c> default, since that resolution
+    /// is a runtime decision this static property cannot see. Used to gate transport-specific
+    /// characterizations such as <see cref="Cider.E2E.Tests.PerfSmokeTests"/>.
+    /// </summary>
+    public static bool XpcTransport =>
+        string.Equals(Transport, CiderOptions.XpcRuntimeTransport, StringComparison.OrdinalIgnoreCase);
+
     /// <summary>The daemon's configuration (short socket path, temp data dir).</summary>
     public CiderOptions Options { get; protected set; } = new();
 
@@ -137,6 +159,11 @@ public class DaemonFixture : IAsyncLifetime
             // `proxy` by default, like the real daemon; CIDER_PORT_PUBLISHING=apple runs the
             // suite against Apple's own `-p` forwarder instead.
             PortPublishing = PortPublishingMode,
+
+            // `auto` by default, like the real daemon; CI's transport matrix sets
+            // CIDER_RUNTIME_TRANSPORT=xpc or =cli to pin this fixture's daemon to one transport for
+            // the whole run instead of letting each fixture instance decide for itself.
+            RuntimeTransport = Transport,
         };
 
         // Only assign when a fixture actually wants a pinned interval: the setter latches
