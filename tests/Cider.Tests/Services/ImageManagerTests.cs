@@ -575,6 +575,43 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Contains(images, i => i.Id == rawId);
     }
 
+    [Fact]
+    public async Task RemoveAsync_ByTag_WhenTheRuntimeSilentlyNoOpsOnAMismatchedReference_DoesNotReportSuccess()
+    {
+        // cider-eo0 correction: the sibling test above only ever exercises the deleteAll path
+        // (single reference -> otherReferences.Count == 0), so it never proved the *untag* branch's
+        // own verification actually detects anything. RemoveAsync's untag branch sends the runtime
+        // cider's normalized tag (RequiredNormalization/VerifyRuntimeDeleteActuallyHappenedAsync's
+        // expectedGoneTag), but the runtime's post-delete reference list is always raw — comparing
+        // the normalized expectedGoneTag against that raw list byte-for-byte can never match, which
+        // made the untag check dead code. Seeding a second, distinct reference keeps otherReferences
+        // non-empty so RemoveAsync takes the untag branch instead of deleteAll.
+        var (manager, runtime) = CreateManager();
+        var rawId = "sha256:" + new string('8', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = rawId,
+            References = ["legacy-raw-ref", "other/app:v1"], // raw: not the normalized form cider computes
+            Size = 1_000,
+            Created = DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+        runtime.StrictExactReferenceMatchOnRemove = true;
+
+        var ex = await Assert.ThrowsAsync<DockerApiException>(
+            () => manager.RemoveAsync("legacy-raw-ref", force: false, noPrune: false, CancellationToken.None));
+
+        Assert.Equal(System.Net.HttpStatusCode.InternalServerError, ex.Status);
+
+        // Honest, not a false alarm: the runtime's own no-op really did leave both references (and
+        // the image) in place.
+        var images = await manager.ListAsync(all: true, Filters.Empty, digests: false, CancellationToken.None);
+        var stillPresent = Assert.Single(images, i => i.Id == rawId);
+        Assert.Equal(2, stillPresent.RepoTags.Count);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

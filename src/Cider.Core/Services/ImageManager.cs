@@ -1636,8 +1636,13 @@ public sealed class ImageManager
     /// verification listing is not free and <c>docker rmi</c> is an interactive path (task's own cost
     /// constraint) — every other delete keeps trusting the runtime's return exactly as before.
     /// <paramref name="expectedGoneTag"/> is <c>null</c> for a full delete (the whole image, every
-    /// reference, must be gone) or the one tag an untag-only removal expected to drop (the image
-    /// itself, and its other references, may legitimately remain).
+    /// reference, must be gone) or the one (already-normalized) tag an untag-only removal expected
+    /// to drop (the image itself, and its other references, may legitimately remain). The untag
+    /// check compares <paramref name="expectedGoneTag"/> against the *normalized* form of each of
+    /// the runtime's raw remaining references — not the raw references themselves — because
+    /// <paramref name="expectedGoneTag"/> is cider's normalized tag and the runtime's list is always
+    /// raw; comparing it against the raw list directly would never match even when the tag is
+    /// genuinely still present, making this check permanently dead.
     /// </summary>
     private async Task VerifyRuntimeDeleteActuallyHappenedAsync(
         RuntimeImageDetail imageBefore, string reference, string? expectedGoneTag, CancellationToken ct)
@@ -1647,7 +1652,8 @@ public sealed class ImageManager
 
         var stillThere = expectedGoneTag is null
             ? current is not null
-            : current is not null && current.References.Contains(expectedGoneTag, StringComparer.Ordinal);
+            : current is not null
+                && current.References.Any(r => string.Equals(NormalizedOf(r), expectedGoneTag, StringComparison.Ordinal));
 
         if (!stillThere)
         {
