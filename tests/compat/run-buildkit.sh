@@ -150,14 +150,31 @@ ctx="$WORK/secret"; mkdir -p "$ctx"
 # keyed on identical instruction text. Confirmed by direct repro
 # (cider-e1e): forcing that slot to "s3cr3t-value" via the E2E suite's own
 # Dockerfile+secret reliably reproduces this scenario's exact failure shape
-# (build exits 0, step CACHED, docker run stdout is "s3cr3t-value"); a
-# --no-cache build always reads back the correct content, proving the
-# secret-mount mechanism itself is correct end-to-end and this is a
-# test-fixture collision, not a product defect. Giving this scenario its own
-# secret id (and therefore its own RUN instruction text, hence its own cache
-# key) makes the two suites' cache entries independent so they can never
-# collide, without depending on either suite happening to run in a
-# particular order.
+# (build exits 0, step CACHED, docker run stdout is "s3cr3t-value"). That
+# this script's own `docker run` emits the E2E suite's own literal
+# "s3cr3t-value" -- content this script never writes anywhere -- is itself
+# the positive evidence that this is a cache-slot collision between the two
+# suites' fixtures and not a product defect (e.g. a store/tag visibility
+# race in cider could produce a stale or missing image, but it cannot
+# fabricate a byte string that only the *other* suite's fixture ever wrote).
+# Giving this scenario its own secret id (and therefore its own RUN
+# instruction text, hence its own cache key) makes the two suites' cache
+# entries independent so they can never collide, without depending on
+# either suite happening to run in a particular order.
+#
+# Why an immediate re-run of this script passes: scenario 10 below
+# (`docker buildx prune -f` + `docker builder prune -f`) runs at the end of
+# every full pass of this script and empties the builder cache. So this
+# scenario can only land CACHED (and thus only pick up the E2E suite's
+# content) when an E2E run has populated the shared id=tok slot *after* the
+# last time this script's own scenario 10 ran and *before* this scenario's
+# `docker build` -- e.g. interleaved with a compat run, or the reviewer
+# running the E2E suite between compat passes. The very next compat run
+# starts from an empty cache (this script's own scenario 10 saw to that on
+# the prior pass) and builds this scenario fresh, so it passes -- which is
+# also why the reviewer saw 3/3 isolated passes, including one CACHED run
+# whose cache had been populated by this script itself rather than by the
+# E2E suite.
 cat >"$ctx/Dockerfile" <<'EOF'
 # syntax=docker/dockerfile:1
 FROM alpine:3.22
@@ -167,17 +184,24 @@ EOF
 printf 's3cr3t' > "$WORK/secret.txt"
 out=$( { cd "$ctx" && docker build --secret id=cider-compat-tok,src="$WORK/secret.txt" -t cider-compat/bk-secret:1 .; } 2>&1 )
 build_status=$?
-# Substring check (matching the neighbouring cache/heredoc scenario below),
-# not exact equality: this scenario used to be the only one in this script
-# that merged docker run's stderr into a captured value and then compared
-# that merged value for exact equality (2>&1 into an == "s3cr3t" test) --
-# any stray byte on either stream would fail the comparison even with the
-# right secret mounted. Confirmed independently (cider-e1e): injecting a
-# single extra stderr line reproduces a FAIL deterministically even when
-# run_out otherwise contains exactly the right content. grep -q survives
-# that the same way scenario 4 already does.
+# Line-exact match (grep -qx), not a plain substring check: this scenario
+# used to compare docker run's stderr-merged output for exact equality
+# (2>&1 into an == "s3cr3t" test), so any stray byte on either stream would
+# fail the comparison even with the right secret mounted. Confirmed
+# independently (cider-e1e): injecting a single extra stderr line reproduces
+# a FAIL deterministically even when run_out otherwise contains exactly the
+# right content -- so the merged-stderr capture is kept, and grep -qx (a
+# whole *line* must equal "s3cr3t") tolerates a stray stderr line landing on
+# its own line the same way scenario 4's plain substring check does.
+# A plain `grep -q "s3cr3t"` is NOT safe here, unlike scenario 4: this
+# scenario's cache slot can collide with the E2E suite's own secret fixture
+# (see the comment above the Dockerfile), whose content is the literal
+# "s3cr3t-value" -- and "s3cr3t" is a prefix of "s3cr3t-value", so a plain
+# substring grep would silently PASS on exactly the wrong-content case this
+# check exists to catch. grep -qx rejects "s3cr3t-value" outright while
+# still matching the correct value and tolerating stray stderr lines.
 run_out=$(docker run --rm cider-compat/bk-secret:1 2>&1); run_status=$?
-if [[ $build_status -eq 0 && $run_status -eq 0 ]] && grep -q "s3cr3t" <<<"$run_out"; then
+if [[ $build_status -eq 0 && $run_status -eq 0 ]] && grep -qx 's3cr3t' <<<"$run_out"; then
   record "--secret id=cider-compat-tok,src=file" PASS
 else
   record "--secret id=cider-compat-tok,src=file" FAIL "$out

@@ -280,11 +280,16 @@ BuildKit works out of the box, the same as it does against real Docker
 Engine. Mirrors the scenario list in
 `tests/Cider.E2E.Tests/BuildKitTests.cs` (the xunit E2E suite is the primary
 coverage; this script is the same coverage from outside the .NET test host,
-matching every other script in this harness):
+matching every other script in this harness), with one deliberate
+divergence: the `--secret` scenario uses a namespaced secret id
+(`cider-compat-tok`) rather than the E2E suite's `id=tok`, so its BuildKit
+cache key can never collide with the E2E suite's own secret fixture on the
+Apple builder VM's cache, which is machine-wide and shared (unisolated)
+across every build on the box (cider-e1e):
 
 - basic build → tag → run
 - `--build-arg` + `--target` on a multi-stage Dockerfile
-- `--secret id=tok,src=<file>` + `RUN --mount=type=secret`
+- `--secret id=cider-compat-tok,src=<file>` + `RUN --mount=type=secret`
 - `RUN --mount=type=cache` + a heredoc `RUN <<EOF`
 - `--progress plain` contains `#1 [internal] load build definition`
 - `--iidfile` and `-q` both agree with `docker images --no-trunc -q`
