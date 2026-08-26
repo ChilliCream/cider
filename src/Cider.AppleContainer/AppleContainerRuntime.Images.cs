@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using Cider.AppleContainer.Cli;
 using Cider.AppleContainer.Cli.Models;
@@ -21,9 +22,17 @@ public sealed partial class AppleContainerRuntime
     /// path below and with <see cref="RemoveImageAsync"/> — including when this runtime is used purely
     /// as the XPC transport's CLI fallback (<c>XpcContainerRuntime</c>'s own <c>_cliFallback</c>), so a
     /// pull/load/build funnelled through *this* runtime is never mid-write while *this* runtime's own
-    /// delete subprocess is sweeping. It does not (and per the task's own fix direction §3, need not)
-    /// coordinate with the XPC transport's separate, direct-XPC writes — see <see cref="BlobSweepGate"/>'s
-    /// own doc comment.
+    /// delete subprocess is sweeping. This instance is a separate <see cref="BlobSweepGate"/> from the
+    /// one <c>XpcContainerRuntime</c> keeps for its own direct-XPC pulls/loads/builds/
+    /// <c>PruneImagesAsync</c> — the two do not coordinate with each other. That split was a live hole
+    /// (cider-ede.31 correction), not a harmless one: an XPC-transport
+    /// build used to delegate straight to <em>this</em> runtime's <see cref="BuildImageAsync"/> with no
+    /// XPC-side gate entry first, so it was invisible to the XPC transport's own
+    /// <c>PruneImagesAsync</c> sweep even though it commits new content the same way a pull/load does.
+    /// <c>XpcContainerRuntime.BuildImageAsync</c> now enters its own gate before delegating here, closing
+    /// that hole — every write this daemon can perform on either transport is covered by whichever
+    /// gate that transport's own sweep (this runtime's delete, or the XPC transport's
+    /// <c>PruneImagesAsync</c>) actually takes.
     /// </summary>
     private readonly BlobSweepGate _blobSweepGate = new();
 
@@ -551,7 +560,23 @@ public sealed partial class AppleContainerRuntime
         // it) — from this daemon's point of view that subprocess *is* a sweep, so it takes the gate
         // exclusively, the same as an XPC-transport PruneImagesAsync, rather than running unguarded
         // against this runtime's own concurrent pulls/loads/builds.
+        //
+        // cider-ede.31 fix direction §4: on this transport every delete genuinely is a sweep, so a
+        // CLI-transport rmi that appears hung needs to be attributable — log Debug when acquiring the
+        // gate actually had to wait on this runtime's own in-flight writes (vs. acquiring it free), and
+        // log Information once the delete/sweep itself starts running, naming the reference, so "stuck
+        // waiting on the gate" and "the subprocess itself is slow" are distinguishable from the log.
+        var gateWait = Stopwatch.StartNew();
         await using var sweep = await _blobSweepGate.EnterSweepAsync(ct).ConfigureAwait(false);
+        gateWait.Stop();
+        if (gateWait.Elapsed > TimeSpan.FromMilliseconds(5))
+        {
+            _logger.LogDebug(
+                "image delete {Reference}: waited {ElapsedMs}ms for in-flight image write(s) to finish before sweeping",
+                reference, gateWait.ElapsedMilliseconds);
+        }
+
+        _logger.LogInformation("image delete {Reference}: running (sweeps the whole content store)", reference);
 
         var args = new List<string> { "image", "delete" };
         if (force)

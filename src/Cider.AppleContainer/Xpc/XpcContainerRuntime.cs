@@ -521,15 +521,28 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     // are ported — see XpcContainerRuntime.Process.cs/XpcContainerProcess.cs (task cider-ede.7).
     // ListImagesAsync/InspectImageAsync/PullImageAsync/PushImageAsync/TagImageAsync/
     // RemoveImageAsync/SaveImagesAsync/LoadImagesAsync are ported — see XpcContainerRuntime.Images.cs
-    // (task cider-ede.10). BuildImageAsync stays on the CLI (classic builder, task's non-goals) and
-    // LoginAsync stays on the CLI (registry login stores credentials the images service reads, fix
-    // direction §2) — neither is this task's job. ExecAsync is ported — see
+    // (task cider-ede.10). BuildImageAsync stays on the CLI (classic builder, task's non-goals) — but
+    // still enters _blobSweepGate here first (cider-ede.31 correction: a build commits new content the
+    // same way a pull/load does, and was the one write path left ungated against PruneImagesAsync) —
+    // and LoginAsync stays on the CLI (registry login stores credentials the images service reads, fix
+    // direction §2) — neither delegation itself is this task's job. ExecAsync is ported — see
     // XpcContainerRuntime.Process.cs/XpcContainerProcess.cs (task cider-ede.8). GetBuilderStatusAsync/
     // DialBuilderAsync are ported (StartBuilderAsync stays delegated) — see
     // XpcContainerRuntime.Builder.cs (task cider-ede.13).
 
+    /// <summary>
+    /// Delegates straight to <see cref="_cliFallback"/> (classic builder, cider-ede.5's non-goals), but
+    /// must enter <see cref="_blobSweepGate"/> as a write first (cider-ede.31 correction): a build
+    /// commits new content the same way a pull/load does, and this was the one XPC-transport write path
+    /// left ungated against <see cref="PruneImagesAsync"/> — the live store corruption this fixed twice
+    /// (alpine:3.19, then redis:8.6) could equally have raced a build instead of a pull.
+    /// </summary>
     public Task<string> BuildImageAsync(BuildSpec spec, IProgress<ProgressEvent> progress, CancellationToken ct) =>
-        _cliFallback.BuildImageAsync(spec, progress, ct);
+        GuardAsync(async () =>
+        {
+            await using var write = await _blobSweepGate.EnterImageWriteAsync(ct).ConfigureAwait(false);
+            return await _cliFallback.BuildImageAsync(spec, progress, ct).ConfigureAwait(false);
+        });
 
     public Task LoginAsync(RegistryAuth auth, CancellationToken ct) => _cliFallback.LoginAsync(auth, ct);
 }

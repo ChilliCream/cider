@@ -380,9 +380,36 @@ public sealed partial class FakeContainerRuntime
         return [reference];
     }
 
-    public Task<string> BuildImageAsync(BuildSpec spec, IProgress<ProgressEvent> progress, CancellationToken ct)
+    /// <summary>
+    /// Test hook (cider-ede.31 correction): lets a test hold <see cref="BuildImageAsync"/> open
+    /// mid-write, the same shape <c>XpcContainerRuntimeRemoveImageTests</c>' own pull gate uses, to
+    /// prove <see cref="Cider.AppleContainer.BlobSweepGate"/> genuinely serializes an XPC-transport
+    /// build against a concurrent <c>PruneImagesAsync</c> sweep rather than merely documenting that it
+    /// should. <c>null</c> (the default) never blocks — every other test using this fake is unaffected.
+    /// </summary>
+    private TaskCompletionSource<bool>? _buildGate;
+    private TaskCompletionSource<bool>? _buildBlockedSignal;
+
+    public void ArmBuildGate()
+    {
+        _buildGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _buildBlockedSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    public Task WaitUntilBuildBlockedAsync() => _buildBlockedSignal!.Task;
+
+    public void ReleaseBuild() => _buildGate?.TrySetResult(true);
+
+    public async Task<string> BuildImageAsync(BuildSpec spec, IProgress<ProgressEvent> progress, CancellationToken ct)
     {
         Record($"BuildImageAsync:{spec.ContextDir}");
+
+        if (_buildGate is not null)
+        {
+            _buildBlockedSignal!.TrySetResult(true);
+            await _buildGate.Task.ConfigureAwait(false);
+        }
+
         progress.Report(new ProgressEvent { Stream = "Step 1/1 : FROM scratch\n" });
 
         // Mirrors AppleContainerRuntime.BuildImageAsync: an untagged build still gets a real
@@ -416,7 +443,7 @@ public sealed partial class FakeContainerRuntime
             progress.Report(new ProgressEvent { Stream = $"Successfully tagged {tag}\n" });
         }
 
-        return Task.FromResult(id);
+        return id;
     }
 
     public Task LoginAsync(RegistryAuth auth, CancellationToken ct)

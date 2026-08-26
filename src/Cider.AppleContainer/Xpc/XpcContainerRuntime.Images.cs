@@ -13,7 +13,9 @@ namespace Cider.AppleContainer.Xpc;
 /// docs/spikes/xpc/02-apiserver-xpc-protocol.md §6's image-routes table, reached through
 /// <see cref="_imagesClient"/> (<see cref="ImagesServiceClient"/>, extended by this task with every
 /// route it did not already carry from cider-ede.6). <c>BuildImageAsync</c>/<c>LoginAsync</c> stay on
-/// the CLI (this file's non-goals; see the // FALLBACK block in <c>XpcContainerRuntime.cs</c>).
+/// the CLI (this file's non-goals; see the // FALLBACK block in <c>XpcContainerRuntime.cs</c>) — but
+/// <c>BuildImageAsync</c> still enters <see cref="_blobSweepGate"/> before delegating (cider-ede.31
+/// correction), so it is covered by the same gate as every write path below.
 /// </summary>
 /// <remarks>
 /// <c>imageList</c> answers one <see cref="ImageDescription"/> per <i>reference</i>, each carrying
@@ -30,10 +32,13 @@ namespace Cider.AppleContainer.Xpc;
 /// </remarks>
 internal sealed partial class XpcContainerRuntime
 {
-    /// <summary>Gates this runtime's own pulls/loads against its own store-wide sweep
+    /// <summary>Gates this runtime's own pulls/loads/builds against its own store-wide sweep
     /// (<see cref="PruneImagesAsync"/>, and the apiserver-unavailable delete fallback in
     /// <see cref="RemoveImageAsync"/>) — see <see cref="BlobSweepGate"/>'s own doc comment
-    /// (cider-ede.31).</summary>
+    /// (cider-ede.31). <c>BuildImageAsync</c> (<c>XpcContainerRuntime.cs</c>'s // FALLBACK block) enters
+    /// this same instance before delegating to the CLI (cider-ede.31 correction: it was the one write
+    /// path on this transport left ungated, since it does not go through <c>_imagesClient</c> like the
+    /// members below do).</summary>
     private readonly BlobSweepGate _blobSweepGate = new();
 
     // ---- images: read paths (list/inspect) ------------------------------------------------------

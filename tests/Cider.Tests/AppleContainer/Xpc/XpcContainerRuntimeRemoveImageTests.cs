@@ -122,14 +122,95 @@ public sealed class XpcContainerRuntimeRemoveImageTests
         Assert.True(sweepIndex < pullIndex, $"expected the sweep to be recorded before the pull; calls were [{string.Join(", ", fake.Calls)}]");
     }
 
-    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient)
+    /// <summary>
+    /// cider-ede.31 correction: <c>BuildImageAsync</c> delegates straight to the CLI fallback
+    /// (<c>XpcContainerRuntime.cs</c>'s // FALLBACK block) rather than through <c>_imagesClient</c>
+    /// like <see cref="PullImageAsync"/> above — it was the one XPC-transport write path left ungated
+    /// against <see cref="PruneImagesAsync"/>. This proves it now enters the same
+    /// <see cref="BlobSweepGate"/> instance before delegating: a build held mid-write by
+    /// <see cref="FakeContainerRuntime.ArmBuildGate"/> must block a concurrently-started
+    /// <see cref="PruneImagesAsync"/> until it completes, the same shape
+    /// <see cref="PullImageAsync_HeldMidWrite_BlocksAConcurrentSweepUntilItCompletes"/> proves for pull.
+    /// </summary>
+    [Fact]
+    public async Task BuildImageAsync_HeldMidWrite_BlocksAConcurrentSweepUntilItCompletes()
+    {
+        var fake = new RecordingImagesServiceClient();
+        var cliFallback = new FakeContainerRuntime();
+        var runtime = NewRuntime(fake, cliFallback);
+        using var _ = runtime;
+
+        cliFallback.ArmBuildGate();
+
+        var progress = new Progress<ProgressEvent>();
+        var buildTask = runtime.BuildImageAsync(new BuildSpec { ContextDir = "/tmp/ctx" }, progress, CancellationToken.None);
+
+        // The build is genuinely mid-write (inside BuildImageAsync, blocked on the armed gate) before
+        // the sweep is even started, the same shape a real build that has written blobs but not yet
+        // committed its index entry would present to a sweep that started a moment later.
+        await cliFallback.WaitUntilBuildBlockedAsync();
+
+        var sweepTask = runtime.PruneImagesAsync(CancellationToken.None);
+
+        // The sweep must not be able to complete while the build is still held — give it a beat to
+        // (wrongly) race ahead before releasing the build, the way the pre-fix code would have let it
+        // (BuildImageAsync used to delegate with no XPC-side gate entry at all).
+        var racedAhead = await Task.WhenAny(sweepTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
+        Assert.NotSame(sweepTask, racedAhead);
+        Assert.False(sweepTask.IsCompleted, "PruneImagesAsync must wait for the in-flight build to finish");
+
+        cliFallback.ReleaseBuild();
+        await buildTask;
+        await sweepTask;
+
+        // Order proves the wait was real, not coincidental: the build's own call is recorded before the
+        // sweep's ImageCleanupOrphanedBlobsAsync call.
+        var buildIndex = cliFallback.Calls.IndexOf(cliFallback.Calls.First(c => c.StartsWith("BuildImageAsync:", StringComparison.Ordinal)));
+        var sweepIndex = fake.Calls.IndexOf("ImageCleanupOrphanedBlobsAsync");
+        Assert.True(buildIndex >= 0 && sweepIndex >= 0, $"expected both calls to be recorded; build calls were [{string.Join(", ", cliFallback.Calls)}], sweep calls were [{string.Join(", ", fake.Calls)}]");
+    }
+
+    /// <summary>The reverse ordering: a sweep already in flight blocks a build that starts after it,
+    /// until the sweep finishes — the other half of the same gate.</summary>
+    [Fact]
+    public async Task PruneImagesAsync_InFlight_BlocksAConcurrentBuildUntilItCompletes()
+    {
+        var fake = new RecordingImagesServiceClient();
+        var cliFallback = new FakeContainerRuntime();
+        var runtime = NewRuntime(fake, cliFallback);
+        using var _ = runtime;
+
+        fake.ArmSweepGate();
+
+        var sweepTask = runtime.PruneImagesAsync(CancellationToken.None);
+        await fake.WaitUntilSweepBlockedAsync();
+
+        var progress = new Progress<ProgressEvent>();
+        var buildTask = runtime.BuildImageAsync(new BuildSpec { ContextDir = "/tmp/ctx" }, progress, CancellationToken.None);
+
+        var racedAhead = await Task.WhenAny(buildTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
+        Assert.NotSame(buildTask, racedAhead);
+        Assert.False(buildTask.IsCompleted, "BuildImageAsync must wait for the in-flight sweep to finish");
+
+        fake.ReleaseSweep();
+        await sweepTask;
+        await buildTask;
+
+        var sweepIndex = fake.Calls.IndexOf("ImageCleanupOrphanedBlobsAsync");
+        Assert.True(sweepIndex >= 0 && cliFallback.Calls.Any(c => c.StartsWith("BuildImageAsync:", StringComparison.Ordinal)), $"expected both calls to be recorded; build calls were [{string.Join(", ", cliFallback.Calls)}], sweep calls were [{string.Join(", ", fake.Calls)}]");
+    }
+
+    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient) =>
+        NewRuntime(imagesClient, new FakeContainerRuntime());
+
+    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient, IContainerRuntime cliFallback)
     {
         var options = new AppleContainerOptions();
         var apiserver = new XpcClient("com.apple.container.test.apiserver", NullLogger.Instance);
         var images = new XpcClient("com.apple.container.test.images", NullLogger.Instance);
         var capabilities = new RuntimeCapabilities { Transport = RuntimeTransportKind.Xpc };
         return new XpcContainerRuntime(
-            new FakeContainerRuntime(), apiserver, images, capabilities, options, NullLogger<XpcContainerRuntime>.Instance, imagesClient);
+            cliFallback, apiserver, images, capabilities, options, NullLogger<XpcContainerRuntime>.Instance, imagesClient);
     }
 
     /// <summary>Records every call it makes, and lets a test hold <c>ImagePullAsync</c> or

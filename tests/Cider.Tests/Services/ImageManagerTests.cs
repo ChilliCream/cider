@@ -874,18 +874,20 @@ public sealed class ImageManagerTests : IDisposable
     }
 
     [Fact]
-    public async Task PruneAsync_WhenNothingIsDeleted_DoesNotSweepTheStore()
+    public async Task PruneAsync_WhenNothingIsDeleted_StillSweepsTheStoreExactlyOnce()
     {
-        // The default (dangling-only) prune against a fixture with no dangling images deletes
-        // nothing — fix direction §2's "only where the user explicitly asked to reclaim space" still
-        // means "and there was actually something to reclaim", not an unconditional sweep on every
-        // prune call regardless of outcome.
+        // cider-ede.31 correction: PruneImagesAsync is the *only* reclaim path in the codebase — a
+        // prune that deletes nothing (the default dangling-only prune against a fixture with no
+        // dangling images) must still sweep, or blobs orphaned by an earlier plain `rmi` (which no
+        // longer sweeps at all, fix direction §1/§2) become permanently unreclaimable. "Only where the
+        // user explicitly asked to reclaim space" means gated on the *prune request*, not on whether
+        // this particular call happened to find something dangling.
         var (manager, runtime) = CreateManager();
 
         var response = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
 
         Assert.Empty(response.ImagesDeleted);
-        Assert.DoesNotContain(runtime.Calls, c => c == "PruneImagesAsync");
+        Assert.Single(runtime.Calls, c => c == "PruneImagesAsync");
     }
 
     [Fact]

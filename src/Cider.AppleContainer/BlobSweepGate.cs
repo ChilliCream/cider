@@ -13,6 +13,19 @@ namespace Cider.AppleContainer;
 /// explicit that this is out of scope ("just stop cider from corrupting the store by itself").
 /// </summary>
 /// <remarks>
+/// <para>
+/// One instance per runtime — <c>AppleContainerRuntime</c> and <c>XpcContainerRuntime</c> each keep
+/// their own, and the two do not coordinate with each other (see each type's own doc comment for why
+/// that is fine for the writes/sweeps each one actually performs). What matters for correctness is
+/// that every write and every sweep *a given transport can run* goes through that same transport's one
+/// instance — cider-ede.31's correction closed the one gap where that was not yet true: an
+/// XPC-transport build used to delegate straight to the CLI runtime's <c>BuildImageAsync</c> with no
+/// XPC-side gate entry first, so it was invisible to the XPC transport's own sweep
+/// (<c>PruneImagesAsync</c>) even though it commits new content the same way a pull/load does.
+/// <c>XpcContainerRuntime.BuildImageAsync</c> now enters its own instance before delegating, so every
+/// write path on both transports is covered by the sweep that could actually race it.
+/// </para>
+/// <para>
 /// Classic two-semaphore readers/writer lock, roles named for what they mean here rather than the
 /// generic reader/writer vocabulary: <see cref="EnterImageWriteAsync"/> ("shared" — pulls/loads run
 /// freely alongside each other) and <see cref="EnterSweepAsync"/> ("exclusive" — a sweep waits for
@@ -21,6 +34,7 @@ namespace Cider.AppleContainer;
 /// indefinitely — but a sweep here is a rare, user-initiated <c>prune</c> (or an unavailable-apiserver
 /// delete fallback), not a hot path; starving it only delays reclaiming space, and never corrupts
 /// anything, which is the one property this type exists to guarantee.
+/// </para>
 /// </remarks>
 internal sealed class BlobSweepGate
 {
