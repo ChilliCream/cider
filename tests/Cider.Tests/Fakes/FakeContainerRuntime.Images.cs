@@ -127,6 +127,21 @@ public sealed partial class FakeContainerRuntime
         }
     }
 
+    /// <summary>
+    /// Test hook (cider-ede.24): simulates a runtime whose <see cref="ListImagesAsync"/> has already
+    /// degraded to an empty listing — the shape both transports now answer with instead of throwing
+    /// when Apple's store holds a dangling content reference — so a caller-side test can prove
+    /// <c>ImageManager.ListAsync</c> forwards that as a plain empty result (Docker's <c>200</c> with
+    /// <c>[]</c>) rather than surfacing it as a failure.
+    /// </summary>
+    public void ClearImages()
+    {
+        lock (_sync)
+        {
+            _images.Clear();
+        }
+    }
+
     public Task<RuntimeImageDetail?> InspectImageAsync(string reference, CancellationToken ct)
     {
         Record($"InspectImageAsync:{reference}");

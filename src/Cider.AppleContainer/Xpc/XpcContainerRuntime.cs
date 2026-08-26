@@ -89,6 +89,28 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         RuntimeCapabilities capabilities,
         AppleContainerOptions options,
         ILogger<XpcContainerRuntime> logger)
+        : this(cliFallback, apiserver, images, capabilities, options, logger, imagesClient: null)
+    {
+    }
+
+    /// <summary>
+    /// Test-only seam (cider-ede.24 fix direction item 4): lets a unit test hand in a fake
+    /// <see cref="ImagesServiceClient"/> (e.g. one whose <c>contentGet</c> throws for a specific digest)
+    /// instead of the real one this class would otherwise build from <paramref name="images"/> — <c>
+    /// apiserver</c>/<c>images</c> are still required (every other member still reads them), but
+    /// nothing in <see cref="ListImagesAsync"/>/<see cref="InspectImageAsync"/> reaches them once
+    /// <paramref name="imagesClient"/> is supplied, so a test can pass throwaway <see cref="XpcClient"/>
+    /// instances that are never actually connected. <c>null</c> (every production call site) keeps the
+    /// original behavior of constructing one from <paramref name="images"/>.
+    /// </summary>
+    internal XpcContainerRuntime(
+        IContainerRuntime cliFallback,
+        XpcClient apiserver,
+        XpcClient images,
+        RuntimeCapabilities capabilities,
+        AppleContainerOptions options,
+        ILogger<XpcContainerRuntime> logger,
+        ImagesServiceClient? imagesClient)
     {
         ArgumentNullException.ThrowIfNull(cliFallback);
         ArgumentNullException.ThrowIfNull(apiserver);
@@ -104,7 +126,7 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         _options = options;
         _logger = logger;
 
-        _imagesClient = new ImagesServiceClient(images, options.PullTimeout);
+        _imagesClient = imagesClient ?? new ImagesServiceClient(images, options.PullTimeout);
         _kernelCache = new KernelCache(apiserver);
         _imageSnapshotEnsurer = new ImageSnapshotEnsurer(_imagesClient);
         _initImageResolver = new InitImageResolver(options, _imagesClient, logger);

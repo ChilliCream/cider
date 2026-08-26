@@ -29,13 +29,8 @@ public sealed partial class AppleContainerRuntime
         {
             if (CliErrorMapper.IsDanglingContent(result.Stderr))
             {
-                _logger.LogWarning(
-                    "the Apple container image store has a dangling content reference ({Digest}) that " +
-                    "`container image ls` cannot resolve; `docker images` will list only what is " +
-                    "enumerable until it is repaired with Apple's own tooling (`container image prune`, " +
-                    "or `container image delete <ref>` for the offending image) -- cider does not modify " +
-                    "Apple's store",
-                    CliErrorMapper.ExtractDanglingDigest(result.Stderr) ?? result.Stderr);
+                var digest = CliErrorMapper.ExtractDanglingDigest(result.Stderr) ?? result.Stderr;
+                _logger.LogWarning("{Message}", CliErrorMapper.DanglingContentRemedy(digest));
                 return (IReadOnlyList<RuntimeImage>)Array.Empty<RuntimeImage>();
             }
 
@@ -546,6 +541,23 @@ public sealed partial class AppleContainerRuntime
             }
         });
 
+    /// <summary>Prefix Apple's <c>image load</c> puts in front of each reference it names on stdout.</summary>
+    private const string LoadedImagePrefix = "Loaded image:";
+
+    /// <summary>
+    /// Must not depend on a healthy full listing (cider-ede.24): with a dangling content reference in
+    /// the store, <see cref="ListImagesAsync"/> degrades to an empty list (see its own doc comment), so
+    /// a before/after diff of it can no longer be trusted to prove what a successful <c>image load</c>
+    /// just loaded — both sets collapse to empty regardless of what actually loaded, which used to read
+    /// as "loaded nothing" and silently drop the reference from <c>docker load</c>/BuildKit's
+    /// <c>ExportLoader</c>. The primary source is now Apple's own stdout echo (<c>Loaded image:
+    /// &lt;ref&gt;</c>, occasionally a bare reference line with no prefix), read unconditionally — no
+    /// gate on the listing containing it. The before/after diff is kept only as a secondary source,
+    /// unioned in and contributing nothing when it found nothing (rather than being trusted as proof
+    /// nothing loaded). If a successful <c>image load</c> still leaves both sources empty, that is
+    /// reported loudly (fix direction item 5: "a silent partial list is worse than a loud one") instead
+    /// of returning an empty list.
+    /// </summary>
     public Task<IReadOnlyList<string>> LoadImagesAsync(Stream tarInput, CancellationToken ct) => GuardAsync(async () =>
     {
         ArgumentNullException.ThrowIfNull(tarInput);
@@ -563,8 +575,22 @@ public sealed partial class AppleContainerRuntime
             var result = await _cli.RunAsync(["image", "load", "-i", tmp], ct, _options.PullTimeout);
             ContainerCli.ThrowIfFailed(result, "image load");
 
-            var after = await ListReferencesAsync(ct);
             var loaded = new List<string>();
+            foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var candidate = line.Trim();
+                if (candidate.StartsWith(LoadedImagePrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    candidate = candidate[LoadedImagePrefix.Length..].Trim();
+                }
+
+                if (candidate.Length > 0 && !loaded.Contains(candidate, StringComparer.Ordinal))
+                {
+                    loaded.Add(candidate);
+                }
+            }
+
+            var after = await ListReferencesAsync(ct);
             foreach (var reference in after)
             {
                 if (!before.Contains(reference) && !loaded.Contains(reference, StringComparer.Ordinal))
@@ -575,16 +601,9 @@ public sealed partial class AppleContainerRuntime
 
             if (loaded.Count == 0)
             {
-                // Nothing new appeared (the archive only refreshed known tags): fall back to the
-                // references the CLI echoed on stdout.
-                foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                {
-                    var candidate = line.Trim();
-                    if (candidate.Length > 0 && after.Contains(candidate))
-                    {
-                        loaded.Add(candidate);
-                    }
-                }
+                throw RuntimeException.Internal(
+                    "`image load` succeeded but no loaded reference could be identified from the CLI's " +
+                    "own output or the image listing");
             }
 
             return (IReadOnlyList<string>)loaded;

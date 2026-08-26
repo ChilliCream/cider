@@ -13,7 +13,14 @@ namespace Cider.AppleContainer.Xpc;
 /// <c>imageLoad</c>/<c>imageCleanupOrphanedBlobs</c> — plus the content-store's <c>contentGet</c>
 /// (task's file-scope note: "extends the X5 stub with all routes").
 /// </summary>
-internal sealed class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
+/// <remarks>
+/// Not <c>sealed</c>, and <see cref="ImageListAsync"/>/<see cref="ContentGetAsync"/> are <c>virtual</c>
+/// — the testability seam cider-ede.24 needs to drive <see cref="XpcContainerRuntime.ListImagesAsync"/>
+/// against a fake that fails a specific digest, without a live apiserver connection (there is no
+/// per-route interface here; a single override point on the real class is the minimal seam, matching
+/// the shape <see cref="XpcContainerRuntime"/>'s own <c>internal</c> test constructor already uses).
+/// </remarks>
+internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
 {
     /// <summary><c>imageUnpack</c> decompresses/unpacks a whole image layer set and can legitimately
     /// take much longer than the 60s default (§1.4) on a large image — still on the shared connection
@@ -34,7 +41,7 @@ internal sealed class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout
 
     /// <summary><c>imageList</c> — no request payload (§6). <c>[]</c> when the reply carries no
     /// <c>imageDescriptions</c> key.</summary>
-    public async Task<List<ImageDescription>> ImageListAsync(CancellationToken ct)
+    public virtual async Task<List<ImageDescription>> ImageListAsync(CancellationToken ct)
     {
         using var request = new XpcMessage("imageList");
         using var reply = await images.SendAsync(request, XpcCallOptions.Default, ct).ConfigureAwait(false);
@@ -202,7 +209,7 @@ internal sealed class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout
     /// closing note: "a digest is resolved to a local file path... then a normal file read"); the
     /// caller reads the file itself (<see cref="ContentStore.LocalBlobReader"/>).
     /// </summary>
-    public async Task<string?> ContentGetAsync(string digest, CancellationToken ct)
+    public virtual async Task<string?> ContentGetAsync(string digest, CancellationToken ct)
     {
         try
         {

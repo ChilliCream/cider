@@ -493,6 +493,32 @@ cider sync
 This only ever fixes cider's own records and cider-owned side processes (DNS forwarders); it never
 deletes anything on the Apple side. Pass `--json` for the raw report.
 
+### Apple's image store has a dangling content reference
+
+Apple's own store can end up naming a content blob in `state.json` that is no longer actually on
+disk — usually after an interrupted operation on the Apple side. Symptom: `container image ls`
+(and cider) fail with
+
+```
+Error: content with digest sha256:<hex>
+```
+
+While the store is in that state, `docker images` may list fewer images than are really there, or
+none at all — cider logs a Warning naming the digest rather than failing the whole listing, but it
+cannot repair another tool's store, so the listing is genuinely short until the entry is cleaned up.
+`container image inspect <ref>`/`container ls -a` are unaffected — only the listing route is
+poisoned by the one bad entry.
+
+Repair it with Apple's own tooling:
+
+```bash
+container image prune
+# or, once the offending image is identified:
+container image delete <ref>
+```
+
+cider never writes to Apple's `state.json` — it does not and will not attempt to repair this itself.
+
 ### A hard-killed daemon can wedge the Apple runtime
 
 The daemon holds one `container start -a <name>` child process per running container, to own that

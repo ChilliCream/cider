@@ -232,6 +232,19 @@ internal static class CliErrorMapper
         return end > hexStart ? stderr[start..end] : null;
     }
 
+    /// <summary>
+    /// Shared operator-facing text for a dangling/unresolvable content reference — used verbatim by
+    /// both the CLI transport's <c>image ls</c> failure (this file) and the XPC transport's per-digest
+    /// <c>contentGet</c> failure (<c>XpcContainerRuntime.Images.cs</c>), so an operator sees identical
+    /// guidance regardless of which transport served the request (cider-ede.24 fix direction item 3:
+    /// "carrying the same operator remedy text as the CLI path").
+    /// </summary>
+    public static string DanglingContentRemedy(string digest) =>
+        $"the Apple container image store has a dangling content reference ({digest}) that could not be " +
+        "resolved; `docker images` output may be incomplete until it is repaired with Apple's own " +
+        "tooling (`container image prune`, or `container image delete <ref>` for the offending image) " +
+        "-- cider does not modify Apple's store";
+
     /// <summary>Builds the exception for a failed invocation.</summary>
     public static RuntimeException ToException(CliResult result, string context)
     {

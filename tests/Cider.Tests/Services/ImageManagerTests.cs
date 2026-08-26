@@ -85,6 +85,25 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Contains(images, i => i.RepoTags.Contains("hello-world:latest"));
     }
 
+    /// <summary>
+    /// cider-ede.24 correction (finding 4, "docker images answers 200 with what is enumerable" is not
+    /// covered at any seam): a runtime whose <c>ListImagesAsync</c> has already degraded to an empty
+    /// list — the tolerated shape both transports now answer with instead of throwing when Apple's
+    /// store holds a dangling content reference — must come back through <c>ImageManager.ListAsync</c>
+    /// (and so <c>GET /images/json</c>) as a plain empty result, not an exception a controller would
+    /// turn into a 500.
+    /// </summary>
+    [Fact]
+    public async Task ListAsync_ReturnsEmpty_WhenTheRuntimesListingHasDegradedToEmpty()
+    {
+        var (manager, runtime) = CreateManager();
+        runtime.ClearImages();
+
+        var images = await manager.ListAsync(true, Filters.Empty, false, CancellationToken.None);
+
+        Assert.Empty(images);
+    }
+
     [Fact]
     public async Task InspectAsync_And_ListAsync_RepoDigests_NameTheIndexDigest_NotTheContentAddressedId()
     {
