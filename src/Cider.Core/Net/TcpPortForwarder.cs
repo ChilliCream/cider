@@ -25,13 +25,17 @@ internal interface IPortForwarder : IDisposable
 /// <c>containerIp:containerPort</c>. The listener binds and starts accepting immediately, whether or
 /// not <c>containerIp</c> is known yet (cider-ede.18: the daemon no longer waits for the container's
 /// VM address before publishing a TCP mapping, so a client racing to connect during the VM boot is
-/// accepted and queued instead of refused). A connection accepted before the address is known waits,
-/// up to <see cref="TargetWaitTimeout"/>, for <see cref="ResolveTarget"/> to supply it; past that it is
-/// closed without ever having been relayed. Half-closes are propagated once relaying starts (an EOF on
-/// one side shuts the other side's send half down), so protocols that rely on the peer seeing FIN —
-/// plain HTTP/1.0 responses, <c>nc</c>-style servers — behave the way they would through dockerd's
-/// userland proxy. Idle connections are never timed out; only a close on either side or
-/// <see cref="Dispose"/> ends them.
+/// accepted and queued instead of refused). A connection accepted before the address is known is held
+/// until the guest's own service accepts the dial, bounded by <see cref="TargetWaitTimeout"/> counted
+/// from the moment the connection was accepted (covering both the wait for the address and the retried
+/// dial once it arrives); past that deadline it is closed without ever having been relayed. A
+/// connection accepted after the address was already known — the steady state of a running container —
+/// is dialed once, not retried: a dead in-container service fails it fast, exactly as dockerd's
+/// userland proxy does. Half-closes are propagated once relaying starts (an EOF on one side shuts the
+/// other side's send half down), so protocols that rely on the peer seeing FIN — plain HTTP/1.0
+/// responses, <c>nc</c>-style servers — behave the way they would through dockerd's userland proxy.
+/// Idle connections are never timed out; only a close on either side or <see cref="Dispose"/> ends
+/// them.
 /// </summary>
 internal sealed class TcpPortForwarder : IPortForwarder
 {
@@ -182,7 +186,10 @@ internal sealed class TcpPortForwarder : IPortForwarder
         {
             client.NoDelay = true;
 
-            var containerIp = await AwaitTargetAsync(ct);
+            var wasHeld = _containerIp is null;
+            var deadline = DateTime.UtcNow + _targetWaitTimeout;
+
+            var containerIp = await AwaitTargetAsync(deadline, ct);
             if (containerIp is null)
             {
                 _logger.LogDebug(
@@ -193,8 +200,17 @@ internal sealed class TcpPortForwarder : IPortForwarder
             }
 
             target = new IPEndPoint(containerIp, _containerPort);
-            upstream = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            await upstream.ConnectAsync(target, ct);
+            upstream = await DialAsync(target, wasHeld, deadline, ct);
+            if (upstream is null)
+            {
+                _logger.LogDebug(
+                    "closing a connection on published port {Endpoint}: backend at {Target} never accepted "
+                    + "within {Timeout}",
+                    HostEndPoint,
+                    target,
+                    _targetWaitTimeout);
+                return;
+            }
 
             await Task.WhenAll(
                 PumpAsync(client, upstream, ct),
@@ -218,15 +234,21 @@ internal sealed class TcpPortForwarder : IPortForwarder
         }
     }
 
-    /// <summary>Returns the backend address once known, or <c>null</c> once the wait gives up.</summary>
-    private async Task<IPAddress?> AwaitTargetAsync(CancellationToken ct)
+    /// <summary>Returns the backend address once known, or <c>null</c> once <paramref name="deadline"/> passes.</summary>
+    private async Task<IPAddress?> AwaitTargetAsync(DateTime deadline, CancellationToken ct)
     {
         if (_containerIp is { } known)
         {
             return known;
         }
 
-        using var timeoutCts = new CancellationTokenSource(_targetWaitTimeout);
+        var remaining = deadline - DateTime.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            return null;
+        }
+
+        using var timeoutCts = new CancellationTokenSource(remaining);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
         try
         {
@@ -235,6 +257,53 @@ internal sealed class TcpPortForwarder : IPortForwarder
         catch (OperationCanceledException)
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Delay between retried dial attempts against a held connection whose backend refused, was
+    /// unreachable, or timed out — the guest's service has not started listening yet.
+    /// </summary>
+    private static readonly TimeSpan DialRetryDelay = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// Dials <paramref name="target"/>. When <paramref name="wasHeld"/> is <c>false</c> — the address
+    /// was already known at accept time, the steady state of a running container — this is a single
+    /// shot: a dead in-container service fails fast, exactly as dockerd's userland proxy does. When
+    /// <paramref name="wasHeld"/> is <c>true</c> — the connection was accepted before the address was
+    /// known — a connection-refused/unreachable/timed-out dial is retried until <paramref
+    /// name="deadline"/>, because the guest's service may simply not have started listening yet.
+    /// Returns <c>null</c> once the deadline passes without a successful dial.
+    /// </summary>
+    private async Task<Socket?> DialAsync(IPEndPoint target, bool wasHeld, DateTime deadline, CancellationToken ct)
+    {
+        while (true)
+        {
+            var socket = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            try
+            {
+                await socket.ConnectAsync(target, ct);
+                return socket;
+            }
+            catch (SocketException ex) when (
+                wasHeld &&
+                ex.SocketErrorCode is SocketError.ConnectionRefused or SocketError.HostUnreachable
+                    or SocketError.NetworkUnreachable or SocketError.TimedOut)
+            {
+                socket.Dispose();
+
+                if (DateTime.UtcNow >= deadline)
+                {
+                    return null;
+                }
+
+                await Task.Delay(DialRetryDelay, ct);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
         }
     }
 

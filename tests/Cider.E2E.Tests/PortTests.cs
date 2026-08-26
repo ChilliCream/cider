@@ -85,19 +85,16 @@ public sealed class PortTests(DaemonFixture daemon)
 
     /// <summary>
     /// cider-ede.18's own named verification: a published TCP port must accept connections the moment
-    /// it is bound at <c>start</c>, before the container's VM address is known, instead of refusing
-    /// them until it is. <see cref="Net.TcpPortForwarder"/> holds an accepted connection (bounded) for
-    /// the backend address rather than failing it, so — unlike before this fix, where the host port
-    /// was not even bound until the address arrived — a connection attempted the moment
-    /// <c>docker run -d</c> returns is never refused: what this test actually achieves is "never
-    /// refused", not the ticket's stronger "succeeds on the first attempt and completes when the
-    /// service is up" — <see cref="Net.TcpPortForwarder"/> dials the backend the instant
-    /// <c>ResolveAddress</c> supplies it, so a connection held while the address was still unknown is
-    /// dropped (curl exit 52, empty reply) rather than parked until the guest's own service starts
-    /// listening; only a later attempt, made after the guest is actually up, succeeds. cider-ede.18
-    /// also leaves <c>StartAsync</c> blocking on network registration before it returns (see task
-    /// comments), so the true "time from `docker run -d` returning to first success" is not yet
-    /// bounded by this fix alone; that gap is tracked as a follow-up, cider-ede.26.
+    /// it is bound at <c>start</c>, before the container's VM address is known, and succeed on a single
+    /// attempt fired immediately after <c>docker run -d</c> returns — not merely "never refused", but
+    /// actually carrying the request through. <see cref="Net.TcpPortForwarder"/> holds an accepted
+    /// connection until the guest's own service accepts the dial (bounded, with the dial itself
+    /// retried while held), so one <c>curl --retry 0</c> shot fired right after <c>docker run -d</c>
+    /// returns gets a real response instead of "connection refused" or an empty reply from a
+    /// too-early single-shot dial. cider-ede.18 leaves <c>StartAsync</c> itself blocking on network
+    /// registration before it returns (see task comments), so the true "time from `docker run -d`
+    /// returning to first success" still depends on that registration latency; bounding it is tracked
+    /// as a follow-up, cider-ede.26.
     /// </summary>
     [E2EFact]
     public async Task A_published_port_accepts_immediately_after_start_instead_of_refusing_until_the_backend_is_known()
@@ -112,68 +109,28 @@ public sealed class PortTests(DaemonFixture daemon)
         var name = DaemonFixture.NewName("fast");
         var hostPort = FreeHostPort();
 
+        // Pre-pull so the image layer fetch, which has nothing to do with the claim under test,
+        // cannot be what eats into the single attempt's budget below.
+        await daemon.DockerAsync(["pull", "nginx:alpine"], timeout: TimeSpan.FromMinutes(4));
+
         var run = await daemon.DockerAsync(
             ["run", "-d", "--name", name, "-p", $"{hostPort.ToString(CultureInfo.InvariantCulture)}:80", "nginx:alpine"],
             timeout: TimeSpan.FromMinutes(4));
         Assert.True(run.Ok, run.ToString());
-        var runReturned = DateTimeOffset.UtcNow;
 
         try
         {
-            // The loop bound is generous (it just needs to outlast a cold VM boot on a loaded CI
-            // runner); the actual latency claim is asserted separately, against a tighter budget, so
-            // that claim can fail on its own instead of being restated by the loop bound.
-            var loopDeadline = runReturned + TimeSpan.FromSeconds(60);
-            var successBudget = TimeSpan.FromSeconds(20);
-            CommandResult? curl = null;
-            var succeeded = false;
-            var exitCodes = new List<int>();
+            var curl = await Cmd.RunAsync(
+                "curl",
+                [
+                    "-sS", "--retry", "0", "--max-time", "6",
+                    $"http://127.0.0.1:{hostPort.ToString(CultureInfo.InvariantCulture)}/",
+                ],
+                timeout: TimeSpan.FromSeconds(11));
 
-            while (DateTimeOffset.UtcNow < loopDeadline)
-            {
-                var remaining = loopDeadline - DateTimeOffset.UtcNow;
-                if (remaining <= TimeSpan.Zero)
-                {
-                    break;
-                }
-
-                curl = await Cmd.RunAsync(
-                    "curl",
-                    [
-                        "-sS", "--retry", "0", "--max-time", remaining.TotalSeconds.ToString(CultureInfo.InvariantCulture),
-                        $"http://127.0.0.1:{hostPort.ToString(CultureInfo.InvariantCulture)}/",
-                    ],
-                    timeout: remaining + TimeSpan.FromSeconds(5));
-                exitCodes.Add(curl.ExitCode);
-
-                // The real claim under test: whatever happens on any given attempt, the daemon must
-                // never have refused the connection — that would mean the listener was not bound and
-                // holding by the time `docker run -d` returned, which is the defect cider-ede.18 fixes.
-                // curl exit 7 is "connection refused"; that is what must never happen. curl exit 52
-                // ("empty reply") is expected on early attempts and is NOT a refusal: TcpPortForwarder
-                // dials the backend the instant ResolveAddress fires, so a connection held while the
-                // guest service was not yet listening is dropped, not parked, once the address itself
-                // becomes known.
-                Assert.DoesNotContain("refused", curl.Stderr, StringComparison.OrdinalIgnoreCase);
-                Assert.DoesNotContain("refused", curl.Stdout, StringComparison.OrdinalIgnoreCase);
-
-                if (curl.Ok && curl.Stdout.Length > 0)
-                {
-                    succeeded = true;
-                    break;
-                }
-
-                await Task.Delay(TimeSpan.FromMilliseconds(200));
-            }
-
-            var elapsed = DateTimeOffset.UtcNow - runReturned;
-            Assert.True(
-                succeeded,
-                $"no attempt within {loopDeadline - runReturned} of `docker run -d` returning succeeded (elapsed {elapsed}): {curl}");
-            Assert.DoesNotContain(7, exitCodes);
-            Assert.True(
-                elapsed <= successBudget,
-                $"first successful response took {elapsed}, over the {successBudget} budget (exit codes seen: {string.Join(", ", exitCodes)})");
+            Assert.NotEqual(7, curl.ExitCode);
+            Assert.True(curl.Ok, curl.ToString());
+            Assert.True(curl.Stdout.Length > 0, "the single immediate attempt returned an empty body: " + curl);
         }
         finally
         {

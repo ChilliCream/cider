@@ -183,6 +183,62 @@ public sealed class PortProxyTests
     }
 
     [Fact]
+    public async Task A_forwarder_with_no_target_closes_a_held_connection_once_its_wait_timeout_elapses()
+    {
+        using var forwarder = new TcpPortForwarder(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            null,
+            9,
+            NullLogger<PortProxyManager>.Instance,
+            TimeSpan.FromMilliseconds(500));
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, forwarder.HostEndPoint.Port);
+        var stream = client.GetStream();
+
+        // Never calls ResolveTarget: the held connection must give up and close on its own once the
+        // (short, test-only) wait timeout elapses, rather than hang until the real 30 s default.
+        var probe = new byte[16];
+        var read = await stream.ReadAsync(probe).AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(0, read);
+    }
+
+    [Fact]
+    public async Task A_held_connection_is_relayed_once_a_late_starting_backend_accepts_it()
+    {
+        using var reserved = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        reserved.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        var backendPort = ((IPEndPoint)reserved.LocalEndPoint!).Port;
+        reserved.Dispose();
+
+        using var forwarder = new TcpPortForwarder(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            null,
+            backendPort,
+            NullLogger<PortProxyManager>.Instance,
+            TimeSpan.FromSeconds(5));
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, forwarder.HostEndPoint.Port);
+        var stream = client.GetStream();
+
+        await stream.WriteAsync(Encoding.UTF8.GetBytes("ping\n"));
+
+        // Resolve the address immediately, but nothing listens on backendPort yet: the retry loop
+        // (cider-ede.18) must keep dialing rather than dropping the held connection on the first
+        // connection-refused.
+        forwarder.ResolveTarget(IPAddress.Loopback);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+        await using var server = EchoServer.StartOn(backendPort);
+
+        Assert.Equal("PING\n", await ReadAsync(stream, 5));
+
+        await stream.WriteAsync(Encoding.UTF8.GetBytes("pong\n"));
+        Assert.Equal("PONG\n", await ReadAsync(stream, 5));
+    }
+
+    [Fact]
     public async Task An_unresolved_connection_is_closed_when_the_publication_is_disposed()
     {
         using var proxy = new PortProxyManager(NullLogger<PortProxyManager>.Instance);
@@ -265,10 +321,10 @@ public sealed class PortProxyTests
         private readonly CancellationTokenSource _cts = new();
         private readonly Task _loop;
 
-        private EchoServer(bool untilEof)
+        private EchoServer(bool untilEof, int port)
         {
             _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            _listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            _listener.Bind(new IPEndPoint(IPAddress.Loopback, port));
             _listener.Listen(16);
             Port = ((IPEndPoint)_listener.LocalEndPoint!).Port;
             _loop = Task.Run(() => AcceptAsync(untilEof, _cts.Token));
@@ -276,7 +332,10 @@ public sealed class PortProxyTests
 
         public int Port { get; }
 
-        public static EchoServer Start(bool untilEof = false) => new(untilEof);
+        public static EchoServer Start(bool untilEof = false) => new(untilEof, 0);
+
+        /// <summary>Binds a specific, already-reserved port instead of an OS-picked one.</summary>
+        public static EchoServer StartOn(int port) => new(untilEof: false, port);
 
         private async Task AcceptAsync(bool untilEof, CancellationToken ct)
         {

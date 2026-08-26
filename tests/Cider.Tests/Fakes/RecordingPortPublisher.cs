@@ -113,10 +113,7 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
                     continue;
                 }
 
-                // Cider.Core has no InternalsVisibleTo for this test assembly, so the handle's
-                // internal Resolve cannot be called from here; replace the list entry with a fresh
-                // handle carrying the resolved port instead.
-                live[i] = new PublishedPortHandle(handle.Port with { ContainerIp = containerIp }, null);
+                handle.Resolve(containerIp);
             }
         }
     }
