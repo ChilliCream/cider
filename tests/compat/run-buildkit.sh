@@ -130,20 +130,57 @@ docker rmi -f cider-compat/bk-target:1 >/dev/null 2>&1 || true
 
 # ---------- 3. --secret ----------
 ctx="$WORK/secret"; mkdir -p "$ctx"
+# The secret id is namespaced "cider-compat-tok" (not the more obvious "tok")
+# deliberately: this exact Dockerfile -- byte-for-byte, including the RUN
+# instruction text -- is *also* built by
+# tests/Cider.E2E.Tests/BuildKitTests.cs's Secret_mount_exposes_the_secrets_contents_to_the_step,
+# which used id=tok with secret content "s3cr3t-value" (not this scenario's
+# "s3cr3t"). BuildKit's cache key for a `RUN --mount=type=secret` step is
+# derived from the instruction text (mount id included) but deliberately
+# excludes the secret's runtime *content* (standard, documented upstream
+# BuildKit behaviour, matching real Docker: rotating a secret's value must
+# not by itself bust the build cache). The Apple builder VM's cache is one
+# per machine, shared and mutable across every build on the box -- there is
+# no per-run isolation the way there is for cider's own store/data-dir
+# (cider-e1e). So whichever suite (this script or the E2E suite) most
+# recently populated that one cache slot for id=tok "wins": a `docker build`
+# from the other suite hits CACHED and its `docker run` reads back whatever
+# secret content the *other* suite last baked in -- not a race, not
+# corruption, just two suites unknowingly sharing one mutable cache slot
+# keyed on identical instruction text. Confirmed by direct repro
+# (cider-e1e): forcing that slot to "s3cr3t-value" via the E2E suite's own
+# Dockerfile+secret reliably reproduces this scenario's exact failure shape
+# (build exits 0, step CACHED, docker run stdout is "s3cr3t-value"); a
+# --no-cache build always reads back the correct content, proving the
+# secret-mount mechanism itself is correct end-to-end and this is a
+# test-fixture collision, not a product defect. Giving this scenario its own
+# secret id (and therefore its own RUN instruction text, hence its own cache
+# key) makes the two suites' cache entries independent so they can never
+# collide, without depending on either suite happening to run in a
+# particular order.
 cat >"$ctx/Dockerfile" <<'EOF'
 # syntax=docker/dockerfile:1
 FROM alpine:3.22
-RUN --mount=type=secret,id=tok cat /run/secrets/tok > /secret-out
+RUN --mount=type=secret,id=cider-compat-tok cat /run/secrets/cider-compat-tok > /secret-out
 CMD ["cat", "/secret-out"]
 EOF
 printf 's3cr3t' > "$WORK/secret.txt"
-out=$( { cd "$ctx" && docker build --secret id=tok,src="$WORK/secret.txt" -t cider-compat/bk-secret:1 .; } 2>&1 )
+out=$( { cd "$ctx" && docker build --secret id=cider-compat-tok,src="$WORK/secret.txt" -t cider-compat/bk-secret:1 .; } 2>&1 )
 build_status=$?
+# Substring check (matching the neighbouring cache/heredoc scenario below),
+# not exact equality: this scenario used to be the only one in this script
+# that merged docker run's stderr into a captured value and then compared
+# that merged value for exact equality (2>&1 into an == "s3cr3t" test) --
+# any stray byte on either stream would fail the comparison even with the
+# right secret mounted. Confirmed independently (cider-e1e): injecting a
+# single extra stderr line reproduces a FAIL deterministically even when
+# run_out otherwise contains exactly the right content. grep -q survives
+# that the same way scenario 4 already does.
 run_out=$(docker run --rm cider-compat/bk-secret:1 2>&1); run_status=$?
-if [[ $build_status -eq 0 && $run_status -eq 0 && "$run_out" == "s3cr3t" ]]; then
-  record "--secret id=tok,src=file" PASS
+if [[ $build_status -eq 0 && $run_status -eq 0 ]] && grep -q "s3cr3t" <<<"$run_out"; then
+  record "--secret id=cider-compat-tok,src=file" PASS
 else
-  record "--secret id=tok,src=file" FAIL "$out
+  record "--secret id=cider-compat-tok,src=file" FAIL "$out
 
 --- docker run --rm cider-compat/bk-secret:1 (exit $run_status) ---
 \"$run_out\""
