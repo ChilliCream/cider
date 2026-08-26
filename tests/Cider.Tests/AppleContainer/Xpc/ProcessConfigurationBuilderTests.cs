@@ -14,7 +14,11 @@ namespace Cider.Tests.AppleContainer.Xpc;
 public class ProcessConfigurationBuilderTests
 {
     private static ProcessConfiguration ContainerInitProcess(
-        IReadOnlyList<string>? env = null, string workingDirectory = "/app", User? user = null) => new()
+        IReadOnlyList<string>? env = null,
+        string workingDirectory = "/app",
+        User? user = null,
+        IReadOnlyList<uint>? supplementalGroups = null,
+        IReadOnlyList<Rlimit>? rlimits = null) => new()
         {
             Executable = "/bin/sh",
             Arguments = ["-c", "app"],
@@ -22,8 +26,8 @@ public class ProcessConfigurationBuilderTests
             WorkingDirectory = workingDirectory,
             Terminal = false,
             User = user ?? User.OfId(1000, 1000),
-            SupplementalGroups = [],
-            Rlimits = [],
+            SupplementalGroups = supplementalGroups is null ? [] : [.. supplementalGroups],
+            Rlimits = rlimits is null ? [] : [.. rlimits],
         };
 
     private static ExecSpec PlainSpec(IReadOnlyList<string>? argv = null) => new()
@@ -168,10 +172,45 @@ public class ProcessConfigurationBuilderTests
         Assert.Equal("www-data", config.User.Raw!.UserString);
     }
 
-    // ---- supplementalGroups / rlimits: always empty (ExecSpec has no such fields) -------------------
+    // ---- supplementalGroups: inherited unless --user overrides the identity -----------------------
 
     [Fact]
-    public void Build_supplemental_groups_and_rlimits_are_always_empty()
+    public void Build_inherits_supplemental_groups_when_spec_user_is_unset()
+    {
+        var container = ContainerInitProcess(supplementalGroups: [100u, 200u]);
+
+        var config = ProcessConfigurationBuilder.Build(container, PlainSpec());
+
+        Assert.Equal([100u, 200u], config.SupplementalGroups);
+    }
+
+    [Fact]
+    public void Build_sends_empty_supplemental_groups_when_spec_user_overrides_the_identity()
+    {
+        var container = ContainerInitProcess(supplementalGroups: [100u, 200u]);
+        var spec = new ExecSpec { Argv = ["sh"], User = "1000:1000" };
+
+        var config = ProcessConfigurationBuilder.Build(container, spec);
+
+        Assert.Empty(config.SupplementalGroups);
+    }
+
+    // ---- rlimits: always inherited from the container's init process -------------------------------
+
+    [Fact]
+    public void Build_inherits_rlimits_from_the_container_regardless_of_user_override()
+    {
+        var rlimits = new List<Rlimit> { new() { Limit = "RLIMIT_NOFILE", Soft = 1024, Hard = 4096 } };
+        var container = ContainerInitProcess(rlimits: rlimits);
+        var spec = new ExecSpec { Argv = ["sh"], User = "1000:1000" };
+
+        var config = ProcessConfigurationBuilder.Build(container, spec);
+
+        Assert.Equal(rlimits, config.Rlimits);
+    }
+
+    [Fact]
+    public void Build_with_no_container_rlimits_or_groups_carries_empty_lists()
     {
         var config = ProcessConfigurationBuilder.Build(ContainerInitProcess(), PlainSpec());
 

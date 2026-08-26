@@ -23,10 +23,14 @@ internal static class ProcessConfigurationBuilder
     /// <c>environment = container env + spec.Env (last wins per key)</c>, <c>workingDirectory =
     /// spec.WorkingDir ?? container workdir</c>, <c>terminal = spec.Tty</c>, <c>user</c> from
     /// <c>spec.User</c> (same parser as X5 — <see cref="ContainerConfigurationBuilder.BuildUser"/>)
-    /// else the container's own <see cref="ProcessConfiguration.User"/>, <c>supplementalGroups</c> and
-    /// <c>rlimits</c> both <c>[]</c> — <see cref="ExecSpec"/> has no fields for either, and the wire
-    /// type requires both present (docs/spikes/xpc/02-apiserver-xpc-protocol.md §2.0 rule 11:
-    /// <c>ProcessConfiguration</c> is synthesized Codable, all 8 fields required).
+    /// else the container's own <see cref="ProcessConfiguration.User"/>. <c>rlimits</c> always
+    /// inherits from the container's init process — cider exposes no per-exec ulimit override, so
+    /// there is no case where dropping them is right (task cider-ede.28). <c>supplementalGroups</c>
+    /// inherits too, but only when <c>spec.User</c> is empty: those groups belong to the container's
+    /// own user, and when <c>--user</c> overrides that identity the groups would be wrong for the new
+    /// one — resolving the new user's groups would need <c>/etc/group</c> inside the guest, which
+    /// cider has no way to read here, so that case sends an empty list rather than guessing (also
+    /// cider-ede.28).
     /// </summary>
     public static ProcessConfiguration Build(ProcessConfiguration container, ExecSpec spec)
     {
@@ -46,8 +50,11 @@ internal static class ProcessConfigurationBuilder
             WorkingDirectory = string.IsNullOrEmpty(spec.WorkingDir) ? container.WorkingDirectory : spec.WorkingDir,
             Terminal = spec.Tty,
             User = string.IsNullOrEmpty(spec.User) ? container.User : ContainerConfigurationBuilder.BuildUser(spec.User),
-            SupplementalGroups = [],
-            Rlimits = [],
+            // --user overrides the identity; the container's groups belong to its own user, not the
+            // new one, and cider cannot resolve the new user's groups without /etc/group in the guest
+            // — so an override gets an empty list instead of the (wrong) inherited one.
+            SupplementalGroups = string.IsNullOrEmpty(spec.User) ? [.. container.SupplementalGroups] : [],
+            Rlimits = [.. container.Rlimits],
         };
     }
 
