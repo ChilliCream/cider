@@ -33,6 +33,16 @@ public sealed partial class ContainerManager
         {
             mode = "bridge";
         }
+        else if (string.Equals(mode, "none", StringComparison.Ordinal) && _runtime.IsXpcTransport)
+        {
+            // The XPC transport can express "no attachments" directly (an empty Networks list
+            // becomes ContainerConfigurationBuilder.BuildNetworks' `[]`, i.e. no eth0 in the guest —
+            // shipped by cider-ede.6). The CLI transport cannot: `container create` takes only
+            // `--network <name>` and attaches the default network whenever the flag is omitted, so
+            // there is no way to ask it for zero attachments — that case falls through to the throw
+            // below.
+            return [];
+        }
         else if (string.Equals(mode, "host", StringComparison.Ordinal) ||
                  string.Equals(mode, "none", StringComparison.Ordinal) ||
                  mode.StartsWith("container:", StringComparison.Ordinal))

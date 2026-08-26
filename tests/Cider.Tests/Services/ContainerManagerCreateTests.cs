@@ -208,11 +208,65 @@ public sealed class ContainerManagerCreateTests
 
     [Theory]
     [InlineData("host")]
-    [InlineData("none")]
     [InlineData("container:other")]
     public async Task Unsupported_network_modes_are_400(string mode)
     {
         await using var harness = await ContainerTestHarness.CreateAsync();
+
+        var error = await Assert.ThrowsAsync<DockerApiException>(() =>
+            harness.Containers.CreateAsync(
+                new ContainerCreateRequest { Image = "alpine", HostConfig = new HostConfig { NetworkMode = mode } },
+                null,
+                null,
+                default));
+
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, error.Status);
+        Assert.Equal($"cider: network mode '{mode}' is not supported by Apple container", error.Message);
+    }
+
+    // ---- network_mode: none (cider-ede.35) -------------------------------------------------------
+    // The XPC transport can express "no attachments" (ContainerConfigurationBuilder.BuildNetworks
+    // maps an empty Networks list to `[]`, shipped by cider-ede.6); the CLI transport cannot, since
+    // omitting `--network` attaches the default network rather than none. "host" and "container:*"
+    // stay unsupported on both transports (Unsupported_network_modes_are_400, above).
+
+    [Fact]
+    public async Task Network_mode_none_is_still_a_400_on_the_CLI_transport()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        Assert.False(harness.Runtime.IsXpcTransport);
+
+        var error = await Assert.ThrowsAsync<DockerApiException>(() =>
+            harness.Containers.CreateAsync(
+                new ContainerCreateRequest { Image = "alpine", HostConfig = new HostConfig { NetworkMode = "none" } },
+                null,
+                null,
+                default));
+
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, error.Status);
+        Assert.Equal("cider: network mode 'none' is not supported by Apple container", error.Message);
+    }
+
+    [Fact]
+    public async Task Network_mode_none_succeeds_on_the_XPC_transport_with_no_network_attachments()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        harness.Runtime.IsXpcTransport = true;
+
+        var record = await harness.CreateAsync("alpine", "web", request =>
+            request.HostConfig = new HostConfig { NetworkMode = "none" });
+
+        Assert.Empty(record.Networks);
+        Assert.Empty(harness.Runtime.GetSpec("web")!.Networks);
+    }
+
+    [Theory]
+    [InlineData("host")]
+    [InlineData("container:other")]
+    public async Task Host_and_container_network_modes_are_still_400_on_the_XPC_transport(string mode)
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        harness.Runtime.IsXpcTransport = true;
 
         var error = await Assert.ThrowsAsync<DockerApiException>(() =>
             harness.Containers.CreateAsync(

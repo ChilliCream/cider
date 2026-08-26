@@ -231,7 +231,15 @@ public class XpcContainerRuntimeE2ETests
             {
                 RuntimeId = name,
                 Image = Image,
-                Args = ["sleep", "300"],
+                // Entrypoint must be set: XpcContainerRuntime.CreateContainerAsync treats a null/empty
+                // Entrypoint as "caller wants the image's own entrypoint/cmd resolved", which only the
+                // CLI can do, and falls back to AppleContainerRuntime — silently exercising the CLI's
+                // own "no --network flag" default-attach behaviour instead of the XPC transport's
+                // ContainerConfigurationBuilder this test means to exercise (found while verifying
+                // cider-ede.35: without this, the assertions below fail against a real daemon even
+                // though the XPC path itself is correct).
+                Entrypoint = "sleep",
+                Args = ["300"],
                 Networks = [],
             },
             ct);
