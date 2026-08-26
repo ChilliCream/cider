@@ -91,11 +91,14 @@ CMD ["cat", "/hello"]
 EOF
 out=$( { cd "$ctx" && docker build -t cider-compat/bk-basic:1 .; } 2>&1 )
 build_status=$?
-if [[ $build_status -eq 0 ]] &&
-   [[ "$(docker run --rm cider-compat/bk-basic:1)" == "hello" ]]; then
+run_out=$(docker run --rm cider-compat/bk-basic:1 2>&1); run_status=$?
+if [[ $build_status -eq 0 && $run_status -eq 0 && "$run_out" == "hello" ]]; then
   record "basic build, tag, run" PASS
 else
-  record "basic build, tag, run" FAIL "$out"
+  record "basic build, tag, run" FAIL "$out
+
+--- docker run --rm cider-compat/bk-basic:1 (exit $run_status) ---
+\"$run_out\""
 fi
 docker rmi -f cider-compat/bk-basic:1 >/dev/null 2>&1 || true
 
@@ -114,11 +117,14 @@ CMD ["cat", "/greeting"]
 EOF
 out=$( { cd "$ctx" && docker build --build-arg GREETING=hi-target --target final -t cider-compat/bk-target:1 .; } 2>&1 )
 build_status=$?
-if [[ $build_status -eq 0 ]] &&
-   [[ "$(docker run --rm cider-compat/bk-target:1)" == "hi-target" ]]; then
+run_out=$(docker run --rm cider-compat/bk-target:1 2>&1); run_status=$?
+if [[ $build_status -eq 0 && $run_status -eq 0 && "$run_out" == "hi-target" ]]; then
   record "--build-arg + --target (multi-stage)" PASS
 else
-  record "--build-arg + --target (multi-stage)" FAIL "$out"
+  record "--build-arg + --target (multi-stage)" FAIL "$out
+
+--- docker run --rm cider-compat/bk-target:1 (exit $run_status) ---
+\"$run_out\""
 fi
 docker rmi -f cider-compat/bk-target:1 >/dev/null 2>&1 || true
 
@@ -133,11 +139,14 @@ EOF
 printf 's3cr3t' > "$WORK/secret.txt"
 out=$( { cd "$ctx" && docker build --secret id=tok,src="$WORK/secret.txt" -t cider-compat/bk-secret:1 .; } 2>&1 )
 build_status=$?
-if [[ $build_status -eq 0 ]] &&
-   [[ "$(docker run --rm cider-compat/bk-secret:1)" == "s3cr3t" ]]; then
+run_out=$(docker run --rm cider-compat/bk-secret:1 2>&1); run_status=$?
+if [[ $build_status -eq 0 && $run_status -eq 0 && "$run_out" == "s3cr3t" ]]; then
   record "--secret id=tok,src=file" PASS
 else
-  record "--secret id=tok,src=file" FAIL "$out"
+  record "--secret id=tok,src=file" FAIL "$out
+
+--- docker run --rm cider-compat/bk-secret:1 (exit $run_status) ---
+\"$run_out\""
 fi
 docker rmi -f cider-compat/bk-secret:1 >/dev/null 2>&1 || true
 
