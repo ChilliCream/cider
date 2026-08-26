@@ -551,6 +551,20 @@ public sealed partial class AppleContainerRuntime
             ContainerCli.ThrowIfFailed(result, $"image tag {sourceReference}");
         });
 
+    /// <summary>
+    /// cider-ede.37 leg 2 test-only seam: when <c>CIDER_TEST_SKIP_BLOB_SWEEP_GATE=1</c> is set in this
+    /// process's environment, <see cref="RemoveImageAsync"/> skips <see
+    /// cref="BlobSweepGate.EnterSweepAsync"/> entirely, restoring the exact pre-cider-ede.31 window
+    /// (an unguarded, store-wide <c>container image delete</c> sweep racing this runtime's own
+    /// concurrent pulls/loads/builds). Read once, statically — never re-checked per call — so a test
+    /// fixture must set the variable before this type is first used. Defaults off (unset); production
+    /// code paths never set this variable. Exists solely so an E2E negative control can demonstrate the
+    /// corruption the gate exists to prevent still reproduces without it, before trusting a race that
+    /// stays green with the gate in place. See <c>ImageStoreRaceTests</c>.
+    /// </summary>
+    private static readonly bool SkipBlobSweepGateForTest = string.Equals(
+        Environment.GetEnvironmentVariable("CIDER_TEST_SKIP_BLOB_SWEEP_GATE"), "1", StringComparison.Ordinal);
+
     public Task RemoveImageAsync(string reference, bool force, CancellationToken ct) => GuardAsync(async () =>
     {
         ArgumentException.ThrowIfNullOrEmpty(reference);
@@ -567,28 +581,40 @@ public sealed partial class AppleContainerRuntime
         // log Information once the delete/sweep itself starts running, naming the reference, so "stuck
         // waiting on the gate" and "the subprocess itself is slow" are distinguishable from the log.
         var gateWait = Stopwatch.StartNew();
-        await using var sweep = await _blobSweepGate.EnterSweepAsync(ct).ConfigureAwait(false);
-        gateWait.Stop();
-        if (gateWait.Elapsed > TimeSpan.FromMilliseconds(5))
+        IAsyncDisposable? sweep = SkipBlobSweepGateForTest
+            ? null
+            : await _blobSweepGate.EnterSweepAsync(ct).ConfigureAwait(false);
+        try
         {
-            _logger.LogDebug(
-                "image delete {Reference}: waited {ElapsedMs}ms for in-flight image write(s) to finish before sweeping",
-                reference, gateWait.ElapsedMilliseconds);
+            gateWait.Stop();
+            if (gateWait.Elapsed > TimeSpan.FromMilliseconds(5))
+            {
+                _logger.LogDebug(
+                    "image delete {Reference}: waited {ElapsedMs}ms for in-flight image write(s) to finish before sweeping",
+                    reference, gateWait.ElapsedMilliseconds);
+            }
+
+            _logger.LogInformation("image delete {Reference}: running (sweeps the whole content store)", reference);
+
+            var args = new List<string> { "image", "delete" };
+            if (force)
+            {
+                // Apple's -f means "ignore images that are not found", not Docker's "remove anyway".
+                args.Add("-f");
+            }
+
+            args.Add(reference);
+
+            var result = await _cli.RunAsync(args, ct);
+            ContainerCli.ThrowIfFailed(result, $"image delete {reference}");
         }
-
-        _logger.LogInformation("image delete {Reference}: running (sweeps the whole content store)", reference);
-
-        var args = new List<string> { "image", "delete" };
-        if (force)
+        finally
         {
-            // Apple's -f means "ignore images that are not found", not Docker's "remove anyway".
-            args.Add("-f");
+            if (sweep is not null)
+            {
+                await sweep.DisposeAsync().ConfigureAwait(false);
+            }
         }
-
-        args.Add(reference);
-
-        var result = await _cli.RunAsync(args, ct);
-        ContainerCli.ThrowIfFailed(result, $"image delete {reference}");
     });
 
     public Task SaveImagesAsync(IReadOnlyList<string> references, Stream tarOutput, CancellationToken ct) =>

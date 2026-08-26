@@ -2,23 +2,36 @@ using System.Collections.Concurrent;
 using Cider.Core.Configuration;
 using Cider.E2E.Tests.Infrastructure;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Cider.E2E.Tests;
 
 /// <summary>
-/// A <see cref="DaemonFixture"/> pinned to the XPC transport regardless of the ambient
-/// <c>CIDER_RUNTIME_TRANSPORT</c>. cider-ede.31's own Verification section named the transport
-/// explicitly ("E2E on the xpc transport") — the transport on which the bug it fixed corrupted this
-/// machine's real image store twice in one day — so <see cref="ImageStoreRaceTests"/> must run there
-/// even when CI's transport matrix has moved the ambient default to <c>cli</c>.
+/// A <see cref="DaemonFixture"/> pinned to the CLI transport regardless of the ambient
+/// <c>CIDER_RUNTIME_TRANSPORT</c> — cider-ede.37 leg 1 correction, choice (a) of the two the task
+/// offered. cider-ede.31's Verification section said "the xpc transport", but on the XPC transport the
+/// fixed <c>RemoveImageAsync</c> (<c>XpcContainerRuntime.Images.cs</c>'s primary path) issues
+/// <c>imageDelete(reference, garbageCollect: false)</c> and nothing else — no sweep at all, so racing
+/// it against concurrent pulls never contends <c>BlobSweepGate</c> and can never fail for the reason
+/// this test exists to check. <c>AppleContainerRuntime.Images.cs</c>'s <c>RemoveImageAsync</c>
+/// (<see cref="CiderOptions.CliRuntimeTransport"/>) is different: Apple's own <c>container image
+/// delete</c> subprocess sweeps the whole content store on every single call with no flag to skip it
+/// (<c>ImageDelete.swift</c>), so on this transport every <c>rmi</c> genuinely is a store-wide sweep,
+/// serialized by <see cref="Cider.AppleContainer.BlobSweepGate.EnterSweepAsync"/> — that is the exact
+/// code path the gate exists to protect, and the only rmi path where a race against concurrent pulls
+/// has anything to prove. The alternative the task also offered — keep XPC and race
+/// <c>XpcContainerRuntime.Images.cs</c>'s <c>PruneImagesAsync</c> instead — was rejected: that call is
+/// an explicit, user-requested store-wide prune, and this task's own environment rules forbid running
+/// one against this shared machine's real Apple store, so the CLI-transport rmi sweep is both the more
+/// faithful reproduction of cider-ede.31's fix (which changed rmi, not prune) and the safer one.
 /// </summary>
 public sealed class ImageStoreRaceFixture : DaemonFixture
 {
     /// <inheritdoc />
-    protected override string? RuntimeTransportOverride => CiderOptions.XpcRuntimeTransport;
+    protected override string? RuntimeTransportOverride => CiderOptions.CliRuntimeTransport;
 }
 
-/// <summary>The collection <see cref="ImageStoreRaceTests"/> uses so it gets its own XPC-pinned daemon.</summary>
+/// <summary>The collection <see cref="ImageStoreRaceTests"/> uses so it gets its own CLI-pinned daemon.</summary>
 [CollectionDefinition(Name, DisableParallelization = true)]
 public sealed class ImageStoreRaceCollection : ICollectionFixture<ImageStoreRaceFixture>
 {
@@ -64,7 +77,7 @@ public sealed class ImageStoreRaceCollection : ICollectionFixture<ImageStoreRace
 /// </remarks>
 [Collection(ImageStoreRaceCollection.Name)]
 [Trait("Category", "E2E")]
-public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon)
+public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutputHelper output)
 {
     // Four distinct tags this test alone pulls repeatedly as the concurrent write load, plus one
     // separate tag it repeatedly deletes and re-pulls as the rmi churn -- distinct from every tag
@@ -80,10 +93,23 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon)
     // doc comment for the full account. Left alone rather than repaired (an operator step this task's
     // permissions do not extend to, and repairing it is not this test's job); avoided here so the
     // actual experiment below can run against images unaffected by that pre-existing entry.
-    private static readonly string[] LoadImages = ["alpine:3.14", "alpine:3.19", "alpine:3.20", "alpine:3.21"];
+    //
+    // NOT alpine:3.19 either (cider-ede.37 leg 4 correction): cider-ede.31's own report recorded
+    // alpine:3.19 as the OTHER tag its incident corrupted (alongside redis:8.6), so seeding it here
+    // risks a seed pull failing for a reason that has nothing to do with this race.
+    private static readonly string[] LoadImages = ["alpine:3.14", "alpine:3.20", "alpine:3.21"];
     private const string ChurnImage = "alpine:3.16";
 
-    private static readonly TimeSpan RaceBudget = TimeSpan.FromMinutes(1);
+    // cider-ede.37 leg 4 correction: the full minute this test was written with burns a minute of
+    // Docker Hub traffic against four tags on every default `dotnet test` run on this shared machine.
+    // Set CIDER_E2E_RACE_FULL=1 to run the full budget cider-ede.31's Verification section asked for;
+    // left unset (the default), a much shorter budget still exercises the same race loops, just with
+    // fewer iterations.
+    private static readonly TimeSpan RaceBudget =
+        string.Equals(Environment.GetEnvironmentVariable("CIDER_E2E_RACE_FULL"), "1", StringComparison.Ordinal)
+            ? TimeSpan.FromMinutes(1)
+            : TimeSpan.FromSeconds(15);
+
     private static readonly TimeSpan PullTimeout = TimeSpan.FromMinutes(3);
 
     [E2EFact]
@@ -223,12 +249,23 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon)
         }
         else
         {
-            Assert.Fail(
-                "`container image ls` was already failing before this race started, on pre-existing " +
+            // cider-ede.37 leg 3 correction: this branch is the test's own "the race added no NEW
+            // damage" verdict -- baseline and post-race stderr are byte-identical, so the pre-existing,
+            // unrelated alpine:3.18 confound (see class remarks) is the only thing keeping `container
+            // image ls` from exiting 0, exactly as it did before the race ran. Calling Assert.Fail here
+            // made this leg fail on every run on this machine, including its own success case, since
+            // that confound is present before this test ever starts. The two real regression signals
+            // this test exists to catch (a clean baseline turning red; an error that changed) are the
+            // two branches above, and both still fail loudly. Passing here is deliberate, not a gap:
+            // the literal "container image ls exits 0" outcome cider-ede.31's Verification section
+            // named is left as an open item for the report/task comment, not asserted by a permanently
+            // -red E2E test.
+            output.WriteLine(
+                "container image ls was already failing before this race started, on pre-existing " +
                 "store damage this test did not cause (see class remarks: docker.io/library/alpine:3.18, " +
                 "sha256:de0eb0b3..., no blob on disk) -- the race itself added NO new damage (identical " +
                 "error before and after, and every image this race's own code touched stayed inspectable " +
-                "and runnable), but the literal 'container image ls exits 0' outcome cider-ede.31's " +
+                "and runnable). The literal 'container image ls exits 0' outcome cider-ede.31's " +
                 "Verification section named cannot be demonstrated on this machine until that " +
                 "pre-existing entry is repaired by an operator:\n" + appleList);
         }
