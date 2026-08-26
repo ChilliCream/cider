@@ -766,6 +766,7 @@ public sealed class ImageManager
         var containers = await _runtime.ListContainersAsync(ct).ConfigureAwait(false);
 
         var deleted = new List<ImageDeleteResponseItem>();
+        var deletedIndexDigests = new List<string>();
         long space = 0;
         foreach (var image in images)
         {
@@ -844,6 +845,7 @@ public sealed class ImageManager
             }
 
             deleted.Add(new ImageDeleteResponseItem { Deleted = image.Id });
+            deletedIndexDigests.AddRange(image.IndexDigests);
             space += image.Size;
             _events.Publish(DockerEvents.Image("delete", image.Id, image.Id));
         }
@@ -859,8 +861,10 @@ public sealed class ImageManager
         // per image. Unconditional on `deleted.Count` (cider-ede.31 correction): a prune that found
         // nothing dangling to delete had still already left orphaned blobs from an earlier plain `rmi`
         // permanently unreclaimable, since PruneImagesAsync is the only reclaim path in the codebase —
-        // a no-op prune must still sweep.
-        await _runtime.PruneImagesAsync(ct).ConfigureAwait(false);
+        // a no-op prune must still sweep. `deletedIndexDigests` (cider-ehn) is this call's own deleted
+        // images, for a transport whose whole-store sweep fails to scope a fallback reclaim to exactly
+        // the blobs this call may have just orphaned — empty, and inert, when nothing was deleted above.
+        await _runtime.PruneImagesAsync(deletedIndexDigests, ct).ConfigureAwait(false);
 
         return new ImagePruneResponse { ImagesDeleted = deleted, SpaceReclaimed = space };
     }

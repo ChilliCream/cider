@@ -92,7 +92,17 @@ public interface IContainerRuntime
     /// <c>ImageDelete.swift</c> sweeps inside that same one-shot invocation; there is no flag to skip
     /// it), so there is nothing left for this call to additionally do there.
     /// </summary>
-    Task PruneImagesAsync(CancellationToken ct) => Task.CompletedTask;
+    /// <param name="deletedImageDigests">
+    /// The <c>RuntimeImage.IndexDigests</c> of every image <c>PruneAsync</c> just finished deleting in
+    /// this same call, if any (cider-ehn) — the seam a transport that has no whole-store enumeration
+    /// route at all needs to scope a fallback, narrower reclaim to exactly the blobs this call itself
+    /// may have just orphaned, when the store-wide sweep above fails on unrelated corruption elsewhere.
+    /// Empty on a prune that deleted nothing, and on every transport (the CLI transport, test fakes)
+    /// that has no such fallback to run — a default no-op ignores it, matching the empty-list caller
+    /// shape unchanged.
+    /// </param>
+    /// <param name="ct"></param>
+    Task PruneImagesAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct) => Task.CompletedTask;
 
     Task SaveImagesAsync(IReadOnlyList<string> references, Stream tarOutput, CancellationToken ct);
 

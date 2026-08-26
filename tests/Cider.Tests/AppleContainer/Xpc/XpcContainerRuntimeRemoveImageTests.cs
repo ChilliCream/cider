@@ -43,7 +43,7 @@ public sealed class XpcContainerRuntimeRemoveImageTests
         var runtime = NewRuntime(fake);
         using var _ = runtime;
 
-        await runtime.PruneImagesAsync(CancellationToken.None);
+        await runtime.PruneImagesAsync([], CancellationToken.None);
 
         Assert.Single(fake.Calls, c => c == "ImageCleanupOrphanedBlobsAsync");
         Assert.DoesNotContain(fake.Calls, c => c.StartsWith("ImageDeleteAsync:", StringComparison.Ordinal));
@@ -74,7 +74,7 @@ public sealed class XpcContainerRuntimeRemoveImageTests
         // committed its index entry would present to a sweep that started a moment later.
         await fake.WaitUntilPullBlockedAsync();
 
-        var sweepTask = runtime.PruneImagesAsync(CancellationToken.None);
+        var sweepTask = runtime.PruneImagesAsync([], CancellationToken.None);
 
         // The sweep must not be able to complete while the pull is still held — give it a beat to
         // (wrongly) race ahead before releasing the pull, the way the pre-fix code would have let it.
@@ -104,7 +104,7 @@ public sealed class XpcContainerRuntimeRemoveImageTests
 
         fake.ArmSweepGate();
 
-        var sweepTask = runtime.PruneImagesAsync(CancellationToken.None);
+        var sweepTask = runtime.PruneImagesAsync([], CancellationToken.None);
         await fake.WaitUntilSweepBlockedAsync();
 
         var progress = new Progress<ProgressEvent>();
@@ -151,7 +151,7 @@ public sealed class XpcContainerRuntimeRemoveImageTests
         // committed its index entry would present to a sweep that started a moment later.
         await cliFallback.WaitUntilBuildBlockedAsync();
 
-        var sweepTask = runtime.PruneImagesAsync(CancellationToken.None);
+        var sweepTask = runtime.PruneImagesAsync([], CancellationToken.None);
 
         // The sweep must not be able to complete while the build is still held — give it a beat to
         // (wrongly) race ahead before releasing the build, the way the pre-fix code would have let it
@@ -183,7 +183,7 @@ public sealed class XpcContainerRuntimeRemoveImageTests
 
         fake.ArmSweepGate();
 
-        var sweepTask = runtime.PruneImagesAsync(CancellationToken.None);
+        var sweepTask = runtime.PruneImagesAsync([], CancellationToken.None);
         await fake.WaitUntilSweepBlockedAsync();
 
         var progress = new Progress<ProgressEvent>();
@@ -225,7 +225,7 @@ public sealed class XpcContainerRuntimeRemoveImageTests
 
         // Must not throw: the store-wide sweep failing over unrelated store corruption is not the
         // caller's failure to report.
-        await runtime.PruneImagesAsync(CancellationToken.None);
+        await runtime.PruneImagesAsync([], CancellationToken.None);
 
         var warnings = logger.Entries.Where(e => e.Level == LogLevel.Warning).ToList();
         var warning = Assert.Single(warnings);
@@ -243,7 +243,7 @@ public sealed class XpcContainerRuntimeRemoveImageTests
         var runtime = NewRuntime(fake, new FakeContainerRuntime(), NullLogger<XpcContainerRuntime>.Instance);
         using var _ = runtime;
 
-        await Assert.ThrowsAsync<RuntimeException>(() => runtime.PruneImagesAsync(CancellationToken.None));
+        await Assert.ThrowsAsync<RuntimeException>(() => runtime.PruneImagesAsync([], CancellationToken.None));
     }
 
     private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient) =>

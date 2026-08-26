@@ -11,7 +11,9 @@ namespace Cider.AppleContainer.Xpc;
 /// <c>imageUnpack</c>); cider-ede.10 extends it with the rest of the images service —
 /// <c>imagePull</c>/<c>imagePush</c>/<c>imageTag</c>/<c>imageDelete</c>/<c>imageSave</c>/
 /// <c>imageLoad</c>/<c>imageCleanupOrphanedBlobs</c> — plus the content-store's <c>contentGet</c>
-/// (task's file-scope note: "extends the X5 stub with all routes").
+/// (task's file-scope note: "extends the X5 stub with all routes"). cider-ehn adds the content-store's
+/// <c>contentDelete</c> — the scoped counterpart to <c>imageCleanupOrphanedBlobs</c>'s whole-store
+/// sweep, not wired until then despite <c>contentGet</c> already being here.
 /// </summary>
 /// <remarks>
 /// Not <c>sealed</c>, and <see cref="ImageListAsync"/>/<see cref="ContentGetAsync"/> are <c>virtual</c>
@@ -239,5 +241,30 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// <c>contentDelete{digests}</c> → <c>digests</c> (data, the ones actually deleted) +
+    /// <c>imageSize</c> (uint64, bytes reclaimed) — §6's content-store table. Unlike
+    /// <see cref="ImageCleanupOrphanedBlobsAsync"/>'s whole-store sweep, this takes an explicit digest
+    /// list — cider-ehn's scoped reclaim (<see cref="XpcContainerRuntime.PruneImagesAsync"/>'s
+    /// fallback) is the one caller, and it is the one responsible for having already proven every
+    /// digest it passes here is unreferenced (see that method's own doc comment for the safety rule):
+    /// this route trusts the list it is given and does not itself re-derive "orphaned". The reply's
+    /// own digests/size are returned, not discarded, so the fallback can log what it actually
+    /// reclaimed rather than assuming the whole request list was honored. <c>virtual</c> for the same
+    /// fake-images-client test seam as <see cref="ImageDeleteAsync"/>/
+    /// <see cref="ImageCleanupOrphanedBlobsAsync"/>.
+    /// </summary>
+    public virtual async Task<(IReadOnlyList<string> Digests, ulong ImageSize)> ContentDeleteAsync(IReadOnlyList<string> digests, CancellationToken ct)
+    {
+        using var request = new XpcMessage("contentDelete");
+        request.SetData("digests", XpcJson.SerializeToUtf8Bytes(digests.ToList()));
+        using var reply = await images.SendAsync(request, XpcCallOptions.Default, ct).ConfigureAwait(false);
+
+        var digestsBytes = reply.GetData("digests");
+        var deleted = digestsBytes is null ? (IReadOnlyList<string>)[] : XpcJson.Deserialize<List<string>>(digestsBytes);
+        var imageSize = reply.GetUInt64("imageSize");
+        return (deleted, imageSize);
     }
 }

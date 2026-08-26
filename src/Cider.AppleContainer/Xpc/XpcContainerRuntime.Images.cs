@@ -739,8 +739,17 @@ internal sealed partial class XpcContainerRuntime
     /// Information what it reclaimed (fix direction §4: "so the next occurrence is attributable rather
     /// than mysterious") — <c>Debug</c> when it reclaimed nothing, so a routine prune of an
     /// already-clean store does not spam the log.
+    ///
+    /// cider-ehn: when the sweep fails on a pre-existing dangling content reference elsewhere in the
+    /// store (the cider-bci catch below), it is tried first because it is cheaper and
+    /// Apple-authoritative, but it is all-or-nothing — that one unrelated corruption means *nothing*
+    /// gets reclaimed, including blobs <paramref name="deletedImageDigests"/> itself just orphaned a
+    /// moment ago. <see cref="TryScopedReclaimAsync"/> is the fallback for exactly that case: a scoped,
+    /// client-side <c>contentDelete</c> of only those blobs, run under this same
+    /// <see cref="_blobSweepGate"/> scope (fix direction §4) and never inferring "orphaned" from an
+    /// absence (see that method's own doc comment for the binding safety rule).
     /// </summary>
-    public Task PruneImagesAsync(CancellationToken ct) => GuardAsync(async () =>
+    public Task PruneImagesAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct) => GuardAsync(async () =>
     {
         await using var sweep = await _blobSweepGate.EnterSweepAsync(ct).ConfigureAwait(false);
 
@@ -750,7 +759,7 @@ internal sealed partial class XpcContainerRuntime
             if (digests.Count > 0)
             {
                 _logger.LogInformation(
-                    "image prune: reclaimed {Count} orphaned blob(s), {Size} byte(s)", digests.Count, imageSize);
+                    "image prune: reclaimed {Count} orphaned blob(s), {Size} byte(s) via the whole-store sweep", digests.Count, imageSize);
             }
             else
             {
@@ -781,12 +790,166 @@ internal sealed partial class XpcContainerRuntime
             // operator-facing remedy text, and let the prune otherwise report success.
             var digest = CliErrorMapper.ExtractDanglingDigest(ex.Message) ?? ex.Message;
             _logger.LogWarning("{Message}", CliErrorMapper.DanglingContentRemedy(digest));
+
+            // cider-ehn fallback: try to reclaim exactly the blobs this call's own deletions just
+            // orphaned, even though the whole-store sweep above could not run at all.
+            await TryScopedReclaimAsync(deletedImageDigests, ct).ConfigureAwait(false);
         }
         catch (XpcException ex)
         {
             throw ex.ToRuntimeException("image prune");
         }
     });
+
+    /// <summary>
+    /// cider-ehn's scoped fallback, entered only when <see cref="PruneImagesAsync"/>'s whole-store
+    /// sweep failed on a pre-existing dangling content reference elsewhere in the store.
+    /// <paramref name="deletedImageDigests"/> are the raw index digests (<c>RuntimeImage.IndexDigests</c>)
+    /// of the images <c>ImageManager.PruneAsync</c> just finished deleting via <c>imageDelete</c> in
+    /// this same call — <c>garbageCollect: false</c> (<see cref="RemoveImageAsync"/>'s own doc comment)
+    /// leaves every blob those images' manifests named still resolvable via <c>contentGet</c>, only the
+    /// index *reference* itself is gone, so <see cref="CollectManifestDigestsAsync"/> can still walk
+    /// them here exactly as <see cref="LoadBlobsAsync"/> would for a live listing (same
+    /// <see cref="GetBlobAsync{T}"/> primitive — no second content-read path).
+    ///
+    /// <para>
+    /// <b>THE SAFETY RULE — binding, planner-ruled (task cider-ehn's own description).</b> Deleting a
+    /// blob by digest is irreversible, and the only valid proof that one is safe to delete is a
+    /// positive one: every image the store still lists was enumerated, its manifest was actually read,
+    /// and none of them names that digest. An absence of evidence — a remaining image this method
+    /// could not enumerate, or one whose index or manifest failed to resolve — is never allowed to
+    /// stand in for that proof. So: if listing the store's current images fails, or if any *remaining*
+    /// image's index or manifest cannot be resolved, this method deletes nothing at all — not even the
+    /// candidate digests it could otherwise fully account for — and makes zero
+    /// <see cref="ImagesServiceClient.ContentDeleteAsync"/> calls. This is strictly more conservative
+    /// on a corrupted store, not a limitation to work around: the corrupted-store case this whole task
+    /// exists to survive is exactly the case where a remaining image's manifest is unreadable, and that
+    /// unreadable entry is precisely the one that might reference the blobs a reclaim would otherwise
+    /// target. Do not weaken this to "prove non-reference only against readable entries" — that
+    /// narrower rule was explicitly considered and rejected: it would delete blobs belonging to the
+    /// very image whose entry is dangling.
+    /// </para>
+    /// <para>
+    /// Any other unexpected failure while gathering that proof (the images service going away
+    /// mid-walk, an XPC error unrelated to a single missing blob) is treated the same way — caught,
+    /// logged, and answered with zero deletions — rather than turning this best-effort fallback into a
+    /// second way for <c>docker image prune</c> to 500.
+    /// </para>
+    /// </summary>
+    private async Task TryScopedReclaimAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct)
+    {
+        if (deletedImageDigests.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var candidates = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var digest in deletedImageDigests)
+            {
+                // Best-effort: a deleted image's own index/manifest failing to resolve just means it
+                // contributes no candidates (a smaller, still-safe set) — this is not the
+                // safety-critical half of this method; the walk over *remaining* images below is.
+                await CollectManifestDigestsAsync(digest, candidates, ct).ConfigureAwait(false);
+            }
+
+            if (candidates.Count == 0)
+            {
+                _logger.LogDebug("image prune (scoped fallback): no blob digests recovered from the deleted image(s); nothing to reclaim");
+                return;
+            }
+
+            var remaining = await _imagesClient.ImageListAsync(ct).ConfigureAwait(false);
+            var keep = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var group in GroupByDigest(remaining))
+            {
+                var digest = group[0].Descriptor.Digest;
+                if (!await CollectManifestDigestsAsync(digest, keep, ct).ConfigureAwait(false))
+                {
+                    // Safety rule: one remaining image whose index/manifest cannot be read means
+                    // non-reference cannot be proven for *any* candidate, not just the ones that
+                    // particular manifest might have named. Delete nothing.
+                    _logger.LogWarning(
+                        "image prune (scoped fallback): a remaining image's manifest could not be read, so " +
+                        "non-reference cannot be proven for any candidate blob; deleting nothing (this is the " +
+                        "intended, more conservative behaviour on a store with an unresolvable reference, not a bug)");
+                    return;
+                }
+            }
+
+            candidates.ExceptWith(keep);
+            if (candidates.Count == 0)
+            {
+                _logger.LogDebug("image prune (scoped fallback): every candidate blob is still referenced by a remaining image; nothing to reclaim");
+                return;
+            }
+
+            var (reclaimedDigests, imageSize) = await _imagesClient.ContentDeleteAsync([.. candidates], ct).ConfigureAwait(false);
+            _logger.LogInformation(
+                "image prune (scoped fallback): reclaimed {Count} orphaned blob(s), {Size} byte(s) after the whole-store sweep failed",
+                reclaimedDigests.Count, imageSize);
+        }
+        catch (XpcException ex)
+        {
+            _logger.LogWarning(ex, "image prune (scoped fallback): could not complete the scoped reclaim; deleting nothing");
+        }
+    }
+
+    /// <summary>
+    /// Walks one image's index → real-platform manifests (§6, the same <c>contentGet</c> + local file
+    /// read <see cref="LoadBlobsAsync"/> uses), harvesting every manifest's <c>config.digest</c> and
+    /// <c>layers[].digest</c> into <paramref name="into"/> — no need to also fetch the config blob
+    /// itself, since cider-ehn's fix direction only reclaims "the config and layer digests reachable
+    /// from the manifests", both of which are named directly in the manifest already in hand.
+    /// Returns <c>false</c> the instant the index, or any real-platform manifest, fails to resolve —
+    /// <see cref="TryScopedReclaimAsync"/> treats that as fatal to the *whole* reclaim when walking a
+    /// remaining image (the safety rule its own doc comment states), and as "this one image
+    /// contributes nothing" when walking a deleted image.
+    /// </summary>
+    private async Task<bool> CollectManifestDigestsAsync(string? digest, HashSet<string> into, CancellationToken ct)
+    {
+        var index = await GetBlobAsync<OciIndex>(digest, ct).ConfigureAwait(false);
+        if (index is null)
+        {
+            return false;
+        }
+
+        var complete = true;
+        foreach (var variant in RealVariants(index))
+        {
+            if (variant.Digest is not { Length: > 0 } variantDigest)
+            {
+                complete = false;
+                continue;
+            }
+
+            var manifest = await GetBlobAsync<AppleOciManifest>(variantDigest, ct).ConfigureAwait(false);
+            if (manifest is null)
+            {
+                complete = false;
+                continue;
+            }
+
+            if (manifest.Config?.Digest is { Length: > 0 } configDigest)
+            {
+                into.Add(configDigest);
+            }
+
+            if (manifest.Layers is { Count: > 0 } layers)
+            {
+                foreach (var layer in layers)
+                {
+                    if (layer.Digest is { Length: > 0 } layerDigest)
+                    {
+                        into.Add(layerDigest);
+                    }
+                }
+            }
+        }
+
+        return complete;
+    }
 
     /// <summary>
     /// <c>imageList</c> to resolve each reference to its <see cref="ImageDescription"/>, then

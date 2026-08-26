@@ -855,7 +855,7 @@ public sealed class ImageManagerTests : IDisposable
         // cider-ede.31: the store-wide sweep runs from PruneAsync itself now, exactly once, never
         // from RemoveImageAsync's own per-image delete (which is what let a sweep race a concurrent
         // pull/load on every single `rmi` before this fix).
-        Assert.Single(runtime.Calls, c => c == "PruneImagesAsync");
+        Assert.Single(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -870,7 +870,7 @@ public sealed class ImageManagerTests : IDisposable
         await manager.RemoveAsync("alpine:latest", force: false, noPrune: false, CancellationToken.None);
 
         Assert.Contains(runtime.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
-        Assert.DoesNotContain(runtime.Calls, c => c == "PruneImagesAsync");
+        Assert.DoesNotContain(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -887,7 +887,37 @@ public sealed class ImageManagerTests : IDisposable
         var response = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
 
         Assert.Empty(response.ImagesDeleted);
-        Assert.Single(runtime.Calls, c => c == "PruneImagesAsync");
+        Assert.Single(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// cider-ehn: the XPC transport's fallback scoped reclaim needs to know exactly which images this
+    /// prune call itself just deleted, to scope a reclaim to only their blobs when the whole-store
+    /// sweep fails. <see cref="ImageManager"/> is transport-agnostic and has no candidate-digest logic
+    /// of its own — it only has to forward what it already knows (<c>RuntimeImage.IndexDigests</c>) to
+    /// the runtime seam member that does.
+    /// </summary>
+    [Fact]
+    public async Task PruneAsync_ForwardsTheDeletedImagesIndexDigestsToPruneImagesAsync()
+    {
+        var (manager, runtime) = CreateManager();
+        var indexDigest = "sha256:" + new string('e', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = "sha256:" + new string('c', 64),
+            IndexDigests = [indexDigest],
+            References = [SyntheticBuildTag.New()],
+            Size = 1_000,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        await manager.PruneAsync(Filters.Empty, CancellationToken.None);
+
+        var pruneCall = Assert.Single(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
+        Assert.Equal($"PruneImagesAsync:{indexDigest}", pruneCall);
     }
 
     [Fact]
@@ -930,7 +960,7 @@ public sealed class ImageManagerTests : IDisposable
 
         // cider-ede.31: two underlying deletes from this one prune call still sweep exactly once —
         // "exactly once per prune", not once per image it happens to remove along the way.
-        Assert.Single(runtime.Calls, c => c == "PruneImagesAsync");
+        Assert.Single(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
 
         var ex = await Assert.ThrowsAsync<DockerApiException>(
             () => manager.InspectAsync(imageId, CancellationToken.None));
