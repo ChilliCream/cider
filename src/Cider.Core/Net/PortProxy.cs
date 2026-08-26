@@ -43,10 +43,20 @@ public sealed class PublishedPortHandle : IDisposable
     }
 
     /// <summary>What this handle publishes; replaced in place once a pending address resolves.</summary>
-    public PublishedPort Port { get; set; }
+    public PublishedPort Port { get; private set; }
 
     /// <summary>The forwarder backing this publication, when it is one (every real publication is).</summary>
     internal IPortForwarder? Forwarder => _resource as IPortForwarder;
+
+    /// <summary>
+    /// Supplies the container's address once it is known: retargets the forwarder and replaces
+    /// <see cref="Port"/> with a copy carrying it. Callers hold the owning manager's lock.
+    /// </summary>
+    internal void Resolve(IPAddress containerIp)
+    {
+        Forwarder?.ResolveTarget(containerIp);
+        Port = Port with { ContainerIp = containerIp };
+    }
 
     /// <inheritdoc />
     public void Dispose() => _resource?.Dispose();
@@ -321,8 +331,7 @@ public sealed class PortProxyManager : IPortPublisher
                     continue;
                 }
 
-                handle.Forwarder?.ResolveTarget(containerIp);
-                handle.Port = handle.Port with { ContainerIp = containerIp };
+                handle.Resolve(containerIp);
                 _logger.LogDebug("resolved {Publication} for container {Container}", handle.Port, containerId);
             }
         }

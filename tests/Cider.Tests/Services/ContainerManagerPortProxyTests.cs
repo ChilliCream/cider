@@ -34,10 +34,10 @@ public sealed class ContainerManagerPortProxyTests
         // Nothing was handed to the engine: the daemon carries the traffic itself.
         Assert.Empty(harness.Runtime.GetSpec("web")!.Ports);
 
-        // The TCP listeners are already bound (pending an address) by the time StartAsync returns
-        // (cider-ede.18); the address itself, and the UDP mapping that needs it up front, resolve on
-        // the background network-registration task StartAsync no longer waits for, so this polls
-        // exactly like the address genuinely arriving late (below) would.
+        // The TCP listeners are already bound (pending an address) before
+        // AwaitStartupAndRegisterNetworkNamesAsync runs (cider-ede.18); the address itself, and the
+        // UDP mapping that needs it up front, are filled in by that wait or a later poller tick, so
+        // this polls rather than assume which of those supplied it.
         var address = harness.Runtime.GetContainer("web")!.Address;
         var published = await WaitUntil(
             () => harness.Publisher.LiveFor(record.Id),
@@ -189,8 +189,8 @@ public sealed class ContainerManagerPortProxyTests
     }
 
     /// <summary>
-    /// Polls <paramref name="value"/> until <paramref name="isDone"/> accepts it, for work that now
-    /// happens off a background task StartAsync no longer waits for (cider-ede.18).
+    /// Polls until the condition holds, so the assertion does not depend on which tick (start,
+    /// network refresh, poller) supplied the address.
     /// </summary>
     private static async Task<T> WaitUntil<T>(Func<T> value, Func<T, bool> isDone)
     {
