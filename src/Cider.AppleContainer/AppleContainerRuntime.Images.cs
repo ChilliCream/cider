@@ -20,6 +20,8 @@ public sealed partial class AppleContainerRuntime
             return (IReadOnlyList<RuntimeImage>)Array.Empty<RuntimeImage>();
         }
 
+        await RecoverContentAddressedIdsAsync(images, ct);
+
         // Apple lists one row per reference; Docker wants one image per digest (RuntimeMapper.ToImages).
         return RuntimeMapper.ToImages(images);
     });
@@ -45,6 +47,7 @@ public sealed partial class AppleContainerRuntime
             return null;
         }
 
+        await RecoverContentAddressedIdsAsync(images, ct);
         await RecoverExposedPortsAsync(images, ct);
 
         var detail = RuntimeMapper.ToImageDetail(images[0], platform: null);
@@ -127,6 +130,55 @@ public sealed partial class AppleContainerRuntime
                 {
                     config.Volumes = recovered.Volumes;
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Apple's own <c>id</c> (<see cref="AppleImageJson.Id"/>) is the OCI *index* digest, and
+    /// <c>container image load</c> recomputes/reassigns it on every import — reproduced (cider-ger.19):
+    /// loading the same byte-identical BuildKit-exported docker tar twice yields two different
+    /// <c>container image ls</c> ids for the same tag, even though the tar's own manifest+config
+    /// digests never change between the two exports. That id drift is exactly what surfaced as
+    /// <c>docker images -q</c>/<c>--iidfile</c> disagreeing with each other for two builds of the same
+    /// Dockerfile (tests/compat/run-buildkit.sh scenario 6). Docker's own image id is not the index
+    /// digest at all — it is the digest of the image *config* blob — and Apple's local
+    /// content-addressed store already keys that config blob by its real content digest, so reading
+    /// it back (the same local-store lookup <see cref="RecoverLayerSizesAsync"/> already does for
+    /// per-layer sizes) gives a value that is genuinely stable across reloads of identical content,
+    /// unlike the id the CLI hands back directly. Recovery is best-effort, exactly like
+    /// <see cref="RecoverExposedPortsAsync"/>: a store miss just leaves Apple's own (possibly
+    /// unstable) id in place rather than failing the call.
+    /// </summary>
+    private async Task RecoverContentAddressedIdsAsync(List<AppleImageJson> images, CancellationToken ct)
+    {
+        string? appRoot = null;
+        var appRootResolved = false;
+
+        foreach (var image in images)
+        {
+            var variant = RuntimeMapper.PickVariant(image, null);
+            if (string.IsNullOrEmpty(variant?.Digest))
+            {
+                continue;
+            }
+
+            if (!appRootResolved)
+            {
+                appRoot = await ResolveAppRootAsync(ct).ConfigureAwait(false);
+                appRootResolved = true;
+            }
+
+            if (string.IsNullOrEmpty(appRoot))
+            {
+                return; // No local store to recover from; leave every remaining row's id as-is.
+            }
+
+            var manifest = await LocalBlobReader.TryReadBlobAsync<AppleOciManifest>(appRoot, variant.Digest, _logger, ct).ConfigureAwait(false);
+            var configDigest = manifest?.Config?.Digest;
+            if (!string.IsNullOrEmpty(configDigest))
+            {
+                image.Id = configDigest;
             }
         }
     }
