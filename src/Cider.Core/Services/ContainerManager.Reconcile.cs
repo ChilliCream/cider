@@ -196,6 +196,16 @@ public sealed partial class ContainerManager
         }
 
         Persist(record);
+
+        if (expected == "exited")
+        {
+            // Self-guards via the id-based wrapper: a no-op when a held process exists (defers to
+            // HandleExitAsync) or when no handle exists at all. Covers the `cider sync` /
+            // StateSynchronizer.cs:126 caller; harmless no-op for the startup ReconcileAsync caller,
+            // where no waiter can exist yet (cider-ede.33).
+            CompleteExitWait(record.Id, record.State.ExitCode);
+        }
+
         return true;
     }
 

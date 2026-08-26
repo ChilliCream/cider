@@ -505,6 +505,59 @@ public sealed class ContainerManagerLifecycleTests
     }
 
     [Fact]
+    public async Task Stop_of_an_adopted_container_with_no_held_process_completes_a_pending_docker_wait()
+    {
+        // cider-ede.33 correction: `docker stop` on a container cider only adopted (no held
+        // process, so HandleExitAsync never runs for it) used to leave a pending `docker wait`
+        // blocked forever -- MarkStoppedWithoutHandle flipped the record to exited and persisted
+        // without ever completing NextExit, and once the record is no longer Running neither
+        // StatePoller die branch (StatePoller.cs:154, :210) can fire to rescue it either.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var record = await harness.CreateAsync("alpine", "web");
+        record.State.Status = "running";
+        harness.Store.Upsert(record.Id, record);
+
+        var nextExit = harness.Containers.WaitAsync(record.Id, "next-exit", default);
+        var notRunning = harness.Containers.WaitAsync(record.Id, "not-running", default);
+
+        await harness.Containers.StopAsync(record.Id, timeoutSeconds: 1, signal: null, default);
+
+        var nextExitResponse = await nextExit.WaitAsync(TimeSpan.FromSeconds(2));
+        var notRunningResponse = await notRunning.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(0, nextExitResponse.StatusCode);
+        Assert.Equal(0, notRunningResponse.StatusCode);
+        Assert.Equal("exit code unknown (daemon restarted)", nextExitResponse.Error?.Message);
+    }
+
+    [Fact]
+    public async Task ReconcileStatus_of_an_adopted_container_completes_a_pending_docker_wait()
+    {
+        // cider-ede.33 correction: StateSynchronizer's running->exited transition
+        // (StateSynchronizer.cs:126 -> ReconcileStatus) is a fifth uncovered observer -- it flipped
+        // a live adopted record to exited and persisted with no CompleteExitWait, leaving a
+        // `docker wait` from before the resync blocked forever.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var record = await harness.CreateAsync("alpine", "web");
+        record.State.Status = "running";
+        harness.Store.Upsert(record.Id, record);
+
+        var nextExit = harness.Containers.WaitAsync(record.Id, "next-exit", default);
+        var notRunning = harness.Containers.WaitAsync(record.Id, "not-running", default);
+
+        var runtimeContainer = new RuntimeContainer { RuntimeId = record.RuntimeId, State = RuntimeContainerState.Stopped };
+        var changed = harness.Containers.ReconcileStatus(record, runtimeContainer);
+
+        Assert.True(changed);
+        var nextExitResponse = await nextExit.WaitAsync(TimeSpan.FromSeconds(2));
+        var notRunningResponse = await notRunning.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(0, nextExitResponse.StatusCode);
+        Assert.Equal(0, notRunningResponse.StatusCode);
+        Assert.Equal("exited", record.State.Status);
+    }
+
+    [Fact]
     public async Task Kill_delivers_the_signal_and_emits_kill()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

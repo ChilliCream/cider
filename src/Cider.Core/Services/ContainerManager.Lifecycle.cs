@@ -227,6 +227,11 @@ public sealed partial class ContainerManager
         record.State.ExitCode = 0;
         record.State.Error = "exit code unknown (daemon restarted)";
         Persist(record);
+
+        // `docker stop` on an adopted container: no held process means HandleExitAsync never runs,
+        // and once the record is no longer Running neither StatePoller die branch (StatePoller.cs:154,
+        // :210) can fire either, so this is the only place left that can unblock the waiter (cider-ede.33).
+        CompleteExitWait(handle, record.State.ExitCode);
     }
 
     /// <summary><c>POST /containers/{id}/kill</c>; 409 when the container is not running.</summary>
