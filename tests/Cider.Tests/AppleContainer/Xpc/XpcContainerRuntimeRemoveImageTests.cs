@@ -3,6 +3,7 @@ using Cider.AppleContainer.Xpc;
 using Cider.AppleContainer.Xpc.Models;
 using Cider.Core.Runtime;
 using Cider.Tests.Fakes;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -200,17 +201,85 @@ public sealed class XpcContainerRuntimeRemoveImageTests
         Assert.True(sweepIndex >= 0 && cliFallback.Calls.Any(c => c.StartsWith("BuildImageAsync:", StringComparison.Ordinal)), $"expected both calls to be recorded; build calls were [{string.Join(", ", cliFallback.Calls)}], sweep calls were [{string.Join(", ", fake.Calls)}]");
     }
 
-    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient) =>
-        NewRuntime(imagesClient, new FakeContainerRuntime());
+    /// <summary>
+    /// cider-bci regression: <c>imageCleanupOrphanedBlobs</c> walks the *whole* store, including blobs
+    /// from images this daemon never touched, so a pre-existing dangling/unresolvable content reference
+    /// elsewhere in the store (the same cider-ede.24 class <see cref="XpcContainerRuntimeListImagesToleranceTests"/>
+    /// covers for <c>ListImagesAsync</c>) must not turn the sweep's failure into a total
+    /// <c>PruneImagesAsync</c> failure — before the fix, this exception propagated straight out and
+    /// discarded every per-image deletion <c>ImageManager.PruneAsync</c> had already made, so
+    /// `docker image prune -f` came back as a 500 (or, before cider-ede.31 made the sweep unconditional,
+    /// silently skipped every dangling image whose deletion happened to run after this exception's
+    /// spiritual predecessor). The fix degrades the same way <c>ListImagesAsync</c> does: log exactly
+    /// one Warning naming the offending digest and let the call return normally.
+    /// </summary>
+    [Fact]
+    public async Task PruneImagesAsync_ToleratesADanglingContentReferenceInTheSweep_LogsOneWarningAndDoesNotThrow()
+    {
+        var digest = "sha256:" + new string('9', 64);
+        var fake = new RecordingImagesServiceClient();
+        fake.CleanupFailure = XpcException.ApiServer("internalError", $"content with digest {digest}");
+        var logger = new RecordingLogger<XpcContainerRuntime>();
+        var runtime = NewRuntime(fake, new FakeContainerRuntime(), logger);
+        using var _ = runtime;
 
-    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient, IContainerRuntime cliFallback)
+        // Must not throw: the store-wide sweep failing over unrelated store corruption is not the
+        // caller's failure to report.
+        await runtime.PruneImagesAsync(CancellationToken.None);
+
+        var warnings = logger.Entries.Where(e => e.Level == LogLevel.Warning).ToList();
+        var warning = Assert.Single(warnings);
+        Assert.Contains(digest, warning.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>A genuine, non-dangling-content failure from the sweep must still surface — this
+    /// tolerance is narrowly scoped to the one known corruption shape, not "swallow every sweep
+    /// error".</summary>
+    [Fact]
+    public async Task PruneImagesAsync_StillThrows_ForANonDanglingContentFailureInTheSweep()
+    {
+        var fake = new RecordingImagesServiceClient();
+        fake.CleanupFailure = XpcException.ApiServer("internalError", "something else entirely went wrong");
+        var runtime = NewRuntime(fake, new FakeContainerRuntime(), NullLogger<XpcContainerRuntime>.Instance);
+        using var _ = runtime;
+
+        await Assert.ThrowsAsync<RuntimeException>(() => runtime.PruneImagesAsync(CancellationToken.None));
+    }
+
+    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient) =>
+        NewRuntime(imagesClient, new FakeContainerRuntime(), NullLogger<XpcContainerRuntime>.Instance);
+
+    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient, IContainerRuntime cliFallback) =>
+        NewRuntime(imagesClient, cliFallback, NullLogger<XpcContainerRuntime>.Instance);
+
+    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient, IContainerRuntime cliFallback, ILogger<XpcContainerRuntime> logger)
     {
         var options = new AppleContainerOptions();
         var apiserver = new XpcClient("com.apple.container.test.apiserver", NullLogger.Instance);
         var images = new XpcClient("com.apple.container.test.images", NullLogger.Instance);
         var capabilities = new RuntimeCapabilities { Transport = RuntimeTransportKind.Xpc };
         return new XpcContainerRuntime(
-            cliFallback, apiserver, images, capabilities, options, NullLogger<XpcContainerRuntime>.Instance, imagesClient);
+            cliFallback, apiserver, images, capabilities, options, logger, imagesClient);
+    }
+
+    /// <summary>Captures every log entry made against it — the same shape
+    /// <c>XpcContainerRuntimeListImagesToleranceTests</c> uses for the analogous <c>ListImagesAsync</c>
+    /// tolerance.</summary>
+    private sealed class RecordingLogger<T> : ILogger<T>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add((logLevel, formatter(state, exception)));
     }
 
     /// <summary>Records every call it makes, and lets a test hold <c>ImagePullAsync</c> or
@@ -228,6 +297,11 @@ public sealed class XpcContainerRuntimeRemoveImageTests
 
         private TaskCompletionSource<bool>? _sweepGate;
         private TaskCompletionSource<bool>? _sweepBlockedSignal;
+
+        /// <summary>Test hook: makes the next <see cref="ImageCleanupOrphanedBlobsAsync"/> call throw
+        /// this instead of its normal empty result — simulates the apiserver rejecting the sweep
+        /// (a dangling content reference, or any other failure a test wants to arm).</summary>
+        public XpcException? CleanupFailure { get; set; }
 
         public void ArmPullGate()
         {
@@ -287,6 +361,12 @@ public sealed class XpcContainerRuntimeRemoveImageTests
 
         public override async Task<(IReadOnlyList<string> Digests, ulong ImageSize)> ImageCleanupOrphanedBlobsAsync(CancellationToken ct)
         {
+            if (CleanupFailure is { } failure)
+            {
+                CleanupFailure = null;
+                throw failure;
+            }
+
             if (_sweepGate is not null)
             {
                 _sweepBlockedSignal!.TrySetResult(true);

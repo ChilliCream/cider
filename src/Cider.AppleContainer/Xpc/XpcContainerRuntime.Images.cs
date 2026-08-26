@@ -765,6 +765,23 @@ internal sealed partial class XpcContainerRuntime
             // for this call to additionally reclaim over the CLI.
             WarnFallback("imageCleanupOrphanedBlobs", ex);
         }
+        catch (XpcException ex) when (CliErrorMapper.IsDanglingContent(ex.Message))
+        {
+            // cider-bci: unlike a per-image `imageDelete`, this sweep walks every blob in the whole
+            // store — including ones from images this daemon never touched — so one pre-existing
+            // dangling/unresolvable content reference elsewhere in the store (cider-ede.24's own class
+            // of corruption, which cider must tolerate and never repair) fails the sweep every single
+            // time, even on a store that otherwise has nothing wrong with it. Before this, that turned
+            // *every* `docker image prune` into a total failure (500), discarding the per-image
+            // deletions `ImageManager.PruneAsync` had already made above — the same "never turn a
+            // success into a failure" rule ListImagesAsync's own dangling-content tolerance follows
+            // (this file's own doc comment credits it to cider-ede.24). Reclaiming orphaned blobs is a
+            // nicety on top of those deletions, not their contract, so this degrades the same way
+            // ListImagesAsync does: log once, at the same Warning level and with the same
+            // operator-facing remedy text, and let the prune otherwise report success.
+            var digest = CliErrorMapper.ExtractDanglingDigest(ex.Message) ?? ex.Message;
+            _logger.LogWarning("{Message}", CliErrorMapper.DanglingContentRemedy(digest));
+        }
         catch (XpcException ex)
         {
             throw ex.ToRuntimeException("image prune");
