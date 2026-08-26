@@ -62,9 +62,12 @@ internal sealed partial class XpcContainerRuntime
                 // Parity with the CLI transport's own dangling-content Warning (cider-ede.24 fix
                 // direction item 3): a single unresolvable blob must never fail the whole listing on
                 // either transport, and an operator must see the same guidance either way — exactly one
-                // Warning per listing call, not one per unresolved blob (a manifest and its config
-                // digest for the same image can both be unresolvable at once, and unresolvedDigests
-                // de-dupes a digest shared by two groups so it is only named once).
+                // Warning per listing call, not one per unresolved blob. The Warning names only
+                // unresolvable top-level index blobs (the digest state.json names directly per image);
+                // unresolvedDigests de-dupes one shared by two groups so it is only named once. A
+                // per-platform manifest absent from a multi-platform index — the common case for an
+                // ordinary pull that never fetched every platform's variant locally — is a normal,
+                // silent store-miss, not a dangling reference, and never reaches this set.
                 if (unresolvedDigests.Count > 0)
                 {
                     _logger.LogWarning("{Message}", CliErrorMapper.DanglingContentRemedy(string.Join(", ", unresolvedDigests)));
@@ -132,7 +135,7 @@ internal sealed partial class XpcContainerRuntime
                 continue;
             }
 
-            var manifest = await GetBlobAsync<AppleOciManifest>(variantDigest, ct, unresolvedDigests).ConfigureAwait(false);
+            var manifest = await GetBlobAsync<AppleOciManifest>(variantDigest, ct).ConfigureAwait(false);
             if (manifest is null)
             {
                 continue;
@@ -141,7 +144,7 @@ internal sealed partial class XpcContainerRuntime
             manifests[variantDigest] = manifest;
             if (manifest.Config?.Digest is { Length: > 0 } configDigest && !configs.ContainsKey(configDigest))
             {
-                var config = await GetBlobAsync<AppleOciImageDocument>(configDigest, ct, unresolvedDigests).ConfigureAwait(false);
+                var config = await GetBlobAsync<AppleOciImageDocument>(configDigest, ct).ConfigureAwait(false);
                 if (config is not null)
                 {
                     configs[configDigest] = config;
@@ -156,9 +159,13 @@ internal sealed partial class XpcContainerRuntime
     /// <c>contentGet(digest)</c> → local path → <see cref="LocalBlobReader.TryReadAsync{T}"/> (§6's
     /// two-step read). <c>null</c> on a missing digest, a <c>notFound</c> from <c>contentGet</c> itself,
     /// or an unparsable/missing blob file — every case collapses to "nothing recovered", exactly like
-    /// the CLI transport's own best-effort blob reads, and every one of them records
-    /// <paramref name="digest"/> into <paramref name="unresolvedDigests"/> for the caller's single
-    /// per-listing Warning (item 3) — not just the exception path below, since
+    /// the CLI transport's own best-effort blob reads. <paramref name="digest"/> is recorded into
+    /// <paramref name="unresolvedDigests"/> for the caller's single per-listing Warning (item 3) only
+    /// when the caller passes a non-null set — <see cref="LoadBlobsAsync"/> does that for the image's
+    /// own top-level index blob only, since that is the one digest <c>state.json</c> names directly and
+    /// the one whose loss actually empties the listed row; a per-platform manifest or its config that
+    /// was legitimately never fetched locally (a normal, silent store-miss on a multi-platform index)
+    /// stays untracked here — not just the exception path below, since
     /// <see cref="ImagesServiceClient.ContentGetAsync"/> already swallows a <c>notFound</c> itself and
     /// answers <c>null</c>, and a <paramref name="digest"/> whose blob file has since been deleted from
     /// disk resolves to a path that simply no longer exists — both far more common live shapes than an
@@ -751,8 +758,9 @@ internal sealed partial class XpcContainerRuntime
     /// Stages <paramref name="tarInput"/> to a temp file, then <c>imageLoad{filePath,
     /// forceLoad:false}</c> → <c>imageUnpack</c> per loaded description (fix direction §3: "no
     /// before/after diff needed anymore" — <c>imageLoad</c>'s own reply already names exactly what it
-    /// loaded, unlike the CLI transport's <c>container image load</c>, which reports nothing
-    /// machine-readable and so has to diff <c>ListImagesAsync</c> before/after instead). On an
+    /// loaded, unlike the CLI transport's <c>container image load</c>, which only writes a bare
+    /// reference to stdout (<c>Loaded image: &lt;ref&gt;</c>, per 918daf4) and so reads that plus a
+    /// before/after <c>ListImagesAsync</c> diff as a secondary source instead). On an
     /// apiserver-unavailable fallback, the CLI runtime reads the already-staged temp file, not
     /// <paramref name="tarInput"/> itself — it was already fully consumed staging it, and a live
     /// request-body stream is not guaranteed seekable/re-readable.

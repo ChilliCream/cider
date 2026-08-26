@@ -98,6 +98,57 @@ public sealed class XpcContainerRuntimeListImagesToleranceTests
         Assert.Contains("container image prune", warning.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Regression for the MAJOR finding this task's correction fixes: a real, multi-platform image
+    /// whose top-level index resolves fine but whose per-platform manifest was never fetched locally
+    /// (the ordinary shape of an every-day pull) must never add that manifest's digest to the
+    /// dangling-content Warning — only an unresolvable top-level index blob may. Before the fix,
+    /// <c>LoadBlobsAsync</c> passed <c>unresolvedDigests</c> to the nested manifest/config
+    /// <c>GetBlobAsync</c> calls too, so this exact shape (a healthy index, an absent platform variant)
+    /// would have warned.
+    /// </summary>
+    [Fact]
+    public async Task ListImagesAsync_DoesNotWarn_ForAPlatformManifestAbsentFromAResolvedIndex_OnlyForTheUnresolvableIndexItself()
+    {
+        using var tempDir = new TempDir();
+        var goodDigest = RepeatDigest('1');
+        var badDigest = RepeatDigest('2');
+        var absentVariantDigest = RepeatDigest('3');
+
+        var goodIndexPath = tempDir.WriteIndex(
+            "good",
+            "[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"" + absentVariantDigest +
+            "\",\"size\":528,\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}}]");
+
+        var descriptions = new List<ImageDescription>
+        {
+            Description("docker.io/library/good:latest", goodDigest),
+            Description("docker.io/library/bad:latest", badDigest),
+        };
+
+        // absentVariantDigest is deliberately NOT staged in `resolvable` — a per-platform manifest
+        // that was never fetched locally, the normal store-miss shape item 3 locks: ContentGetAsync
+        // answers null for it (FakeImagesServiceClient.ContentGetAsync's GetValueOrDefault falls back
+        // to null for any digest not listed there), and that must NOT add it to the Warning.
+        var fakeClient = new FakeImagesServiceClient(descriptions, badDigest, resolvable: new() { [goodDigest] = goodIndexPath });
+        var logger = new RecordingLogger<XpcContainerRuntime>();
+        var runtime = NewRuntime(fakeClient, logger);
+        using var _ = runtime;
+
+        var images = await runtime.ListImagesAsync(CancellationToken.None);
+
+        // Both rows still come back: the good row's index resolved fine (the absent variant just
+        // yields an empty/short variants list, tolerated the same way a store-miss manifest is), and
+        // the bad row tolerates its own unresolvable index the same as the other tests in this file.
+        Assert.Equal(2, images.Count);
+
+        var warnings = logger.Entries.Where(e => e.Level == LogLevel.Warning).ToList();
+        var warning = Assert.Single(warnings);
+        Assert.Contains(badDigest, warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(goodDigest, warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(absentVariantDigest, warning.Message, StringComparison.Ordinal);
+    }
+
     private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient, ILogger<XpcContainerRuntime> logger)
     {
         var options = new AppleContainerOptions();
@@ -123,12 +174,15 @@ public sealed class XpcContainerRuntimeListImagesToleranceTests
     {
         private readonly string _dir = Directory.CreateTempSubdirectory("cider-ede24-tests-").FullName;
 
-        public string WriteIndex(string name)
+        /// <param name="manifestsJson">A raw JSON array literal for the index's <c>manifests</c>
+        /// field — defaults to <c>[]</c> (no real variants) for the tests that only exercise the
+        /// index blob itself; pass a real platform descriptor to walk a variant manifest too.</param>
+        public string WriteIndex(string name, string manifestsJson = "[]")
         {
             var path = Path.Combine(_dir, $"{name}.json");
             File.WriteAllText(
                 path,
-                """{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}""");
+                $$"""{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":{{manifestsJson}}}""");
             return path;
         }
 
