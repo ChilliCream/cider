@@ -403,6 +403,7 @@ public static class Program
         Console.WriteLine($"containers: {DescribeResource(report.Containers, includeUpdated: true)}");
         Console.WriteLine($"networks:   {DescribeResource(report.Networks, includeUpdated: false)}");
         Console.WriteLine($"volumes:    {DescribeResource(report.Volumes, includeUpdated: false)}");
+        Console.WriteLine($"dns:        {DescribeResource(report.Dns, includeUpdated: false, removedVerb: "stopped", adoptedVerb: "started")}");
 
         if (report.Warnings.Count > 0)
         {
@@ -419,12 +420,16 @@ public static class Program
         }
     }
 
-    private static string DescribeResource(SyncResourceReportDto resource, bool includeUpdated)
+    private static string DescribeResource(
+        SyncResourceReportDto resource,
+        bool includeUpdated,
+        string removedVerb = "removed",
+        string adoptedVerb = "adopted")
     {
         var parts = new List<string>
         {
-            $"{resource.Removed.Count} removed{NameList(resource.Removed)}",
-            $"{resource.Adopted.Count} adopted{NameList(resource.Adopted)}",
+            $"{resource.Removed.Count} {removedVerb}{NameList(resource.Removed)}",
+            $"{resource.Adopted.Count} {adoptedVerb}{NameList(resource.Adopted)}",
         };
 
         if (includeUpdated)

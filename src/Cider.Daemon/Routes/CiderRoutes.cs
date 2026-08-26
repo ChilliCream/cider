@@ -56,10 +56,13 @@ public sealed class SyncReportDto
     /// <summary>Mirrors <see cref="SyncReport.Volumes"/>.</summary>
     public SyncResourceReportDto Volumes { get; set; } = new();
 
+    /// <summary>Mirrors <see cref="SyncReport.Dns"/> (cider-ede.39).</summary>
+    public SyncResourceReportDto Dns { get; set; } = new();
+
     /// <summary>Mirrors <see cref="SyncReport.Warnings"/>.</summary>
     public List<string> Warnings { get; set; } = [];
 
-    /// <summary>Mirrors <see cref="SyncReport.IsEmpty"/>.</summary>
+    /// <summary>Mirrors <see cref="SyncReport.IsEmpty"/> — <see cref="Dns"/> excluded, see there.</summary>
     public bool IsEmpty =>
         Containers.IsEmpty && Networks.IsEmpty && Volumes.IsEmpty && Warnings.Count == 0;
 }

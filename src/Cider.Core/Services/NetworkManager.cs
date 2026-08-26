@@ -607,6 +607,7 @@ public sealed class NetworkManager
             }
 
             await ReleaseDnsForwarderAsync(record.Name, ct).ConfigureAwait(false);
+            report.Dns.Removed.Add(record.Name); // cider-ede.39: the forwarder above is stopped with its network.
             _store.Delete(record.Name);
             _events.Publish(DockerEvents.Network("destroy", record.Id, record.Name));
             report.Networks.Removed.Add(record.Name);

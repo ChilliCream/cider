@@ -66,7 +66,7 @@ public sealed class StateSynchronizer
         _logger.LogInformation(
             "state sync complete: containers +{ContainersAdopted}/-{ContainersRemoved}/~{ContainersUpdated}, "
             + "networks +{NetworksAdopted}/-{NetworksRemoved}, volumes +{VolumesAdopted}/-{VolumesRemoved}, "
-            + "{Warnings} warning(s)",
+            + "dns +{DnsEnsured}/-{DnsStopped}, {Warnings} warning(s)",
             report.Containers.Adopted.Count,
             report.Containers.Removed.Count,
             report.Containers.Updated.Count,
@@ -74,6 +74,8 @@ public sealed class StateSynchronizer
             report.Networks.Removed.Count,
             report.Volumes.Adopted.Count,
             report.Volumes.Removed.Count,
+            report.Dns.Adopted.Count,
+            report.Dns.Removed.Count,
             report.Warnings.Count);
 
         return report;
@@ -189,8 +191,13 @@ public sealed class StateSynchronizer
                 // turned off by configuration always returns (NullDnsForwarderService), and the real
                 // service already logs its own warning when it has one (no gateway yet, the DNS
                 // server never bound, …) — duplicating that here would be misleading noise on a
-                // daemon that has DNS disabled on purpose.
-                await _dnsForwarder.EnsureAsync(network, ct).ConfigureAwait(false);
+                // daemon that has DNS disabled on purpose. A non-null address does mean cider sync did
+                // something observable for this network's DNS (started the forwarder or confirmed it
+                // is still up), so it goes in the report (cider-ede.39) — see SyncReport.Dns.
+                if (await _dnsForwarder.EnsureAsync(network, ct).ConfigureAwait(false) is not null)
+                {
+                    report.Dns.Adopted.Add(network);
+                }
             }
             catch (Exception ex) when (ex is RuntimeException or IOException)
             {

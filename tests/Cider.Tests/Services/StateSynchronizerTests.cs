@@ -137,6 +137,54 @@ public sealed class StateSynchronizerTests
     }
 
     [Fact]
+    public async Task SyncAsync_DnsForwarders_ReportsStartedAndStoppedNetworks()
+    {
+        // cider-ede.39: cider-eh2 shipped the forwarder resync itself but the report had no counter
+        // for it, so a `cider sync` that started or stopped a forwarder looked identical to one that
+        // never touched DNS at all. This pins the fix: both halves show up in report.Dns.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var sync = NewSynchronizer(harness);
+
+        // A running container on "bridge" — its forwarder gets ensured every pass, which counts as
+        // "started" here (SyncReport.Dns can't tell "just created" from "already running"; see its
+        // doc comment).
+        var running = await harness.RunShellAsync("sleep 30", "web-with-dns");
+        Assert.True(running.Networks.ContainsKey("bridge"), "the default create attaches bridge");
+
+        // A network record that vanished from the engine has its forwarder released as part of
+        // dropping the record (NetworkManager.ReconcileAsync).
+        await harness.Networks.CreateAsync(new NetworkCreateRequest { Name = "vanishing-net" }, default);
+        harness.Runtime.VanishNetwork("vanishing-net");
+
+        var report = await sync.SyncAsync(default);
+
+        Assert.Contains("bridge", report.Dns.Adopted);
+        Assert.Contains("bridge", harness.Dns.Requested);
+
+        Assert.Contains("vanishing-net", report.Dns.Removed);
+        Assert.Contains("vanishing-net", harness.Dns.Released);
+
+        await harness.Runtime.KillContainerAsync("web-with-dns", "SIGKILL", default);
+    }
+
+    [Fact]
+    public async Task SyncAsync_DnsForwarders_ReportsZerosRatherThanOmittingTheLine_WhenNothingTouchesDns()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var sync = NewSynchronizer(harness);
+
+        // No running containers and no dropped networks: nothing for SyncDnsForwardersAsync or the
+        // network reconciler to touch.
+        var report = await sync.SyncAsync(default);
+
+        Assert.Empty(report.Dns.Adopted);
+        Assert.Empty(report.Dns.Removed);
+        Assert.True(report.Dns.IsEmpty);
+        Assert.Empty(harness.Dns.Requested);
+        Assert.Empty(harness.Dns.Released);
+    }
+
+    [Fact]
     public async Task SyncAsync_EngineListFailure_ThrowsAndChangesNothing()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

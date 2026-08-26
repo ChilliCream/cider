@@ -28,6 +28,7 @@ public sealed class ContainerTestHarness : IAsyncDisposable
 
         Images = new ImageManager(Runtime, Events, options, NullLogger<ImageManager>.Instance);
         Networks = new NetworkManager(Runtime, new InMemoryRecordStore<NetworkRecord>(), Events, NullLogger<NetworkManager>.Instance);
+        Networks.SetDnsForwarders(Dns);
         Volumes = new VolumeManager(Runtime, new InMemoryRecordStore<VolumeRecord>(), Events, options, NullLogger<VolumeManager>.Instance);
 
         Containers = new ContainerManager(
