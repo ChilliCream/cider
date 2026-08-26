@@ -174,11 +174,38 @@ public class ImagesMappingTests
 
         var image = XpcContainerRuntime.ToRuntimeImage(["alpine:3.22"], Digest, variants, manifests, configs);
 
-        Assert.Equal("sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc", image.Id);
+        // cider-ger.19 orchestrator follow-up: Id is the preferred variant's manifest config digest
+        // (the value that is stable across separate loads of identical content), not the group's raw
+        // index digest — the same content-addressed derivation the CLI transport's own
+        // AppleContainerRuntime.RecoverContentAddressedIdsAsync applies. The raw index digest survives
+        // on IndexDigests, for the rmi/prune in-use join (ImageManager.IsBoundTo).
+        Assert.Equal(ConfigDigest, image.Id);
+        Assert.Equal([Digest], image.IndexDigests);
         Assert.Equal((374 + 1512 + 4120486 + 104) + (375 + 1000) + 0, image.Size);
         Assert.Equal(["linux/arm64", "linux/amd64", "linux/386"], image.Platforms);
         Assert.Equal(new DateTimeOffset(2026, 8, 25, 19, 18, 4, TimeSpan.Zero), image.Created);
         Assert.Equal("b", image.Labels["a"]);
+    }
+
+    [Fact]
+    public void ToRuntimeImage_FallsBackToTheIndexDigest_WhenThePreferredVariantsManifestDidNotResolve()
+    {
+        // Store-miss recovery, same best-effort contract as the CLI transport's
+        // RecoverContentAddressedIdsAsync: no entry for the variant's digest in `manifests` at all.
+        var variants = new List<OciDescriptor>
+        {
+            new() { Digest = ManifestDigest, Size = 374, Platform = new OciPlatform { Os = "linux", Architecture = "arm64" } },
+        };
+
+        var image = XpcContainerRuntime.ToRuntimeImage(
+            ["alpine:3.22"],
+            Digest,
+            variants,
+            manifests: new Dictionary<string, AppleOciManifest>(StringComparer.Ordinal),
+            configs: new Dictionary<string, AppleOciImageDocument>(StringComparer.Ordinal));
+
+        Assert.Equal(Digest, image.Id);
+        Assert.Equal([Digest], image.IndexDigests);
     }
 
     [Fact]
@@ -223,7 +250,9 @@ public class ImagesMappingTests
         var detail = XpcContainerRuntime.ToRuntimeImageDetail(["postgres:18.3"], Digest, variants, manifests, configs);
 
         Assert.NotNull(detail);
-        Assert.Equal("arm64", detail!.Architecture);
+        Assert.Equal(ConfigDigest, detail!.Id);
+        Assert.Equal([Digest], detail.IndexDigests);
+        Assert.Equal("arm64", detail.Architecture);
         Assert.Equal("linux", detail.Os);
         // Size uses the single preferred variant's full getFullImageSize formula (descriptor.size +
         // config.size + sum(layers[].size)) — the same variant.Size semantics RuntimeMapper.ToImageDetail

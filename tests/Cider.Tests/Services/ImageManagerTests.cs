@@ -86,6 +86,38 @@ public sealed class ImageManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task InspectAsync_And_ListAsync_RepoDigests_NameTheIndexDigest_NotTheContentAddressedId()
+    {
+        // cider-ger.19 orchestrator follow-up (item 3): Docker's RepoDigests names the manifest
+        // digest a reference actually resolves to -- Apple's raw index digest -- not the image id.
+        // Since this task, image.Id is the content-addressed config digest instead, which is stable
+        // across reloads but is not a digest a registry would ever hand back for a pull/push of this
+        // reference, so RepoDigests must keep preferring IndexDigests over Id.
+        var (manager, runtime) = CreateManager();
+        var configDigest = "sha256:" + new string('c', 64);
+        var indexDigest = "sha256:" + new string('i', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = configDigest,
+            IndexDigests = [indexDigest],
+            References = ["repodigest-check:v1"],
+            Size = 1_000,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        var inspect = await manager.InspectAsync("repodigest-check:v1", CancellationToken.None);
+        Assert.Single(inspect.RepoDigests, d => d.EndsWith($"@{indexDigest}", StringComparison.Ordinal));
+        Assert.DoesNotContain(inspect.RepoDigests, d => d.Contains(configDigest, StringComparison.Ordinal));
+
+        var listed = await manager.ListAsync(true, Filters.Empty, false, CancellationToken.None);
+        var summary = Assert.Single(listed, i => i.Id == configDigest);
+        Assert.Single(summary.RepoDigests, d => d.EndsWith($"@{indexDigest}", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task InspectAsync_ByFamiliarName_ReturnsImageConfig()
     {
         var (manager, _) = CreateManager();
@@ -879,6 +911,124 @@ public sealed class ImageManagerTests : IDisposable
         var ex = await Assert.ThrowsAsync<DockerApiException>(
             () => manager.InspectAsync("alpine:latest", CancellationToken.None));
         Assert.Equal(System.Net.HttpStatusCode.NotFound, ex.Status);
+    }
+
+    [Fact]
+    public async Task RemoveAsync_ByTheNewContentAddressedId_DeletesEndToEnd()
+    {
+        // cider-ger.19 orchestrator follow-up (item 6, "verify docker rmi <new-id> end to end"):
+        // Apple's `image delete <ref>` only ever resolves a *reference*, never a bare digest of any
+        // kind (see RuntimeReferenceFor's own doc comment) -- so what actually has to keep working
+        // here is that `docker rmi <id>`, typed as `docker images -q` now prints it (the
+        // content-addressed config digest), still resolves to the right image and deletes it through
+        // its real tag. It does: FindImageDetailAsync already matches a request by Id (full or
+        // prefix), and RuntimeReferenceFor always prefers a real reference over the id once the image
+        // is found -- this exercises that whole path together rather than each half in isolation.
+        var (manager, runtime) = CreateManager();
+        var configDigest = "sha256:" + new string('c', 64);
+        var indexDigest = "sha256:" + new string('i', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = configDigest,
+            IndexDigests = [indexDigest],
+            References = ["rmi-by-id-check:v1"],
+            Size = 1_000,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        var items = await manager.RemoveAsync(configDigest, force: false, noPrune: false, CancellationToken.None);
+
+        Assert.Contains(items, i => i.Deleted == configDigest);
+        var delete = Assert.Single(runtime.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
+        Assert.Contains("rmi-by-id-check:v1", delete, StringComparison.Ordinal);
+
+        var ex = await Assert.ThrowsAsync<DockerApiException>(
+            () => manager.InspectAsync(configDigest, CancellationToken.None));
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, ex.Status);
+    }
+
+    [Fact]
+    public async Task PruneAsync_ImageBoundToARunningContainerOnlyByDigest_IsNotDeleted()
+    {
+        // cider-ger.19 orchestrator follow-up (item b, the regression this task most needed a test
+        // for): RuntimeImage.Id is now the content-addressed config digest, but a container's own
+        // RuntimeContainer.ImageDigest is still whatever raw digest the engine handed it at creation
+        // time -- Apple's index digest on both the CLI and XPC transports -- which no longer equals
+        // Id. Seeded here exactly like AppleContainerRuntime/XpcContainerRuntime now report it:
+        // IndexDigests carries the raw value, distinct from Id. The container's own ImageReference
+        // deliberately does not name the image at all, so the *only* thing that can recognize it as
+        // in-use is the digest join -- before this fix, PruneAsync's `usedIds` set was built from
+        // container.ImageDigest and checked only against image.Id, which never matched again once Id
+        // stopped being the raw digest, so `docker image prune -a` would have deleted an image still
+        // backing this running container.
+        var (manager, runtime) = CreateManager();
+        var configDigest = "sha256:" + new string('c', 64);
+        var indexDigest = "sha256:" + new string('i', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = configDigest,
+            IndexDigests = [indexDigest],
+            References = ["digest-only:v1"],
+            Size = 1_000,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+        runtime.SeedContainer(new RuntimeContainer
+        {
+            RuntimeId = "web1",
+            State = RuntimeContainerState.Running,
+            ImageReference = "",
+            ImageDigest = indexDigest,
+        });
+
+        // dangling=false (docker image prune -a) so the candidate set includes tagged images too --
+        // otherwise the in-use join is never even reached for a tagged image.
+        var response = await manager.PruneAsync(Filters.Parse("""{"dangling":["false"]}"""), CancellationToken.None);
+
+        Assert.DoesNotContain(response.ImagesDeleted, i => i.Deleted == configDigest);
+        var inspect = await manager.InspectAsync("digest-only:v1", CancellationToken.None);
+        Assert.Equal(configDigest, inspect.Id);
+    }
+
+    [Fact]
+    public async Task RemoveAsync_ImageBoundToARunningContainerOnlyByDigest_WithoutForce_Throws409()
+    {
+        // The rmi in-use guard shares IsBoundTo with PruneAsync (previous test) -- exercised here too
+        // since ThrowIfUsedByRunningContainerAsync used to have its own reference-based fallback that
+        // could mask this exact join bug; ImageReference is left empty specifically to rule that
+        // fallback out and isolate the digest path.
+        var (manager, runtime) = CreateManager();
+        var configDigest = "sha256:" + new string('c', 64);
+        var indexDigest = "sha256:" + new string('i', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = configDigest,
+            IndexDigests = [indexDigest],
+            References = ["digest-only:v2"],
+            Size = 1_000,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+        runtime.SeedContainer(new RuntimeContainer
+        {
+            RuntimeId = "web2",
+            State = RuntimeContainerState.Running,
+            ImageReference = "",
+            ImageDigest = indexDigest,
+        });
+
+        var ex = await Assert.ThrowsAsync<DockerApiException>(
+            () => manager.RemoveAsync("digest-only:v2", force: false, noPrune: false, CancellationToken.None));
+
+        Assert.Equal(System.Net.HttpStatusCode.Conflict, ex.Status);
+        Assert.Contains("web2", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

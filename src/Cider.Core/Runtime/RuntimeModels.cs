@@ -57,6 +57,19 @@ public record RuntimeImage
     public DateTimeOffset? Created { get; init; }
     public IReadOnlyList<string> Platforms { get; init; } = [];
     public IReadOnlyDictionary<string, string> Labels { get; init; } = new Dictionary<string, string>();
+
+    /// <summary>
+    /// Every raw index/manifest digest Apple's own image store has assigned this content across
+    /// separate loads or pulls of the same reference (cider-ger.19: <see cref="Id"/> is instead the
+    /// content-addressed config digest, stable across reloads of byte-identical content, which Apple's
+    /// own <c>id</c> is not). A container is bound at creation time to whichever of these Apple handed
+    /// it back as <c>configuration.image.descriptor.digest</c>, and that binding never changes even if
+    /// the image is later reloaded under the same tag — so this is what lets
+    /// <c>ImageManager</c>'s rmi in-use guard and prune's used-image set still recognize a running
+    /// container's image now that <see cref="Id"/> no longer equals the raw digest the container
+    /// itself carries. Empty when the engine could not report one.
+    /// </summary>
+    public IReadOnlyList<string> IndexDigests { get; init; } = [];
 }
 
 /// <summary>An image plus the configuration needed to derive container defaults.</summary>

@@ -417,8 +417,7 @@ public sealed class ImageManager
         var containers = await _runtime.ListContainersAsync(ct).ConfigureAwait(false);
         var blocker = containers.FirstOrDefault(c =>
             c.State is RuntimeContainerState.Running or RuntimeContainerState.Stopping &&
-            (string.Equals(c.ImageDigest, image.Id, StringComparison.Ordinal) ||
-             ReferencesImage(c.ImageReference, image)));
+            IsBoundTo(c, image));
 
         if (blocker is null)
         {
@@ -738,7 +737,6 @@ public sealed class ImageManager
 
         var images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
         var containers = await _runtime.ListContainersAsync(ct).ConfigureAwait(false);
-        var usedIds = containers.Select(c => c.ImageDigest).Where(d => d is not null).ToHashSet(StringComparer.Ordinal)!;
 
         var deleted = new List<ImageDeleteResponseItem>();
         long space = 0;
@@ -749,7 +747,13 @@ public sealed class ImageManager
                 continue;
             }
 
-            if (usedIds.Contains(image.Id))
+            // IsBoundTo, not a raw c.ImageDigest/image.Id set lookup (cider-ger.19 orchestrator
+            // follow-up): image.Id is now the content-addressed config digest, but a container's own
+            // ImageDigest is still whatever raw digest the engine handed it at creation time (the index
+            // digest on the Apple transports) — a plain set-membership check against image.Id alone
+            // went stale for every image once that changed, and let `docker image prune -a` delete an
+            // image still backing a running container. See IsBoundTo's own doc comment.
+            if (containers.Any(c => IsBoundTo(c, image)))
             {
                 continue;
             }
@@ -1325,12 +1329,24 @@ public sealed class ImageManager
         Labels = new Dictionary<string, string>(image.Labels),
     };
 
+    /// <summary>
+    /// Docker's <c>RepoDigests</c> names the manifest digest the reference actually resolves to, not
+    /// the image id — before cider-ger.19 those happened to be the same value (Apple's raw index
+    /// digest, which is what <c>image.Id</c> used to be), so keying off <c>image.Id</c> here read as
+    /// correct by coincidence. Now that <c>image.Id</c> is the content-addressed config digest instead
+    /// (stable across reloads, but not a digest a registry would ever hand back for a pull/push of this
+    /// reference), this prefers <see cref="RuntimeImage.IndexDigests"/> — the raw digest(s) the engine
+    /// actually associates with the reference — falling back to <c>image.Id</c> only when the engine
+    /// reported none (orchestrator follow-up item 3: reconcile, not revert, since <c>image.Id</c> is
+    /// still a better fallback than nothing).
+    /// </summary>
     private static List<string> BuildRepoDigests(RuntimeImage image)
     {
+        var digest = image.IndexDigests.Count > 0 ? image.IndexDigests[0] : image.Id;
         var names = VisibleReferences(image.References)
             .Select(r => ImageReference.Parse(r).Normalize().Name)
             .Distinct(StringComparer.Ordinal);
-        return names.Select(name => $"{name}@{image.Id}").ToList();
+        return names.Select(name => $"{name}@{digest}").ToList();
     }
 
     private static ImageInspectResponse ToInspectResponse(RuntimeImageDetail detail) => new()
@@ -1414,7 +1430,7 @@ public sealed class ImageManager
         return $"[{bar}] {current}B/{total}B";
     }
 
-    private static bool ReferencesImage(string imageReference, RuntimeImageDetail image)
+    private static bool ReferencesImage(string imageReference, RuntimeImage image)
     {
         if (string.IsNullOrEmpty(imageReference))
         {
@@ -1433,6 +1449,35 @@ public sealed class ImageManager
 
         var familiar = parsed.Normalize().Familiar();
         return image.References.Any(r => ImageReference.TryParse(r, out var rp) && string.Equals(rp.Normalize().Familiar(), familiar, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Whether a container is using this image — the shared test both the rmi in-use guard
+    /// (<see cref="ThrowIfUsedByRunningContainerAsync"/>) and <see cref="PruneAsync"/> apply, so a
+    /// running container is recognized the same way in both places (cider-ger.19 orchestrator
+    /// follow-up: before this, prune's own join only compared <see cref="RuntimeContainer.ImageDigest"/>
+    /// against <see cref="RuntimeImage.Id"/> with no reference fallback at all — once <c>Id</c> became
+    /// the content-addressed config digest instead of Apple's raw index digest, that join went stale
+    /// for every image, and <c>docker image prune -a</c> could delete an image still backing a running
+    /// container). <paramref name="container"/>.ImageDigest is the raw digest Apple handed the
+    /// container at creation time (still the index digest on the Apple transports — see
+    /// <see cref="RuntimeContainer.ImageDigest"/>'s own callers), so it is checked against both
+    /// <see cref="RuntimeImage.Id"/> (equal only if the engine ever reports the config digest there
+    /// too) and <see cref="RuntimeImage.IndexDigests"/> (the value that actually matches on the Apple
+    /// transports), before falling back to matching the container's own image *reference* against the
+    /// image's tags/id — the same fallback the rmi guard always had, for a container whose digest was
+    /// never captured at all.
+    /// </summary>
+    private static bool IsBoundTo(RuntimeContainer container, RuntimeImage image)
+    {
+        if (!string.IsNullOrEmpty(container.ImageDigest) &&
+            (string.Equals(container.ImageDigest, image.Id, StringComparison.Ordinal) ||
+             image.IndexDigests.Contains(container.ImageDigest, StringComparer.Ordinal)))
+        {
+            return true;
+        }
+
+        return ReferencesImage(container.ImageReference, image);
     }
 
     private static string? TryNormalizedTag(string reference)
@@ -1460,9 +1505,16 @@ public sealed class ImageManager
 
     /// <summary>
     /// The string Apple <c>container image tag|save|delete</c> can actually resolve. Those verbs
-    /// only take a *reference*: handed a <c>sha256:…</c> id they fail with
-    /// "image with reference sha256:…", so the caller's own reference (when it names this image) or
-    /// the image's first known reference is used instead, and the id is only a last resort.
+    /// only take a *reference*: handed a <c>sha256:…</c> id — of *any* kind, Apple's own raw digest
+    /// included, not just cider's — they fail with "image with reference sha256:… not found", so the
+    /// caller's own reference (when it names this image) or the image's first known reference is
+    /// used instead, and a bare id is only a last resort for an image with no reference at all
+    /// (verified: cider-ger.19 orchestrator follow-up item 6 asked whether switching <c>image.Id</c>
+    /// from Apple's raw index digest to the content-addressed config digest broke this fallback —
+    /// it did not, because Apple already refused a bare digest reference of *either* kind before this
+    /// task; that limitation is pre-existing and unrelated, covered by every locally built image
+    /// always carrying at least a synthetic tag (<see cref="SyntheticBuildTag"/>), so this fallback
+    /// in practice is never actually asked to resolve one against the real engine).
     /// </summary>
     private static string RuntimeReferenceFor(RuntimeImage image, string requested)
     {

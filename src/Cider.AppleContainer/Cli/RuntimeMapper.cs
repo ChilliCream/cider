@@ -228,7 +228,17 @@ internal static class RuntimeMapper
                 continue;
             }
 
-            merged[index] = merged[index] with { References = MergeReferences(merged[index].References, image.References) };
+            merged[index] = merged[index] with
+            {
+                References = MergeReferences(merged[index].References, image.References),
+
+                // Two rows can share a config-digest Id (this method's grouping key) while carrying
+                // *different* raw index digests — exactly the cider-ger.19 case of the same content
+                // loaded twice, each load getting its own fresh Apple index id. Union both onto the
+                // merged image so a container still bound to either raw digest is still recognized as
+                // using it (ImageManager's rmi in-use guard / prune's used-image set).
+                IndexDigests = MergeReferences(merged[index].IndexDigests, image.IndexDigests),
+            };
         }
 
         return merged;
@@ -269,9 +279,10 @@ internal static class RuntimeMapper
         }
 
         var preferred = PickVariant(json, null);
+        var indexDigest = ToImageId(json.Id);
         return new RuntimeImage
         {
-            Id = ToImageId(json.Id),
+            Id = string.IsNullOrEmpty(json.ContentAddressedId) ? indexDigest : json.ContentAddressedId,
             References = References(json),
             Size = size,
             Created = preferred?.Config?.Created ?? json.Configuration?.CreationDate,
@@ -279,6 +290,7 @@ internal static class RuntimeMapper
             Labels = preferred?.Config?.Config?.Labels is { Count: > 0 } labels
                 ? new Dictionary<string, string>(labels, StringComparer.Ordinal)
                 : EmptyLabels,
+            IndexDigests = indexDigest.Length > 0 ? [indexDigest] : [],
         };
     }
 
@@ -298,6 +310,7 @@ internal static class RuntimeMapper
         {
             Id = summary.Id,
             References = summary.References,
+            IndexDigests = summary.IndexDigests,
             Size = variant.Size ?? summary.Size,
             Created = document?.Created ?? summary.Created,
             Platforms = summary.Platforms,

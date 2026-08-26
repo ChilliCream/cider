@@ -31,9 +31,19 @@ internal sealed partial class XpcContainerRuntime
 {
     // ---- images: read paths (list/inspect) ------------------------------------------------------
 
-    /// <summary><c>imageList</c>, grouped by index digest — one <see cref="RuntimeImage"/> per digest,
+    /// <summary>
+    /// <c>imageList</c>, grouped by raw index digest — one <see cref="RuntimeImage"/> per digest,
     /// references unioned (task fix direction §1: "same semantics as <c>RuntimeMapper.ToImages</c>",
-    /// which does the identical merge for the CLI transport's one-row-per-reference output).</summary>
+    /// which does the identical merge for the CLI transport's one-row-per-reference output).
+    /// <see cref="RuntimeImage.Id"/> is then derived from that group's own content, not the raw index
+    /// digest used to group it (see <see cref="ToRuntimeImage"/>) — unlike the CLI transport, this does
+    /// not additionally re-merge groups that turn out to share one content id after that derivation
+    /// (e.g. two tags loaded separately from byte-identical content, each getting its own fresh Apple
+    /// index digest): each stays its own list row here, with its own <see cref="RuntimeImage.Id"/> that
+    /// happens to equal the other's. cider-ger.19's own regression (the same tag reloaded twice) never
+    /// hits this, since reloading one reference replaces its single <c>imageList</c> row in place
+    /// rather than adding a second one.
+    /// </summary>
     public Task<IReadOnlyList<RuntimeImage>> ListImagesAsync(CancellationToken ct) => GuardAsync(() =>
         XpcReadAsync(
             "imageList",
@@ -313,6 +323,19 @@ internal sealed partial class XpcContainerRuntime
     /// Created/Labels come from the preferred (host, else first) variant's config — the same "one
     /// representative variant" choice <c>RuntimeMapper.ToImage</c> makes via its own
     /// <c>PickVariant(json, null)</c>.
+    ///
+    /// <see cref="RuntimeImage.Id"/> is the preferred variant's manifest <c>config.digest</c>, not
+    /// <paramref name="digest"/> (the group's raw index digest) — the same content-addressed
+    /// derivation <c>AppleContainerRuntime.RecoverContentAddressedIdsAsync</c> applies on the CLI
+    /// transport (cider-ger.19 orchestrator follow-up: this path was still reporting Apple's unstable
+    /// index digest, so it alone kept the default XPC install failing compat scenario 6 even after the
+    /// CLI-only fix). No extra blob read is needed here: <paramref name="manifests"/> was already
+    /// loaded by <see cref="LoadBlobsAsync"/> to build <paramref name="configs"/>, so this just reads
+    /// the digest already in hand. Falls back to the index digest when the preferred variant's
+    /// manifest was not resolved (store miss), same best-effort contract as the CLI transport.
+    /// <paramref name="digest"/> itself is preserved on <see cref="RuntimeImage.IndexDigests"/> so a
+    /// container still bound to it (<c>configuration.image.descriptor.digest</c> at creation time)
+    /// stays recognized as using this image even after <see cref="RuntimeImage.Id"/> stops matching it.
     /// </summary>
     internal static RuntimeImage ToRuntimeImage(
         IReadOnlyList<string> references,
@@ -335,10 +358,14 @@ internal sealed partial class XpcContainerRuntime
 
         var preferred = PickVariant(variants, null);
         var config = PreferredConfig(preferred, manifests, configs);
+        var indexDigest = RuntimeMapper.ToImageId(digest);
+        var contentId = preferred?.Digest is { Length: > 0 } preferredDigest && manifests.TryGetValue(preferredDigest, out var preferredManifest)
+            ? preferredManifest.Config?.Digest
+            : null;
 
         return new RuntimeImage
         {
-            Id = RuntimeMapper.ToImageId(digest),
+            Id = string.IsNullOrEmpty(contentId) ? indexDigest : contentId,
             References = references,
             Size = size,
             Created = config?.Created,
@@ -346,6 +373,7 @@ internal sealed partial class XpcContainerRuntime
             Labels = config?.Config?.Labels is { Count: > 0 } labels
                 ? new Dictionary<string, string>(labels, StringComparer.Ordinal)
                 : EmptyLabels,
+            IndexDigests = indexDigest.Length > 0 ? [indexDigest] : [],
         };
     }
 
@@ -380,6 +408,7 @@ internal sealed partial class XpcContainerRuntime
         {
             Id = summary.Id,
             References = summary.References,
+            IndexDigests = summary.IndexDigests,
             Size = VariantSize(variant, manifests),
             Created = config?.Created ?? summary.Created,
             Platforms = summary.Platforms,
