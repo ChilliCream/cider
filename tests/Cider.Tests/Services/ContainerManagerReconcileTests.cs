@@ -145,4 +145,68 @@ public sealed class ContainerManagerReconcileTests
         var listed = await harness.Containers.ListAsync(all: true, null, false, Filters.Empty, default);
         Assert.Contains(listed, c => string.Equals(c.Names.FirstOrDefault()?.TrimStart('/'), "web", StringComparison.Ordinal));
     }
+
+    /// <summary>
+    /// cider-ede.29: an adopted container carries the engine's raw (index) digest in
+    /// <see cref="RuntimeContainer.ImageDigest"/> — not the content-addressed config digest
+    /// <c>docker images</c> reports as the image's id since cider-ger.19. Adoption must resolve that
+    /// raw digest to the matching <see cref="RuntimeImage.Id"/> via <see cref="RuntimeImage.IndexDigests"/>
+    /// so <c>docker inspect</c>'s <c>.Image</c> agrees with <c>docker images -q</c>.
+    /// </summary>
+    [Fact]
+    public async Task Reconcile_resolves_an_adopted_containers_image_digest_to_the_images_config_digest_id()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        const string configDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const string rawIndexDigest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        harness.Runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = configDigest,
+            References = ["docker.io/library/alpine:latest"],
+            IndexDigests = [rawIndexDigest],
+        });
+        harness.Runtime.SeedContainer(new RuntimeContainer
+        {
+            RuntimeId = "web",
+            State = RuntimeContainerState.Running,
+            ImageReference = "docker.io/library/alpine:latest",
+            ImageDigest = rawIndexDigest,
+            Argv = ["sh"],
+        });
+
+        await harness.Containers.ReconcileAsync(default);
+
+        var record = Assert.Single(harness.Store.GetAll());
+        Assert.Equal(configDigest, record.ImageId);
+
+        var inspected = await harness.Containers.InspectAsync(record.Id, size: false, default);
+        Assert.Equal(configDigest, inspected.Image);
+    }
+
+    /// <summary>
+    /// cider-ede.29: when the adopted container's image cannot be resolved (deleted underneath a
+    /// running container, or the store cannot be listed), adoption must keep the raw engine digest
+    /// rather than losing it to an empty string, and must not fail the adoption itself.
+    /// </summary>
+    [Fact]
+    public async Task Reconcile_keeps_the_raw_engine_digest_when_the_adopted_containers_image_is_not_resolvable()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        const string unresolvableDigest = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        harness.Runtime.SeedContainer(new RuntimeContainer
+        {
+            RuntimeId = "web",
+            State = RuntimeContainerState.Running,
+            ImageReference = "docker.io/library/alpine:latest",
+            ImageDigest = unresolvableDigest,
+            Argv = ["sh"],
+        });
+
+        await harness.Containers.ReconcileAsync(default);
+
+        var record = Assert.Single(harness.Store.GetAll());
+        Assert.Equal(unresolvableDigest, record.ImageId);
+    }
 }

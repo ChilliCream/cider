@@ -138,7 +138,7 @@ public sealed class StateSynchronizer
                 continue;
             }
 
-            var adopted = _containers.AdoptContainer(runtimeContainer);
+            var adopted = await _containers.AdoptContainerAsync(runtimeContainer, ct).ConfigureAwait(false);
             report.Containers.Adopted.Add(adopted.Name);
         }
 

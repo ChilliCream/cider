@@ -151,7 +151,7 @@ public sealed partial class ContainerManager
                 continue;
             }
 
-            AdoptContainer(runtimeContainer);
+            await AdoptContainerAsync(runtimeContainer, ct);
         }
 
         // In proxy mode the host-side listeners live in this process and died with the last one, so
@@ -205,7 +205,7 @@ public sealed partial class ContainerManager
     /// <see cref="StateSynchronizer"/>. The caller is expected to have already checked that no
     /// existing record claims <paramref name="runtimeContainer"/>'s <see cref="RuntimeContainer.RuntimeId"/>.
     /// </summary>
-    internal ContainerRecord AdoptContainer(RuntimeContainer runtimeContainer)
+    internal async Task<ContainerRecord> AdoptContainerAsync(RuntimeContainer runtimeContainer, CancellationToken ct)
     {
         var dockerId = ContainerIdentity.ReadDockerId(runtimeContainer.Labels) ?? DockerId.New();
         var name = ContainerIdentity.ReadDockerName(runtimeContainer.Labels) ?? runtimeContainer.RuntimeId;
@@ -226,7 +226,7 @@ public sealed partial class ContainerManager
                 Labels = new Dictionary<string, string>(runtimeContainer.Labels, StringComparer.Ordinal),
             },
             ImageRef = runtimeContainer.ImageReference,
-            ImageId = runtimeContainer.ImageDigest ?? "",
+            ImageId = await ResolveAdoptedImageIdAsync(runtimeContainer, ct),
             Path = argv.Count > 0 ? argv[0] : "",
             Args = argv.Count > 1 ? [.. argv.Skip(1)] : [],
             Managed = ContainerIdentity.ReadDockerId(runtimeContainer.Labels) is not null,
@@ -241,6 +241,45 @@ public sealed partial class ContainerManager
         Persist(record);
         GetHandle(dockerId);
         return record;
+    }
+
+    /// <summary>
+    /// cider-ede.29: <paramref name="runtimeContainer"/>.ImageDigest is the raw digest Apple's engine
+    /// reports for an adopted container — the *index* digest on both Apple transports, not the
+    /// content-addressed config digest that <see cref="RuntimeImage.Id"/> has been since cider-ger.19
+    /// (and that a container created through <c>ContainerManager.CreateAsync</c> stores directly as
+    /// <c>image.Id</c>). Docker's contract is that a container's <c>Image</c> IS the id
+    /// <c>docker images</c> shows, so this resolves the engine digest to that id the same way
+    /// <c>ImageManager</c>'s own <c>IsBoundTo</c> in-use guard matches a container to its image: by
+    /// checking <see cref="RuntimeImage.IndexDigests"/> (falling back to a direct <see cref="RuntimeImage.Id"/>
+    /// equality, in case the engine ever reports the config digest there too). When no image matches —
+    /// deleted underneath a running container, or the store could not be listed — this keeps the raw
+    /// engine digest rather than losing it to an empty string, and never lets the lookup fail adoption.
+    /// </summary>
+    private async Task<string> ResolveAdoptedImageIdAsync(RuntimeContainer runtimeContainer, CancellationToken ct)
+    {
+        var digest = runtimeContainer.ImageDigest;
+        if (string.IsNullOrEmpty(digest))
+        {
+            return "";
+        }
+
+        IReadOnlyList<RuntimeImage> images;
+        try
+        {
+            images = await _runtime.ListImagesAsync(ct);
+        }
+        catch (RuntimeException ex)
+        {
+            _logger.LogDebug(ex, "could not list images to resolve the adopted image id for {Container}; keeping the raw engine digest", runtimeContainer.RuntimeId);
+            return digest;
+        }
+
+        var match = images.FirstOrDefault(image =>
+            string.Equals(image.Id, digest, StringComparison.Ordinal) ||
+            image.IndexDigests.Contains(digest, StringComparer.Ordinal));
+
+        return match?.Id ?? digest;
     }
 
     /// <summary>
