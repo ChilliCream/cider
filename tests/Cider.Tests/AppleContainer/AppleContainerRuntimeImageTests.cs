@@ -113,6 +113,35 @@ public sealed class AppleContainerRuntimeImageTests
         Assert.Equal(2, events.Count);
     }
 
+    [Fact]
+    public async Task BuildImageAsync_WithNoTags_MintsAnAlreadyNormalizedSyntheticTag()
+    {
+        // cider-imz: an untagged classic build's synthetic `cider-build-<uuid>` tag has to be minted
+        // *already* normalized (`docker.io/library/cider-build-<uuid>:latest`), exactly like every
+        // other locally-created image's reference (ImageManager.BuildAsync's own `-t` tags,
+        // SolveRewriter's BuildKit-path synthetic tag). Handed the bare `cider-build-<uuid>` instead,
+        // Apple's CLI stores the image under that literal bare name, while ImageManager's
+        // delete/prune paths always compute their target by normalizing — asking Apple to delete a
+        // `docker.io/library/…` reference it never actually stored. Apple's `imageDelete` then
+        // silently no-ops on the mismatched reference instead of erroring, so `rmi -f`/`prune -f`
+        // both report success while the synthetic tag never actually leaves the store.
+        var (runtime, cli) = CreateRuntime(["#1 [internal] load build definition", ManifestLine], new CliResult(0, "", ""));
+        var events = new List<ProgressEvent>();
+
+        await runtime.BuildImageAsync(
+            new BuildSpec { ContextDir = Path.GetTempPath() },
+            new CollectingProgress(events),
+            CancellationToken.None);
+
+        var args = cli.LastStreamingArgs!;
+        var tIndex = args.ToList().IndexOf("-t");
+        Assert.True(tIndex >= 0, "expected a -t argument");
+        var mintedTag = args[tIndex + 1];
+
+        Assert.StartsWith("docker.io/library/cider-build-", mintedTag, StringComparison.Ordinal);
+        Assert.EndsWith(":latest", mintedTag, StringComparison.Ordinal);
+    }
+
     private static (AppleContainerRuntime Runtime, ScriptedContainerCli Cli) CreateRuntime(
         IReadOnlyList<string> lines,
         CliResult result)
@@ -128,6 +157,14 @@ public sealed class AppleContainerRuntimeImageTests
     {
         public IReadOnlyList<string>? LastArgs { get; private set; }
 
+        /// <summary>
+        /// The args from the last <see cref="RunStreamingAsync"/> call specifically — <see cref="LastArgs"/>
+        /// alone is not enough for a caller that (like <c>BuildImageAsync</c>) makes a streaming call and
+        /// then a follow-up non-streaming one (its best-effort content-addressed id lookup), which would
+        /// otherwise overwrite it before the streaming call's own args can be asserted on.
+        /// </summary>
+        public IReadOnlyList<string>? LastStreamingArgs { get; private set; }
+
         public override Task<CliResult> RunStreamingAsync(
             IReadOnlyList<string> args,
             Action<string, bool> onLine,
@@ -135,6 +172,7 @@ public sealed class AppleContainerRuntimeImageTests
             TimeSpan? timeout = null)
         {
             LastArgs = args;
+            LastStreamingArgs = args;
             foreach (var line in lines)
             {
                 onLine(line, false);

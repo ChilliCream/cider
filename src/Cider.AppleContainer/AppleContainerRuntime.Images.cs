@@ -734,9 +734,21 @@ public sealed partial class AppleContainerRuntime
             await using var write = await _blobSweepGate.EnterImageWriteAsync(ct).ConfigureAwait(false);
 
             // Apple's `-t` default is a random UUID we would not be able to look up afterwards.
+            //
+            // cider-imz: this must be normalized the same way ImageManager.BuildAsync normalizes
+            // every explicit `-t` tag (and SolveRewriter.NormalizeName mints its own synthetic tag
+            // for the BuildKit path) before it ever reaches Apple's CLI. Handed the bare
+            // `cider-build-<uuid>` name, Apple's `container build -t` stores the image under that
+            // exact bare name — but ImageManager's delete/prune paths always compute their target via
+            // ImageReference.Normalize(), which unconditionally rewrites a domain-less single-segment
+            // reference to `docker.io/library/cider-build-<uuid>:latest`. That mismatched reference is
+            // one Apple's own store never held, so `imageDelete` silently no-ops on it: `rmi -f` and
+            // `prune -f` both report success while the synthetic tag never actually leaves the store.
+            // Minting it already-normalized here keeps the mint and every delete path speaking the
+            // same reference, exactly like every other locally-created image already does.
             var tags = spec.Tags.Count > 0
                 ? spec.Tags
-                : (IReadOnlyList<string>)[SyntheticBuildTag.New()];
+                : (IReadOnlyList<string>)[ImageReference.Parse(SyntheticBuildTag.New()).Normalize().ToString()];
 
             var args = ArgBuilder.Build(spec, tags);
 
