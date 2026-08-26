@@ -68,6 +68,13 @@ public sealed class ContainerManagerLifecycleTests
         var record = await harness.RunShellAsync("sleep 5", "web", request =>
             request.Labels = new Dictionary<string, string> { ["com.docker.compose.service"] = "api" });
 
+        // cider-ede.26: DNS/address registration is a detached follow-up now, no longer something
+        // RunShellAsync's underlying StartAsync has necessarily finished by the time it returns —
+        // so this waits for it explicitly instead of assuming it is already done.
+        await ContainerTestHarness.WaitUntilAsync(
+            () => harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "the container's DNS name to be registered");
+
         Assert.True(harness.NameRegistry.TryResolve("bridge", "web", out var ip));
         Assert.StartsWith("192.168.64.", ip.ToString(), StringComparison.Ordinal);
         Assert.True(harness.NameRegistry.TryResolve("bridge", "api", out _));
@@ -93,6 +100,13 @@ public sealed class ContainerManagerLifecycleTests
 
         await harness.Containers.StartAsync(record.Id, default);
 
+        // cider-ede.26: the poll that gets past the delayed attachments now runs detached from
+        // Start's own return, so both the DNS registration and the inspect-call count it takes to
+        // get there are awaited explicitly rather than assumed complete the instant Start returns.
+        await ContainerTestHarness.WaitUntilAsync(
+            () => harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "the container's DNS name to be registered past the delayed attachment");
+
         Assert.True(harness.NameRegistry.TryResolve("bridge", "web", out var ip));
         Assert.StartsWith("192.168.64.", ip.ToString(), StringComparison.Ordinal);
         Assert.Equal(ip.ToString(), record.Networks["bridge"].IPAddress);
@@ -106,7 +120,41 @@ public sealed class ContainerManagerLifecycleTests
     }
 
     [Fact]
-    public async Task Start_returns_within_budget_even_when_the_address_never_shows_up()
+    public async Task Start_returns_immediately_without_waiting_on_the_address_at_all()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        // The old test proved only that Start honored its own (tiny, test-only) budgets — a
+        // loop-bound restatement of the very thing under test. This proves the actual cider-ede.26
+        // claim: Start no longer waits on network registration at all, so it returns fast even with
+        // the *default* NetworkPollInterval/StartReturnBudget/NetworkPollBudget left untouched and
+        // the attachment delayed several poll cycles deep — carrying over cider-ede.18's criterion
+        // that `docker start` returns in <= 200 ms (excluding VM boot; the fake runtime here has
+        // none to exclude). Under the old, inline behaviour this alone would take >= 5 poll
+        // intervals (~1.25 s at the default 250 ms) to resolve before Start could return.
+        var record = await harness.CreateShellAsync("sleep 5", "web");
+        harness.Runtime.DelayNetworkAttachment("web", 5);
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        await harness.Containers.StartAsync(record.Id, default);
+        stopwatch.Stop();
+
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromMilliseconds(200),
+            $"StartAsync took {stopwatch.Elapsed} to return; it must not wait on network registration at all");
+        Assert.True(record.State.Running);
+
+        // Confirms the wait really is still happening, just detached: the address does eventually
+        // resolve once the delayed attachment clears, without anyone calling StartAsync again.
+        await ContainerTestHarness.WaitUntilAsync(
+            () => harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "the container's DNS name to be registered by the detached follow-up");
+
+        await harness.Containers.KillAsync(record.Id, "SIGKILL", default);
+    }
+
+    [Fact]
+    public async Task Start_gives_up_on_the_address_within_budget_when_it_never_shows_up()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();
         harness.Containers.NetworkPollInterval = TimeSpan.FromMilliseconds(10);
@@ -114,15 +162,18 @@ public sealed class ContainerManagerLifecycleTests
         harness.Containers.NetworkPollBudget = TimeSpan.FromMilliseconds(60);
         var record = await harness.CreateShellAsync("sleep 5", "web");
 
-        // Outlives every budget above: Start must give up and return rather than hang on the IP.
+        // 1000 delayed inspects vastly outlives NetworkPollBudget (60 ms / ~6 polls at a 10 ms
+        // interval): the delay never actually clears within the follow-up's own budget, so it must
+        // give up on its own rather than poll forever.
         harness.Runtime.DelayNetworkAttachment("web", 1000);
 
-        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         await harness.Containers.StartAsync(record.Id, default);
-        stopwatch.Stop();
-
-        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2), $"StartAsync took {stopwatch.Elapsed}");
         Assert.True(record.State.Running);
+
+        // The detached follow-up gives up on the address after NetworkPollBudget; give it
+        // comfortable headroom past that and confirm it really did stop rather than eventually
+        // succeed.
+        await Task.Delay(TimeSpan.FromMilliseconds(300));
         Assert.False(harness.NameRegistry.TryResolve("bridge", "web", out _));
 
         await harness.Containers.KillAsync(record.Id, "SIGKILL", default);

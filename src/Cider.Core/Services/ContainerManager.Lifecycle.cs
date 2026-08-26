@@ -26,8 +26,13 @@ public sealed partial class ContainerManager
     /// part that runs after <see cref="StartAsync"/> has already returned to its caller).</summary>
     public TimeSpan NetworkPollBudget { get; set; } = TimeSpan.FromSeconds(10);
 
-    /// <summary>How long <see cref="StartAsync"/> itself will wait for an address once the runtime
-    /// confirms the container is running, before returning and leaving the rest to <see cref="StatePoller"/>.</summary>
+    /// <summary>Once the detached post-start network registration (see
+    /// <see cref="AwaitStartupAndRegisterNetworkNamesAsync"/>, launched from <see cref="StartAsync"/>
+    /// but no longer part of its return path — cider-ede.26) has the runtime's confirmation that the
+    /// container is running, how much longer it keeps polling for an address before giving up early
+    /// and leaving the rest to <see cref="StatePoller"/>. Shorter than <see cref="NetworkPollBudget"/>
+    /// so a container that is running but whose address is stuck doesn't poll as long as one that's
+    /// still booting.</summary>
     public TimeSpan StartReturnBudget { get; set; } = TimeSpan.FromSeconds(3);
 
     /// <summary><c>POST /containers/{id}/start</c>; 304 when the container already runs.</summary>
@@ -120,11 +125,9 @@ public sealed partial class ContainerManager
             // StartReturnBudget past that) got a bare "connection refused" instead of anything
             // queuing. The listener is already accepting by the time that wait even starts now;
             // TcpPortForwarder holds each accepted connection until EnsurePublishedPortsAsync
-            // resolves the backend address (the second call below, once it is found — or a later
-            // poller/refresh tick, if it is not, in time) instead of failing it.
+            // resolves the backend address (the detached follow-up below, once it is found — or a
+            // later poller/refresh tick, if it is not, in time) instead of failing it.
             await EnsurePublishedPortsAsync(record, ct);
-
-            await AwaitStartupAndRegisterNetworkNamesAsync(record, process, ct);
 
             // Everything `docker cp`'d into the container while it was not running goes in here,
             // with the gate still held and before this call returns, so the client that started it
@@ -133,10 +136,35 @@ public sealed partial class ContainerManager
             // `container cp` refuses a container that is not running.
             await FlushStagedArchivesAsync(record, ct);
 
-            await EnsurePublishedPortsAsync(record, ct);
-
             Publish(record, "start");
             RaiseStateChanged(record, "start");
+
+            // cider-ede.26: network name registration/DNS (and the address-aware port republish
+            // that follows once an address is found) are the one piece of start's old work that
+            // has nothing to do with the answer the caller is waiting on — Docker semantics say
+            // `start` returns once the process is running, not once every side effect has settled
+            // (cider-ede.18's own criterion: `docker start` returns in <= 200 ms on XPC, excluding
+            // VM boot). This used to run inline here, so a container whose address Apple was slow
+            // to attach — the very case AwaitStartupAndRegisterNetworkNamesAsync polls through —
+            // kept the caller waiting for up to StartReturnBudget on top of the VM boot it had
+            // already waited out. Detached on purpose, the same way HandleExitAsync's auto-remove
+            // below is: CancellationToken.None throughout because the request's own `ct` is scoped
+            // to the call that has already returned to its caller by the time this runs, and must
+            // not cancel a poll that legitimately continues past it. StatePoller's
+            // RefreshNetworkInfoAsync/EnsurePublishedPortsAsync (PollOnceAsync) are the safety net
+            // once this task's own budget (NetworkPollBudget/StartReturnBudget) runs out first.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await AwaitStartupAndRegisterNetworkNamesAsync(record, process, CancellationToken.None);
+                    await EnsurePublishedPortsAsync(record, CancellationToken.None);
+                }
+                catch (Exception ex) when (ex is RuntimeException or IOException)
+                {
+                    _logger.LogDebug(ex, "post-start network registration failed for container {Container}", record.Id);
+                }
+            }, CancellationToken.None);
         }
         finally
         {

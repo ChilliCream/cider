@@ -448,6 +448,13 @@ public sealed class NetworkManagerTests
         await harness.Containers.StartAsync(created.Id, CancellationToken.None);
 
         var record = await harness.Containers.ResolveAsync(created.Id, CancellationToken.None);
+
+        // cider-ede.26: address registration is a detached follow-up of Start now, no longer
+        // something guaranteed complete by the time it returns, so this waits for it explicitly.
+        await ContainerTestHarness.WaitUntilAsync(
+            () => record.Networks.Values.All(endpoint => !string.IsNullOrEmpty(endpoint.IPAddress)),
+            "every endpoint to have an address");
+
         Assert.All(
             record.Networks.Values,
             endpoint => Assert.False(string.IsNullOrEmpty(endpoint.IPAddress), "every endpoint has an address"));

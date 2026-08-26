@@ -344,20 +344,27 @@ public sealed partial class ContainerManager
     }
 
     /// <summary>
-    /// Polled right after <see cref="StartAsync"/> starts the runtime process: on Apple container
-    /// 1.2.2, <c>container inspect</c> reports <c>status.networks: []</c> for the first ~1-2 s after
-    /// start, so a single inspect (the old behaviour) usually finds no address at all and the
-    /// container's DNS name/IP never gets registered. This polls every <see cref="NetworkPollInterval"/>
-    /// until the runtime reports the container <c>Running</c> and (when it has declared networks) at
-    /// least one attachment has an address, up to <see cref="NetworkPollBudget"/> total, and gives up
-    /// early if the held process has already exited.
+    /// Launched detached, right after <see cref="StartAsync"/> has already returned to its caller
+    /// (cider-ede.26 — it used to run inline, on <see cref="StartAsync"/>'s own return path): on
+    /// Apple container 1.2.2, <c>container inspect</c> reports <c>status.networks: []</c> for the
+    /// first ~1-2 s after start, so a single inspect (the old behaviour, before cider-ede.7) usually
+    /// finds no address at all and the container's DNS name/IP never gets registered. This polls
+    /// every <see cref="NetworkPollInterval"/> until the runtime reports the container
+    /// <c>Running</c> and (when it has declared networks) at least one attachment has an address, up
+    /// to <see cref="NetworkPollBudget"/> total, and gives up early if the held process has already
+    /// exited.
     /// </summary>
     /// <remarks>
-    /// Only blocks the caller (<see cref="StartAsync"/>) up to <see cref="StartReturnBudget"/> once
-    /// <c>Running</c> is confirmed: Docker semantics say <c>start</c> returns once the process is
-    /// running, not once every side effect has settled. If the address is still missing after that,
-    /// this returns anyway and <see cref="RefreshNetworkInfoAsync"/> (called from
-    /// <see cref="StatePoller"/>) finishes the job on a later tick.
+    /// Does not block <see cref="StartAsync"/>'s caller at all any more: Docker semantics say
+    /// <c>start</c> returns once the process is running, not once every side effect has settled, and
+    /// waiting on an address here used to cost every caller up to <see cref="StartReturnBudget"/> on
+    /// top of the VM boot <see cref="StartAsync"/> already waits out (cider-ede.18's own criterion —
+    /// <c>docker start</c> returns in &lt;= 200 ms on XPC, excluding VM boot — was neither implemented
+    /// nor verified while this call sat on the return path). Once <c>Running</c> is confirmed it still
+    /// gives itself only <see cref="StartReturnBudget"/> more before giving up on the address
+    /// specifically, so a container whose address never resolves does not poll for the full
+    /// <see cref="NetworkPollBudget"/>; either way, <see cref="RefreshNetworkInfoAsync"/> (called from
+    /// <see cref="StatePoller"/>) finishes the job on a later tick if this gives up first.
     /// </remarks>
     private async Task AwaitStartupAndRegisterNetworkNamesAsync(ContainerRecord record, IContainerProcess process, CancellationToken ct)
     {

@@ -118,6 +118,13 @@ public sealed class ContainerManagerQueryTests
         });
         await harness.Containers.StartAsync(record.Id, default);
 
+        // cider-ede.26: address registration is a detached follow-up of Start now, no longer
+        // something guaranteed complete by the time it returns, so this waits for it explicitly
+        // before inspecting the network settings it fills in.
+        await ContainerTestHarness.WaitUntilAsync(
+            () => harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "the container's DNS name to be registered");
+
         var inspect = await harness.Containers.InspectAsync(record.Id, size: false, default);
 
         Assert.Equal(record.Id, inspect.Id);
