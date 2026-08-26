@@ -299,9 +299,19 @@ public static class Program
             var selection = await RuntimeTransportSelector.SelectAsync(
                 options, NullLoggerFactory.Instance, CancellationToken.None, autoStartServices: false);
             var capabilities = selection.Capabilities;
-            Console.WriteLine(capabilities.Transport == RuntimeTransportKind.Xpc
-                ? $"transport: xpc (apiserver {capabilities.ApiServerVersion!.Semver})"
-                : $"transport: cli" + (capabilities.FallbackReason is { Length: > 0 } reason ? $" ({reason})" : ""));
+            if (capabilities.Transport == RuntimeTransportKind.Xpc)
+            {
+                // Task cider-ede.14: the per-member fallback matrix (FallbackMatrix.cs), so an operator
+                // can see which IContainerRuntime members are still CLI-backed and why, without reading
+                // source.
+                var fallback = FallbackMatrix.ActiveMembers(capabilities);
+                Console.WriteLine($"transport: xpc, apiserver {capabilities.ApiServerVersion!.Semver}, " +
+                                  $"fallback: {(fallback.Count > 0 ? string.Join(", ", fallback) : "none")}");
+            }
+            else
+            {
+                Console.WriteLine("transport: cli" + (capabilities.FallbackReason is { Length: > 0 } reason ? $" ({reason})" : ""));
+            }
         }
         catch (RuntimeException ex)
         {

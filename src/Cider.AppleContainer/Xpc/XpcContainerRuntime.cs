@@ -28,7 +28,10 @@ namespace Cider.AppleContainer.Xpc;
 /// (<c>XpcContainerRuntime.Builder.cs</c>) — <c>StartBuilderAsync</c> stays delegated.
 /// Every other
 /// <see cref="IContainerRuntime"/> member is listed in the <c>// FALLBACK</c> block at the bottom and
-/// delegates straight to the CLI runtime until a later task ports it.
+/// delegates straight to the CLI runtime until a later task ports it. The still-CLI members, and why,
+/// are the documented policy in <see cref="FallbackMatrix"/> (task cider-ede.14) — also printed by the
+/// startup Information log below when <see cref="RuntimeCapabilities.Transport"/> is
+/// <see cref="RuntimeTransportKind.Xpc"/>, and by <c>cider status</c>.
 /// Mapping from the wire models to <c>Cider.Core.Runtime</c> types lives in the sibling
 /// <c>XpcContainerRuntime.Mapping.cs</c> file of this partial class.
 /// </summary>
@@ -133,6 +136,18 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         _imageSnapshotEnsurer = new ImageSnapshotEnsurer(_imagesClient);
         _initImageResolver = new InitImageResolver(options, _imagesClient, logger);
         _dnsDomainResolver = new SystemDnsDomainResolver(options, logger);
+
+        // Task cider-ede.14 fix direction: "add a startup Information log listing fallback members
+        // when the transport is xpc" — the operator-visible half of FallbackMatrix; the other half is
+        // `cider status` (Program.StatusAsync), which calls FallbackMatrix.ActiveMembers itself rather
+        // than reading this log.
+        if (capabilities.Transport == RuntimeTransportKind.Xpc)
+        {
+            _logger.LogInformation(
+                "apple-container transport: xpc (apiserver {Version}); CLI fallback: {Members}",
+                capabilities.ApiServerVersion?.Semver.ToString() ?? "unknown",
+                string.Join(", ", FallbackMatrix.ActiveMembers(capabilities)));
+        }
     }
 
     /// <summary>
@@ -506,11 +521,15 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     }
 
     // ---- FALLBACK -----------------------------------------------------------------------------
-    // Every IContainerRuntime member cider-ede.5 does not port. Each delegates straight to the CLI
-    // runtime — no XPC attempted, no fallback warning (there is nothing to fall back *from*). Listed
-    // explicitly, one line each, so a later task (write paths X6, process model X6, images X10) can
-    // find and remove its own entries here as it ports them, without having to re-audit the whole
-    // interface.
+    // Every IContainerRuntime member this class does not port at all, or ports only conditionally.
+    // Each delegates straight to the CLI runtime — no XPC attempted for these, no fallback warning
+    // (there is nothing to fall back *from*). The three unconditional ones (BuildImageAsync,
+    // LoginAsync, StartBuilderAsync) plus the conditional one (CreateNetworkAsync, ported in
+    // XpcContainerRuntime.Resources.cs, gated by RuntimeCapabilities.NetworkCreate) are the documented
+    // policy in FallbackMatrix (task cider-ede.14: "the code needs one place that states the policy") —
+    // FallbackMatrix.ActiveMembers is what cider status and this constructor's startup log print. This
+    // comment stays as the "which task ported what" map; FallbackMatrix.cs is the "who still falls back
+    // and why" policy.
 
     // CreateContainerAsync/RemoveContainerAsync/StopContainerAsync/KillContainerAsync are ported —
     // see XpcContainerRuntime.Create.cs (task cider-ede.6). OpenLogsAsync is ported — see

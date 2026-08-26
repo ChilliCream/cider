@@ -11,9 +11,15 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Cider.AppleContainer;
 
 /// <summary>
-/// <see cref="IContainerRuntime"/> on top of the Apple <c>container</c> CLI (1.2.x).
-/// Everything the CLI reports is parsed from JSON; failures are classified from stderr text
-/// because the CLI always exits with 1 (docs/apple-container-notes.md §12).
+/// CLI transport — fallback only. <see cref="IContainerRuntime"/> on top of the Apple <c>container</c>
+/// CLI (1.2.x). Everything the CLI reports is parsed from JSON; failures are classified from stderr
+/// text because the CLI always exits with 1 (docs/apple-container-notes.md §12). Two ways a call ends
+/// up here: the whole daemon selected <see cref="Xpc.RuntimeTransportKind.Cli"/> (an explicit
+/// <c>RuntimeTransport=cli</c>, or the version gate rejecting an apiserver older than
+/// <see cref="Xpc.ApiServerVersion.Minimum"/> — <see cref="Xpc.RuntimeTransportSelector"/>), or the
+/// daemon is running <see cref="Xpc.XpcContainerRuntime"/> and one particular member delegates here per
+/// <see cref="Xpc.FallbackMatrix"/> (unconditionally, or a live apiserver failure — task cider-ede.14).
+/// This class never knows which case it is; it is written the same way regardless.
 /// </summary>
 public sealed partial class AppleContainerRuntime : IContainerRuntime
 {

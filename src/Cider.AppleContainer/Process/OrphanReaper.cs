@@ -14,6 +14,16 @@ namespace Cider.AppleContainer.Process;
 /// </summary>
 /// <remarks>
 /// <para>
+/// Kept for legacy children (task cider-ede.14 fix direction: "keep the orphan sweep call") even now
+/// that the XPC transport is primary: a held child is a CLI process — <c>ProcessLauncher</c>/PTY, not
+/// XPC — so it can only ever come from a prior run under <c>RuntimeTransportKind.Cli</c>, or from
+/// <c>XpcContainerRuntime</c>'s own CLI fallback (<c>FallbackMatrix</c>:
+/// <c>BuildImageAsync</c>/<c>LoginAsync</c>/<c>StartBuilderAsync</c>, or a live
+/// <c>CreateNetworkAsync</c>/<c>containerStats</c>/etc. fallback that happened to hold a child). Called
+/// unconditionally at every daemon startup regardless of which transport this run selects —
+/// <c>XpcContainerRuntime.EnsureReadyAsync</c> runs it before ever attempting <c>ping</c>.
+/// </para>
+/// <para>
 /// The discriminator is the parent pid: when a daemon dies, its held children are re-parented to
 /// launchd (ppid 1). A held process whose parent is alive belongs to a live daemon — possibly
 /// another instance on this machine — and is never touched. That makes the sweep safe to run from

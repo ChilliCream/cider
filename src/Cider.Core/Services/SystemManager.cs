@@ -125,9 +125,12 @@ public sealed class SystemManager
             CgroupDriver = "none",
             CgroupVersion = "2",
             DefaultRuntime = "apple-container",
+            // Task cider-ede.14: report which transport is actually serving calls (xpc/cli), not the
+            // CLI binary path — the CLI path leaked here even under the XPC transport, where most
+            // members never touch it at all (docs/spikes/xpc/01-cider-runtime-map.md §6).
             Runtimes = new Dictionary<string, DockerRuntimeInfo>
             {
-                ["apple-container"] = new DockerRuntimeInfo { Path = _options.ContainerCliPath },
+                ["apple-container"] = new DockerRuntimeInfo { Path = _runtime.IsXpcTransport ? "xpc" : "cli" },
             },
             SecurityOptions = [],
             Warnings = [],

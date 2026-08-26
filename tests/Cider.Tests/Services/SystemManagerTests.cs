@@ -244,4 +244,38 @@ public sealed class SystemManagerTests : IDisposable
 
         Assert.Equal("1", ping.BuilderVersion);
     }
+
+    [Fact]
+    public async Task InfoAsync_ReportsCliTransport_WhenRuntimeIsCliBacked()
+    {
+        var (manager, _) = CreateManager();
+
+        var info = await manager.InfoAsync(CancellationToken.None);
+
+        Assert.Equal("cli", info.Runtimes["apple-container"].Path);
+    }
+
+    /// <summary>
+    /// Task cider-ede.14: <c>/info</c> must report which transport is actually serving calls
+    /// (<c>xpc</c>/<c>cli</c>), never the CLI binary path — even though nothing in this fake actually
+    /// runs the CLI, <see cref="FakeContainerRuntime.IsXpcTransport"/> alone must flip the reported
+    /// value (docs/spikes/xpc/01-cider-runtime-map.md §6).
+    /// </summary>
+    [Fact]
+    public async Task InfoAsync_ReportsXpcTransport_WhenRuntimeIsXpcBacked()
+    {
+        var runtime = new FakeContainerRuntime { IsXpcTransport = true };
+        var events = new EventBus();
+        var options = new CiderOptions { DataDir = _tmpDir };
+        var images = new ImageManager(runtime, events, options, NullLogger<ImageManager>.Instance);
+        var volumeStore = new InMemoryRecordStore<Cider.Core.State.VolumeRecord>();
+        var volumes = new VolumeManager(runtime, volumeStore, events, options, NullLogger<VolumeManager>.Instance);
+        var counts = new FakeContainerCounts { Total = 3, Running = 1, Exited = 2 };
+        var engineId = new EngineId(options);
+        var manager = new SystemManager(runtime, counts, images, volumes, options, engineId);
+
+        var info = await manager.InfoAsync(CancellationToken.None);
+
+        Assert.Equal("xpc", info.Runtimes["apple-container"].Path);
+    }
 }
