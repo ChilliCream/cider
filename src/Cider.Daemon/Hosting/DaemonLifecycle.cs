@@ -61,6 +61,20 @@ public sealed class DaemonLifecycle(
             // on the manager), so it is handed over here.
             networks.SetDnsForwarders(_dns);
             await SafeAsync("start the DNS server", () => _dns.StartAsync(cancellationToken));
+
+            // Bootstrapping a network's forwarder is a real Apple container create+start the first
+            // time anything on that network needs DNS (cider-ede.30: ~550-650 ms wall on this box) --
+            // otherwise paid inline, inside DnsForwarderService's per-network gate, by whichever
+            // concurrent containerCreate happens to be first to ask for it, with every other create
+            // on the same network queued behind that same gate. That is what a burst of concurrent
+            // creates against a freshly started daemon (the project's actual use case -- see
+            // cider-ede.30) measured as "8 concurrent creates cost ~125 ms/container": one create ate
+            // the whole bootstrap and the rest waited on it. "bridge" is the always-present default
+            // network (NetworkManager.EnsureDefaultAsync, called above), so it always needs a
+            // forwarder once DNS is on -- paying that cost here, once, before Kestrel takes real
+            // client traffic, keeps it off every create path instead. A non-default network still
+            // pays it lazily on its own first create, same as before.
+            await SafeAsync("warm the default DNS forwarder", () => _dns.EnsureAsync("bridge", cancellationToken));
         }
 
         await SafeAsync("start the state poller", () => poller.StartAsync(cancellationToken));

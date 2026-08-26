@@ -91,12 +91,26 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
 
     /// <summary>
     /// 8 concurrent <c>containerCreate</c> calls consistently took 700-1200 ms wall on this box across
-    /// several runs (2026-08-26) — in the same range the original CLI-driven version of this test
-    /// measured against the real runtime under light load (870.3 ms), so the cost is not primarily
-    /// process-spawn or HTTP-connection overhead; it looks like a real per-container cost that does
-    /// not fully parallelize once several creates are in flight at once. The budget below is set well
-    /// above that observed range rather than trying to characterize it precisely — narrowing it is
-    /// tracked as follow-up work in cider-ede.30, not this ticket's.
+    /// several runs (2026-08-26) before cider-ede.30 traced this: the cost was never the 8 creates
+    /// failing to parallelize — it was <c>DnsForwarderService.EnsureAsync</c>'s per-network gate
+    /// (<c>src/Cider.Daemon/Dns/DnsForwarderService.cs</c>), which every create routes through
+    /// (<c>ContainerManager.CreateAsync</c> → <c>ResolveDnsServersAsync</c>) to get a
+    /// <c>--dns</c> address for the container's network. On a freshly started daemon nothing has
+    /// bootstrapped the default "bridge" network's DNS forwarder container yet, so whichever of the 8
+    /// concurrent creates reaches the gate first pays a real Apple container create+start for that
+    /// forwarder (~550-650 ms measured, <c>containerBootstrap</c> alone ~520-560 ms) while the other 7
+    /// queue behind the same <c>SemaphoreSlim(1,1)</c> gate — a one-time, whole-batch tax that a naive
+    /// "wall / 8" reading misreads as "~125 ms/container that does not parallelize". Confirmed by
+    /// instrumenting a diagnostic copy of this test: an untimed warm-up create before the timed batch
+    /// (which pays the bootstrap itself, off the clock) dropped 8-way wall time from 700-1200 ms to
+    /// 100-250 ms — within reach of the ~100 ms Apple's own CLI does 8 concurrent creates in with no
+    /// cider at all (planner-1, cider-ede.30 comment). <c>DaemonLifecycle.StartAsync</c> now pays this
+    /// bootstrap once, eagerly, right after the DNS server starts and before Kestrel takes real client
+    /// traffic, so the create path never queues behind it. Re-measured post-fix (2026-08-26, same box,
+    /// load average ~30-36, i.e. not idle): 19 runs of this test against a fresh daemon ranged
+    /// 101.5-561.6 ms wall (median ~180 ms, two outliers over 450 ms under momentary extra load from
+    /// other concurrently-running processes on this box) — the budget below keeps ~2x headroom over
+    /// the worst of those.
     /// </summary>
     [XpcOnlyFact]
     public async Task Eight_parallel_creates_of_a_cached_image_finish_within_budget()
@@ -116,9 +130,9 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
             stopwatch.Stop();
 
             Assert.True(
-                stopwatch.Elapsed <= TimeSpan.FromMilliseconds(2500),
+                stopwatch.Elapsed <= TimeSpan.FromMilliseconds(1200),
                 $"{parallelism} parallel containerCreate-over-XPC calls took " +
-                $"{stopwatch.Elapsed.TotalMilliseconds:F1} ms wall (budget 2500 ms)");
+                $"{stopwatch.Elapsed.TotalMilliseconds:F1} ms wall (budget 1200 ms)");
         }
         finally
         {
