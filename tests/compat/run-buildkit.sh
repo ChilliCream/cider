@@ -89,11 +89,13 @@ FROM alpine:3.22
 RUN echo hello > /hello
 CMD ["cat", "/hello"]
 EOF
-if ( cd "$ctx" && docker build -t cider-compat/bk-basic:1 . ) >/dev/null 2>&1 &&
+out=$( { cd "$ctx" && docker build -t cider-compat/bk-basic:1 .; } 2>&1 )
+build_status=$?
+if [[ $build_status -eq 0 ]] &&
    [[ "$(docker run --rm cider-compat/bk-basic:1)" == "hello" ]]; then
   record "basic build, tag, run" PASS
 else
-  record "basic build, tag, run" FAIL
+  record "basic build, tag, run" FAIL "$out"
 fi
 docker rmi -f cider-compat/bk-basic:1 >/dev/null 2>&1 || true
 
@@ -110,11 +112,13 @@ RUN false
 FROM base AS final
 CMD ["cat", "/greeting"]
 EOF
-if ( cd "$ctx" && docker build --build-arg GREETING=hi-target --target final -t cider-compat/bk-target:1 . ) >/dev/null 2>&1 &&
+out=$( { cd "$ctx" && docker build --build-arg GREETING=hi-target --target final -t cider-compat/bk-target:1 .; } 2>&1 )
+build_status=$?
+if [[ $build_status -eq 0 ]] &&
    [[ "$(docker run --rm cider-compat/bk-target:1)" == "hi-target" ]]; then
   record "--build-arg + --target (multi-stage)" PASS
 else
-  record "--build-arg + --target (multi-stage)" FAIL
+  record "--build-arg + --target (multi-stage)" FAIL "$out"
 fi
 docker rmi -f cider-compat/bk-target:1 >/dev/null 2>&1 || true
 
@@ -127,11 +131,13 @@ RUN --mount=type=secret,id=tok cat /run/secrets/tok > /secret-out
 CMD ["cat", "/secret-out"]
 EOF
 printf 's3cr3t' > "$WORK/secret.txt"
-if ( cd "$ctx" && docker build --secret id=tok,src="$WORK/secret.txt" -t cider-compat/bk-secret:1 . ) >/dev/null 2>&1 &&
+out=$( { cd "$ctx" && docker build --secret id=tok,src="$WORK/secret.txt" -t cider-compat/bk-secret:1 .; } 2>&1 )
+build_status=$?
+if [[ $build_status -eq 0 ]] &&
    [[ "$(docker run --rm cider-compat/bk-secret:1)" == "s3cr3t" ]]; then
   record "--secret id=tok,src=file" PASS
 else
-  record "--secret id=tok,src=file" FAIL
+  record "--secret id=tok,src=file" FAIL "$out"
 fi
 docker rmi -f cider-compat/bk-secret:1 >/dev/null 2>&1 || true
 
@@ -173,7 +179,9 @@ docker rmi -f cider-compat/bk-progress:1 >/dev/null 2>&1 || true
 ctx="$WORK/iid"; mkdir -p "$ctx"
 printf 'FROM alpine:3.22\nRUN echo hi > /hi\n' > "$ctx/Dockerfile"
 iid_file="$WORK/iid.txt"
-if ( cd "$ctx" && docker build --iidfile "$iid_file" -t cider-compat/bk-iid:1 . ) >/dev/null 2>&1; then
+out=$( { cd "$ctx" && docker build --iidfile "$iid_file" -t cider-compat/bk-iid:1 .; } 2>&1 )
+build_status=$?
+if [[ $build_status -eq 0 ]]; then
   iid=$(cat "$iid_file" 2>/dev/null || true)
   imgid=$(docker images --no-trunc -q cider-compat/bk-iid:1)
   qid=$( cd "$ctx" && docker build -q -t cider-compat/bk-iid:1 . 2>/dev/null )
@@ -183,14 +191,15 @@ if ( cd "$ctx" && docker build --iidfile "$iid_file" -t cider-compat/bk-iid:1 . 
     record "--iidfile and -q match \`docker images -q\`" FAIL "iid=$iid img=$imgid q=$qid"
   fi
 else
-  record "--iidfile and -q match \`docker images -q\`" FAIL
+  record "--iidfile and -q match \`docker images -q\`" FAIL "$out"
 fi
 docker rmi -f cider-compat/bk-iid:1 >/dev/null 2>&1 || true
 
 # ---------- 7. untagged build is dangling and prunable ----------
 ctx="$WORK/untagged"; mkdir -p "$ctx"
 printf 'FROM alpine:3.22\nRUN echo hi > /hi\n' > "$ctx/Dockerfile"
-built_id=$( cd "$ctx" && docker build -q . 2>/dev/null )
+built_id=$( cd "$ctx" && docker build -q . 2>"$WORK/untagged.err" )
+build_err=$(cat "$WORK/untagged.err" 2>/dev/null)
 built_short="${built_id#sha256:}"; built_short="${built_short:0:12}"
 dangling_before=$(docker images --filter dangling=true -q)
 docker image prune -f >/dev/null 2>&1
@@ -198,16 +207,18 @@ dangling_after=$(docker images --filter dangling=true -q)
 if [[ -n "$built_short" ]] && grep -q "$built_short" <<<"$dangling_before" && ! grep -q "$built_short" <<<"$dangling_after"; then
   record "untagged build is dangling + prunable" PASS
 else
-  record "untagged build is dangling + prunable" FAIL
+  record "untagged build is dangling + prunable" FAIL "built_id=$built_id before=$dangling_before after=$dangling_after err=$build_err"
 fi
 
 # ---------- 8. --no-cache ----------
 ctx="$WORK/no-cache"; mkdir -p "$ctx"
 printf 'FROM alpine:3.22\nRUN echo hi > /hi\n' > "$ctx/Dockerfile"
-if ( cd "$ctx" && docker build -t cider-compat/bk-nc:1 . && docker build --no-cache -t cider-compat/bk-nc:1 . ) >/dev/null 2>&1; then
+out=$( { cd "$ctx" && docker build -t cider-compat/bk-nc:1 . && docker build --no-cache -t cider-compat/bk-nc:1 .; } 2>&1 )
+build_status=$?
+if [[ $build_status -eq 0 ]]; then
   record "--no-cache" PASS
 else
-  record "--no-cache" FAIL
+  record "--no-cache" FAIL "$out"
 fi
 docker rmi -f cider-compat/bk-nc:1 >/dev/null 2>&1 || true
 
@@ -222,13 +233,14 @@ COPY --from=build /hello /hello
 EOF
 local_dest="$WORK/local-out"; mkdir -p "$local_dest"
 tar_dest="$WORK/tar-out.tar"
-if ( cd "$ctx" && docker build --output type=local,dest="$local_dest" . ) >/dev/null 2>&1 &&
+out=$( { cd "$ctx" && docker build --output type=local,dest="$local_dest" . && docker build --output type=tar,dest="$tar_dest" .; } 2>&1 )
+build_status=$?
+if [[ $build_status -eq 0 ]] &&
    [[ "$(cat "$local_dest/hello" 2>/dev/null)" == "hello-out" ]] &&
-   ( cd "$ctx" && docker build --output type=tar,dest="$tar_dest" . ) >/dev/null 2>&1 &&
    [[ -s "$tar_dest" ]] && tar -tf "$tar_dest" | grep -q hello; then
   record "--output type=local,dest=<dir> and type=tar,dest=<file>" PASS
 else
-  record "--output type=local,dest=<dir> and type=tar,dest=<file>" FAIL
+  record "--output type=local,dest=<dir> and type=tar,dest=<file>" FAIL "$out"
 fi
 
 # ---------- 10. buildx inspect/du/prune, builder prune ----------
@@ -261,7 +273,9 @@ echo "shared-context-marker" > "$ctx/shared.txt"
 printf 'FROM alpine:3.22\nCOPY shared.txt /shared.txt\nRUN echo svc-a >> /shared.txt\n' > "$ctx/Dockerfile.a"
 printf 'FROM alpine:3.22\nCOPY shared.txt /shared.txt\nRUN echo svc-b >> /shared.txt\n' > "$ctx/Dockerfile.b"
 compose_project="cider-compat-bk"
-if ( cd "$ctx" && docker compose -p "$compose_project" build && docker compose -p "$compose_project" up -d ) >/dev/null 2>&1; then
+out=$( { cd "$ctx" && docker compose -p "$compose_project" build && docker compose -p "$compose_project" up -d; } 2>&1 )
+compose_status=$?
+if [[ $compose_status -eq 0 ]]; then
   ps_out=$( cd "$ctx" && docker compose -p "$compose_project" ps --format '{{.Service}}: {{.State}}' )
   if grep -q "svc-a: running" <<<"$ps_out" && grep -q "svc-b: running" <<<"$ps_out"; then
     record "compose build (two services, one shared context)" PASS
@@ -269,7 +283,7 @@ if ( cd "$ctx" && docker compose -p "$compose_project" build && docker compose -
     record "compose build (two services, one shared context)" FAIL "$ps_out"
   fi
 else
-  record "compose build (two services, one shared context)" FAIL
+  record "compose build (two services, one shared context)" FAIL "$out"
 fi
 ( cd "$ctx" && docker compose -p "$compose_project" down -v --remove-orphans --rmi local ) >/dev/null 2>&1 || true
 
@@ -293,7 +307,9 @@ target "b" {
   tags       = ["cider-compat/bk-bake-b:1"]
 }
 EOF
-if ( cd "$ctx" && docker buildx bake ) >/dev/null 2>&1; then
+out=$( { cd "$ctx" && docker buildx bake; } 2>&1 )
+bake_status=$?
+if [[ $bake_status -eq 0 ]]; then
   images_out=$(docker images --format '{{.Repository}}:{{.Tag}}')
   if grep -q "cider-compat/bk-bake-a:1" <<<"$images_out" && grep -q "cider-compat/bk-bake-b:1" <<<"$images_out"; then
     record "buildx bake (two targets, shared context)" PASS
@@ -301,7 +317,7 @@ if ( cd "$ctx" && docker buildx bake ) >/dev/null 2>&1; then
     record "buildx bake (two targets, shared context)" FAIL
   fi
 else
-  record "buildx bake (two targets, shared context)" FAIL
+  record "buildx bake (two targets, shared context)" FAIL "$out"
 fi
 docker rmi -f cider-compat/bk-bake-a:1 cider-compat/bk-bake-b:1 >/dev/null 2>&1 || true
 
@@ -310,10 +326,12 @@ mb="${CIDER_E2E_CONTEXT_MB:-20}"
 ctx="$WORK/large"; mkdir -p "$ctx"
 printf 'FROM alpine:3.22\nCOPY . /ctx\nRUN ls -la /ctx > /listing\n' > "$ctx/Dockerfile"
 head -c "$((mb * 1024 * 1024))" /dev/urandom > "$ctx/payload.bin"
-if run_with_timeout 180 docker build -t cider-compat/bk-large:1 "$ctx" >/dev/null 2>&1; then
+out=$(run_with_timeout 180 docker build -t cider-compat/bk-large:1 "$ctx" 2>&1)
+large_status=$?
+if [[ $large_status -eq 0 ]]; then
   record "${mb} MiB build context within 180s" PASS
 else
-  record "${mb} MiB build context within 180s" FAIL
+  record "${mb} MiB build context within 180s" FAIL "$out"
 fi
 docker rmi -f cider-compat/bk-large:1 >/dev/null 2>&1 || true
 

@@ -34,7 +34,7 @@ tests/compat/
 ├── diff-vs-orbstack.sh
 ├── fixtures/compose/docker-compose.yml
 ├── allowlists/                   one file per case-level suite: expected-pass ids
-└── reports/                      generated on every run; see each script below
+└── reports/                      generated on every run, gitignored; see each script below
 ```
 
 ## Prerequisites
@@ -325,8 +325,9 @@ supported.
 
 **Output:** `reports/buildkit.md` — one table row per scenario (PASS/FAIL)
 plus the builder-survival check, with failure output attached per scenario.
-Exit code: non-zero if any scenario failed or the builder VM did not survive
-the run.
+Generated on every run and gitignored (see `reports/` above) — never commit
+it. Exit code: non-zero if any scenario failed or the builder VM did not
+survive the run.
 
 ## `run-swagger-contract.sh`
 

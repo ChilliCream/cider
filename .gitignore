@@ -56,3 +56,6 @@ nuget.config.user
 __pycache__/
 *.pyc
 .nitro/
+
+## generated on every compat run; see tests/compat/README.md
+tests/compat/reports/
