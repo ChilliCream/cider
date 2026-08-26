@@ -148,6 +148,73 @@ public sealed class PortProxyTests
     }
 
     [Fact]
+    public async Task A_connection_accepted_before_the_address_is_known_is_held_and_relayed_once_it_resolves()
+    {
+        await using var server = EchoServer.Start();
+        using var proxy = new PortProxyManager(NullLogger<PortProxyManager>.Instance);
+
+        var handle = await proxy.PublishAsync(
+            ContainerId, "tcp", IPAddress.Loopback, 0, null, server.Port, CancellationToken.None);
+        Assert.Null(handle.Port.ContainerIp);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, handle.Port.HostPort);
+        var stream = client.GetStream();
+
+        await stream.WriteAsync(Encoding.UTF8.GetBytes("ping\n"));
+
+        // Held, not refused: the connect above already succeeded, and nothing comes back yet because
+        // the backend address is still unknown.
+        using (var probeCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300)))
+        {
+            var probe = new byte[16];
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                _ = await stream.ReadAsync(probe, probeCts.Token));
+        }
+
+        proxy.ResolveAddress(ContainerId, IPAddress.Loopback);
+
+        // Once resolved, the connection that was held is relayed, in both directions, without having
+        // to be re-established.
+        Assert.Equal("PING\n", await ReadAsync(stream, 5));
+
+        await stream.WriteAsync(Encoding.UTF8.GetBytes("pong\n"));
+        Assert.Equal("PONG\n", await ReadAsync(stream, 5));
+    }
+
+    [Fact]
+    public async Task An_unresolved_connection_is_closed_when_the_publication_is_disposed()
+    {
+        using var proxy = new PortProxyManager(NullLogger<PortProxyManager>.Instance);
+
+        var handle = await proxy.PublishAsync(
+            ContainerId, "tcp", IPAddress.Loopback, 0, null, 9, CancellationToken.None);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, handle.Port.HostPort);
+        var stream = client.GetStream();
+
+        proxy.Unpublish(ContainerId);
+        Assert.False(proxy.IsPublished(ContainerId));
+
+        // The held connection observes a close instead of hanging until TcpPortForwarder.TargetWaitTimeout.
+        var probe = new byte[16];
+        var read = await stream.ReadAsync(probe).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, read);
+    }
+
+    [Fact]
+    public async Task Publishing_a_udp_mapping_without_an_address_is_rejected()
+    {
+        using var proxy = new PortProxyManager(NullLogger<PortProxyManager>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            proxy.PublishAsync(ContainerId, "udp", IPAddress.Loopback, 0, null, 9999, CancellationToken.None));
+
+        Assert.False(proxy.IsPublished(ContainerId));
+    }
+
+    [Fact]
     public async Task Binding_a_host_port_that_is_taken_is_reported_as_a_socket_failure()
     {
         using var taken = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);

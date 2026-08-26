@@ -88,9 +88,16 @@ public sealed class PortTests(DaemonFixture daemon)
     /// it is bound at <c>start</c>, before the container's VM address is known, instead of refusing
     /// them until it is. <see cref="Net.TcpPortForwarder"/> holds an accepted connection (bounded) for
     /// the backend address rather than failing it, so — unlike before this fix, where the host port
-    /// was not even bound until the address arrived — a single <c>curl --retry 0</c> issued the moment
-    /// <c>docker run -d</c> returns succeeds without ever seeing "connection refused" in between,
-    /// whatever is left of the VM boot (Apple's, not cider's) it has to wait out to get there.
+    /// was not even bound until the address arrived — a connection attempted the moment
+    /// <c>docker run -d</c> returns is never refused: what this test actually achieves is "never
+    /// refused", not the ticket's stronger "succeeds on the first attempt and completes when the
+    /// service is up" — <see cref="Net.TcpPortForwarder"/> dials the backend the instant
+    /// <c>ResolveAddress</c> supplies it, so a connection held while the address was still unknown is
+    /// dropped (curl exit 52, empty reply) rather than parked until the guest's own service starts
+    /// listening; only a later attempt, made after the guest is actually up, succeeds. cider-ede.18
+    /// also leaves <c>StartAsync</c> blocking on network registration before it returns (see task
+    /// comments), so the true "time from `docker run -d` returning to first success" is not yet
+    /// bounded by this fix alone; that gap is tracked as a follow-up, cider-ede.26.
     /// </summary>
     [E2EFact]
     public async Task A_published_port_accepts_immediately_after_start_instead_of_refusing_until_the_backend_is_known()
@@ -113,18 +120,18 @@ public sealed class PortTests(DaemonFixture daemon)
 
         try
         {
-            // The ticket's own verification text asks for a first attempt within 6 s of `docker run`
-            // returning; that number assumes a fast dev box and is tighter than the other budgets in
-            // this file tolerate on a loaded CI runner or a cold VM boot, so this asserts a larger,
-            // explicit wall-clock budget instead and keeps 6 s here only as the documented target.
-            var budget = TimeSpan.FromSeconds(20);
-            var deadline = DateTimeOffset.UtcNow + budget;
+            // The loop bound is generous (it just needs to outlast a cold VM boot on a loaded CI
+            // runner); the actual latency claim is asserted separately, against a tighter budget, so
+            // that claim can fail on its own instead of being restated by the loop bound.
+            var loopDeadline = runReturned + TimeSpan.FromSeconds(60);
+            var successBudget = TimeSpan.FromSeconds(20);
             CommandResult? curl = null;
             var succeeded = false;
+            var exitCodes = new List<int>();
 
-            while (DateTimeOffset.UtcNow < deadline)
+            while (DateTimeOffset.UtcNow < loopDeadline)
             {
-                var remaining = deadline - DateTimeOffset.UtcNow;
+                var remaining = loopDeadline - DateTimeOffset.UtcNow;
                 if (remaining <= TimeSpan.Zero)
                 {
                     break;
@@ -137,10 +144,16 @@ public sealed class PortTests(DaemonFixture daemon)
                         $"http://127.0.0.1:{hostPort.ToString(CultureInfo.InvariantCulture)}/",
                     ],
                     timeout: remaining + TimeSpan.FromSeconds(5));
+                exitCodes.Add(curl.ExitCode);
 
                 // The real claim under test: whatever happens on any given attempt, the daemon must
                 // never have refused the connection — that would mean the listener was not bound and
                 // holding by the time `docker run -d` returned, which is the defect cider-ede.18 fixes.
+                // curl exit 7 is "connection refused"; that is what must never happen. curl exit 52
+                // ("empty reply") is expected on early attempts and is NOT a refusal: TcpPortForwarder
+                // dials the backend the instant ResolveAddress fires, so a connection held while the
+                // guest service was not yet listening is dropped, not parked, once the address itself
+                // becomes known.
                 Assert.DoesNotContain("refused", curl.Stderr, StringComparison.OrdinalIgnoreCase);
                 Assert.DoesNotContain("refused", curl.Stdout, StringComparison.OrdinalIgnoreCase);
 
@@ -156,10 +169,11 @@ public sealed class PortTests(DaemonFixture daemon)
             var elapsed = DateTimeOffset.UtcNow - runReturned;
             Assert.True(
                 succeeded,
-                $"no attempt within {budget} of `docker run -d` returning succeeded (elapsed {elapsed}): {curl}");
+                $"no attempt within {loopDeadline - runReturned} of `docker run -d` returning succeeded (elapsed {elapsed}): {curl}");
+            Assert.DoesNotContain(7, exitCodes);
             Assert.True(
-                elapsed <= budget + TimeSpan.FromSeconds(5),
-                $"first successful response took {elapsed}, over the {budget} budget");
+                elapsed <= successBudget,
+                $"first successful response took {elapsed}, over the {successBudget} budget (exit codes seen: {string.Join(", ", exitCodes)})");
         }
         finally
         {

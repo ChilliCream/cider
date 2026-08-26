@@ -49,6 +49,7 @@ internal sealed class TcpPortForwarder : IPortForwarder
     private readonly Socket _listener;
     private readonly int _containerPort;
     private readonly ILogger _logger;
+    private readonly TimeSpan _targetWaitTimeout;
     private readonly CancellationTokenSource _cts = new();
     private readonly TaskCompletionSource<IPAddress> _targetTcs =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -62,11 +63,19 @@ internal sealed class TcpPortForwarder : IPortForwarder
     /// </summary>
     /// <exception cref="SocketException">The host endpoint could not be bound.</exception>
     public TcpPortForwarder(IPEndPoint host, IPAddress? containerIp, int containerPort, ILogger logger)
+        : this(host, containerIp, containerPort, logger, TargetWaitTimeout)
+    {
+    }
+
+    /// <summary>As the public constructor, but with an injectable wait timeout for tests.</summary>
+    internal TcpPortForwarder(
+        IPEndPoint host, IPAddress? containerIp, int containerPort, ILogger logger, TimeSpan targetWaitTimeout)
     {
         ArgumentNullException.ThrowIfNull(host);
 
         _containerPort = containerPort;
         _logger = logger;
+        _targetWaitTimeout = targetWaitTimeout;
         _listener = Bind(host);
         HostEndPoint = (IPEndPoint)_listener.LocalEndPoint!;
         if (containerIp is not null)
@@ -179,7 +188,7 @@ internal sealed class TcpPortForwarder : IPortForwarder
                 _logger.LogDebug(
                     "closing a connection on published port {Endpoint}: no backend address within {Timeout}",
                     HostEndPoint,
-                    TargetWaitTimeout);
+                    _targetWaitTimeout);
                 return;
             }
 
@@ -217,7 +226,7 @@ internal sealed class TcpPortForwarder : IPortForwarder
             return known;
         }
 
-        using var timeoutCts = new CancellationTokenSource(TargetWaitTimeout);
+        using var timeoutCts = new CancellationTokenSource(_targetWaitTimeout);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
         try
         {
