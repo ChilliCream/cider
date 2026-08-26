@@ -5,29 +5,30 @@ using Xunit;
 namespace Cider.Tests.Daemon.BuildKit;
 
 /// <summary>
-/// <see cref="TokenBucketPacer"/> in isolation: the planner-ruled defaults (8 MiB/s, 1 MiB burst;
-/// cider-ger.8 comment #10) actually throttle a write that exceeds the burst, a small write within
-/// the burst is not delayed at all, and an <c>AcquireAsync</c> call always reports progress to an
-/// attached tracker regardless of whether it had to wait.
+/// <see cref="TokenBucketPacer"/> in isolation: the planner-ruled defaults (32 MiB/s, 1 MiB burst;
+/// cider-ger.21, retuning cider-ger.8 comment #10's original 8 MiB/s placeholder) actually throttle a
+/// write that exceeds the burst, a small write within the burst is not delayed at all, and an
+/// <c>AcquireAsync</c> call always reports progress to an attached tracker regardless of whether it
+/// had to wait.
 /// </summary>
 public sealed class TokenBucketPacerTests
 {
     [Fact]
-    public async Task A_4_MiB_write_from_a_cold_bucket_is_throttled_to_roughly_the_configured_rate()
+    public async Task A_33_MiB_write_from_a_cold_bucket_is_throttled_to_roughly_the_configured_rate()
     {
-        // Burst 1 MiB is available immediately; the remaining 3 MiB must wait at 8 MiB/s, i.e. at
-        // least ~0.375 s. A generous floor (300 ms) keeps this from flaking on a loaded CI box while
+        // Burst 1 MiB is available immediately; the remaining 32 MiB must wait at 32 MiB/s, i.e. at
+        // least ~1.0 s. A generous floor (850 ms) keeps this from flaking on a loaded CI box while
         // still failing hard for an unthrottled implementation (which would return in single-digit ms).
         var pacer = new TokenBucketPacer(TokenBucketPacer.DefaultBytesPerSecond, TokenBucketPacer.DefaultBurstBytes);
-        const int fourMiB = 4 * 1024 * 1024;
+        const int thirtyThreeMiB = 33 * 1024 * 1024;
 
         var stopwatch = Stopwatch.StartNew();
-        await pacer.AcquireAsync(fourMiB, CancellationToken.None);
+        await pacer.AcquireAsync(thirtyThreeMiB, CancellationToken.None);
         stopwatch.Stop();
 
         Assert.True(
-            stopwatch.Elapsed >= TimeSpan.FromMilliseconds(300),
-            $"expected the pacer to hold a 4 MiB write back for at least 300ms, took {stopwatch.Elapsed}");
+            stopwatch.Elapsed >= TimeSpan.FromMilliseconds(850),
+            $"expected the pacer to hold a 33 MiB write back for at least 850ms, took {stopwatch.Elapsed}");
     }
 
     [Fact]
