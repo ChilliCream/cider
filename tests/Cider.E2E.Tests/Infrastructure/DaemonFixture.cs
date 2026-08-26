@@ -490,9 +490,20 @@ public class DaemonFixture : IAsyncLifetime
 
             LogSkipped("network", skippedNetworks);
 
-            // Images this run built, tagged or pulled -- including the synthetic `cider-build-*` tags
-            // an untagged build leaves behind (cider-ede.10/ImageManager). By id, so a multi-tag image
+            // Images this run tagged (e2e/*, cider-e2e*, cider-compat*), by id, so a multi-tag image
             // is removed in one call under every tag at once, same as `docker rmi -f <id>`.
+            //
+            // An untagged build also leaves a `cider-build-*` synthetic tag behind
+            // (cider-ede.10/ImageManager) as an internal bookkeeping marker, but that marker is never
+            // visible through cider's own listing API -- ImageManager.VisibleReferences strips
+            // synthetic build tags and ToSummary derives RepoTags from that filtered set, so such an
+            // image always lists here as `<none>:<none>` and is disqualified by the
+            // `EndsWith(":<none>")` branch in FilterOwnedImageIdsAsync, whatever OwnedImageTagPrefixes
+            // says. That residual untagged/synthetic-tagged debris is not reclaimed by this filter; it
+            // is a known, accepted residual under cider-24v's rule that teardown never removes what
+            // this run did not unambiguously create (an untagged id could just as easily be another
+            // run's in-flight build). What this filter actually reclaims is the suite's own tagged
+            // images.
             //
             // Since cider-ede.31, a plain `rmi` no longer sweeps the store's blob content on the XPC
             // transport (only `docker image prune` does, and only once per prune call) -- so this may
@@ -506,12 +517,11 @@ public class DaemonFixture : IAsyncLifetime
             // with every other concurrent run and the operator's own images, so anything another run
             // pulled or built between our snapshot and now would look identical to "this run created
             // it". A second, ownership test narrows the removal to ids this run can actually claim:
-            // only an id all of whose repo:tag entries carry one of this harness's own prefixes
-            // (cider-build-*/cider-e2e*/cider-compat*) is removed; an untagged id or one carrying any
-            // other tag is left alone -- it may be another run's in-flight build, or a base image
-            // (alpine, nginx, ryuk, ...) newly pulled into the shared cache, which stays in the store
-            // by design. The leak this task measures (this fixture's own synthetic tags) is still
-            // cleaned.
+            // only an id all of whose repo:tag entries carry one of this harness's own prefixes (see
+            // OwnedImageTagPrefixes) is removed; an untagged id or one carrying any other tag is left
+            // alone -- it may be another run's in-flight build, or a base image (alpine, nginx,
+            // ryuk, ...) newly pulled into the shared cache, which stays in the store by design. The
+            // leak this task measures (this fixture's own e2e/* tags) is still cleaned.
             var currentImages = await DockerAsync(["images", "-aq", "--no-trunc"], timeout: TimeSpan.FromSeconds(60));
             var allImageIds = currentImages.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             var newImageIds = allImageIds.Where(id => !_preExistingImageIds.Contains(id)).ToArray();
@@ -552,12 +562,31 @@ public class DaemonFixture : IAsyncLifetime
     }
 
     /// <summary>
-    /// The repo-tag prefixes this fixture (and the compat harness, <c>tests/compat/lib/daemon.sh</c>)
-    /// actually tag things with -- the synthetic tags cider-0o3's verification asserts on. Used by
-    /// <see cref="FilterOwnedImageIdsAsync"/> to narrow "new since our snapshot" down to "this run can
-    /// actually claim it".
+    /// The single prefix every E2E-minted image tag actually carries -- <see
+    /// cref="BuildKitTests.UniqueTag"/> and <see cref="BuildTests.Tag"/> (the only two places the E2E
+    /// suite tags an image) build their tags from this constant so the two can never drift apart from
+    /// what <see cref="OwnedImageTagPrefixes"/> below recognises.
     /// </summary>
-    private static readonly string[] OwnedImageTagPrefixes = ["cider-build-", "cider-e2e", "cider-compat"];
+    internal const string OwnedTagPrefix = "e2e/";
+
+    /// <summary>
+    /// The repo-tag prefixes this fixture (and the compat harness, <c>tests/compat/lib/daemon.sh</c>)
+    /// actually tag things with -- the synthetic tags cider-0o3's verification asserts on. <see
+    /// cref="OwnedTagPrefix"/> ("e2e/...") covers every tag <see cref="BuildKitTests.UniqueTag"/> and
+    /// <see cref="BuildTests.Tag"/> mint; "e2e-" covers a bare <see cref="NewName"/> used directly as a
+    /// tag; "cider-e2e"/"cider-compat" are the compat harness's own prefixes
+    /// (<c>tests/compat/lib/daemon.sh</c>). Used by <see cref="FilterOwnedImageIdsAsync"/> to narrow
+    /// "new since our snapshot" down to "this run can actually claim it".
+    ///
+    /// This deliberately does NOT include a `cider-build-*` prefix: that synthetic tag
+    /// (<see cref="Cider.Core.Services.ImageManager"/>'s marker for an untagged build) is never
+    /// visible through cider's own API in the first place -- <c>ImageManager.VisibleReferences</c>
+    /// strips it and <c>ToSummary</c> derives <c>RepoTags</c> from that filtered set, so such an image
+    /// always lists as <c>&lt;none&gt;:&lt;none&gt;</c> here and is disqualified by the
+    /// <c>EndsWith(":&lt;none&gt;")</c> branch below regardless of what prefixes this array names.
+    /// Listing it as a prefix would misrepresent what this filter reclaims.
+    /// </summary>
+    private static readonly string[] OwnedImageTagPrefixes = [OwnedTagPrefix, "e2e-", "cider-e2e", "cider-compat"];
 
     /// <summary>
     /// Narrows <paramref name="candidateIds"/> (already known to be new since <see

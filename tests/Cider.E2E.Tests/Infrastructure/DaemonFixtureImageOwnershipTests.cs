@@ -13,12 +13,29 @@ namespace Cider.E2E.Tests.Infrastructure;
 public sealed class DaemonFixtureImageOwnershipTests
 {
     // Captured verbatim (2026-08-26) from `docker images -a --no-trunc --format
-    // "{{.ID}}\t{{.Repository}}:{{.Tag}}"` against a real throwaway cider daemon -- pins the one
-    // genuine divergence from tests/compat/lib/daemon.sh's shell equivalent, which formats with a
+    // "{{.ID}}\t{{.Repository}}:{{.Tag}}"` against a real throwaway cider fixture daemon -- pins the
+    // one genuine divergence from tests/compat/lib/daemon.sh's shell equivalent, which formats with a
     // plain space instead of this tab. The C# "\t" escape below produces the identical byte the real
     // CLI emits; this is not a re-derivation of the format, it is that captured line.
     private const string RealCapturedLine =
         "sha256:5d3b3e589fcf57f626c7967bff5171924cf9c55068911247a1f7bd2458e726c3\tcoredns/coredns:1.14.7";
+
+    // Captured verbatim (2026-08-26) from the same run, right after `docker build -t
+    // e2e/capture-b40417a3 .` against the fixture -- the real shape a BuildKitTests.UniqueTag/
+    // BuildTests.Tag build leaves behind. Full command and raw multi-line output this and the two
+    // constants below were pulled from are quoted in the cider-0o3 verification notes.
+    private const string RealTaggedLine =
+        "sha256:5341c44d24253c138f3aa5a8f1c14b9ad2a25110ddb7672e959a3568015990b8\te2e/capture-b40417a3:latest";
+
+    // Captured verbatim (2026-08-26) from the same run, right after a plain `docker build .` (no
+    // `-t`) against the fixture -- the real shape an untagged build leaves behind. This is the
+    // synthetic-tagged/untagged residual cider-0o3 finding #1/#2 established is never visible through
+    // cider's own listing API (ImageManager.VisibleReferences strips the cider-build-* marker before
+    // ToSummary derives RepoTags, so it always renders as <none>:<none> here) and so is left alone by
+    // FilterOwnedImageIdsAsync as an accepted residual under cider-24v's never-remove-what-we-did-not-
+    // create rule, not reclaimed by this filter.
+    private const string RealUntaggedLine =
+        "sha256:fe34c8603e8a5a6819717f4243c637ce38f29da13d65a930db1c3ce3e7754024\t<none>:<none>";
 
     [Fact]
     public void Real_captured_line_is_kept_when_not_a_candidate()
@@ -31,10 +48,10 @@ public sealed class DaemonFixtureImageOwnershipTests
     }
 
     [Fact]
-    public void Cider_build_tagged_new_id_is_removed()
+    public void Real_e2e_tagged_new_id_is_removed()
     {
-        const string id = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        var listing = RealCapturedLine + "\n" + id + "\tcider-build-abc123:latest";
+        const string id = "sha256:5341c44d24253c138f3aa5a8f1c14b9ad2a25110ddb7672e959a3568015990b8";
+        var listing = RealCapturedLine + "\n" + RealTaggedLine;
 
         var result = DaemonFixture.ParseOwnedImageIds(listing, candidateIds: [id]);
 
@@ -50,7 +67,7 @@ public sealed class DaemonFixtureImageOwnershipTests
         const string id = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
         var listing = string.Join(
             '\n',
-            id + "\tcider-build-abc123:latest",
+            id + "\te2e/capture-abc123:latest",
             id + "\talpine:3.19");
 
         var result = DaemonFixture.ParseOwnedImageIds(listing, candidateIds: [id]);
@@ -59,12 +76,16 @@ public sealed class DaemonFixtureImageOwnershipTests
     }
 
     [Fact]
-    public void None_tagged_id_is_kept()
+    public void Real_untagged_new_id_is_kept_as_the_accepted_residual()
     {
-        const string id = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
-        var listing = id + "\t<none>:<none>";
+        // The real shape an untagged build leaves behind (RealUntaggedLine, above): it renders
+        // <none>:<none>, not a cider-build-* tag -- that marker never survives cider's own listing
+        // (cider-0o3 finding #2), so it is disqualified here by the EndsWith(":<none>") branch just
+        // like any other dangling image, and stays in the store as the known, accepted residual under
+        // cider-24v's rule that teardown never removes what this run cannot unambiguously claim.
+        const string id = "sha256:fe34c8603e8a5a6819717f4243c637ce38f29da13d65a930db1c3ce3e7754024";
 
-        var result = DaemonFixture.ParseOwnedImageIds(listing, candidateIds: [id]);
+        var result = DaemonFixture.ParseOwnedImageIds(RealUntaggedLine, candidateIds: [id]);
 
         Assert.Empty(result);
     }
@@ -76,8 +97,8 @@ public sealed class DaemonFixtureImageOwnershipTests
         const string candidate = "sha256:5555555555555555555555555555555555555555555555555555555555555555";
         var listing = string.Join(
             '\n',
-            preExisting + "\tcider-build-abc123:latest",
-            candidate + "\tcider-build-def456:latest");
+            preExisting + "\te2e/capture-abc123:latest",
+            candidate + "\te2e/capture-def456:latest");
 
         // preExisting carries an owned tag too, but it was never a candidate (the snapshot already
         // knew about it), so it must never be returned -- "owned tag" alone is not enough, "new since

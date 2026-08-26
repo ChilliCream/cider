@@ -14,7 +14,7 @@ namespace Cider.E2E.Tests;
 [Trait("Category", "E2E")]
 public sealed class BuildTests(DaemonFixture daemon)
 {
-    private const string Tag = "e2e/built:1";
+    private const string Tag = DaemonFixture.OwnedTagPrefix + "built:1";
 
     [E2EFact]
     public async Task Classic_builder_builds_tags_and_runs_an_image()

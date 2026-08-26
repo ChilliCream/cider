@@ -538,7 +538,7 @@ public sealed class BuildKitTests(DaemonFixture daemon)
         }
     }
 
-    private static string UniqueTag(string suffix) => "e2e/" + DaemonFixture.NewName(suffix);
+    private static string UniqueTag(string suffix) => DaemonFixture.OwnedTagPrefix + DaemonFixture.NewName(suffix);
 
     /// <summary>Strips a leading <c>sha256:</c> so ids from different commands compare equal.</summary>
     private static string NormalizeId(string id) =>
