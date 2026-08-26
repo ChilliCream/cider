@@ -1,5 +1,6 @@
 using Cider.AppleContainer;
 using Cider.AppleContainer.Cli;
+using Cider.Core.Runtime;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -141,6 +142,28 @@ public sealed class AppleContainerRuntimeContentAddressedIdTests : IDisposable
         Assert.Equal($"sha256:{ConfigDigestHex}", detail!.Id);
     }
 
+    [Fact]
+    public async Task BuildImageAsync_ReportsTheContentAddressedConfigId_NotTheScrapedManifestDigest()
+    {
+        // cider-ger.20: a classic (untagged) build's own "exporting manifest sha256:<manifest digest>"
+        // progress line is an OCI manifest digest, never the content-addressed *config* digest that
+        // RuntimeImage.Id actually is elsewhere (ListImagesAsync/InspectImageAsync above) -- if
+        // BuildImageAsync ever regressed to reporting that scraped digest again, its own freshly-built
+        // id would never appear in a subsequent `docker images --filter dangling=true` listing. This is
+        // the only test that would catch a regression of commit 12598cc.
+        SeedLocalBlobStore();
+        var cli = new ScriptedBuildCli(StatusJson(_appRoot), ImageRowJson(appleIndexId: "index-after-build"));
+        var runtime = new AppleContainerRuntime(new AppleContainerOptions(), NullLogger<AppleContainerRuntime>.Instance, cli);
+
+        var id = await runtime.BuildImageAsync(
+            new BuildSpec { ContextDir = Path.GetTempPath() },
+            new Progress<ProgressEvent>(),
+            CancellationToken.None);
+
+        Assert.Equal($"sha256:{ConfigDigestHex}", id);
+        Assert.NotEqual($"sha256:{ManifestDigestHex}", id);
+    }
+
     /// <summary>Answers `system status`/`image ls` from canned strings; anything else fails like an
     /// unscripted call, exercised deliberately.</summary>
     private sealed class ScriptedListCli(string? statusJson, string imageLsJson)
@@ -174,6 +197,45 @@ public sealed class AppleContainerRuntimeContentAddressedIdTests : IDisposable
     private sealed class ScriptedInspectCli(string? statusJson, string inspectJson)
         : ContainerCli(new AppleContainerOptions(), NullLogger.Instance)
     {
+        public override Task<CliResult> RunAsync(
+            IReadOnlyList<string> args,
+            CancellationToken ct,
+            TimeSpan? timeout = null,
+            string? stdin = null)
+        {
+            if (args.Count >= 2 && args[0] == "system" && args[1] == "status")
+            {
+                return Task.FromResult(statusJson is null
+                    ? new CliResult(1, "", "not running")
+                    : new CliResult(0, statusJson, ""));
+            }
+
+            if (args.Count >= 2 && args[0] == "image" && args[1] == "inspect")
+            {
+                return Task.FromResult(new CliResult(0, inspectJson, ""));
+            }
+
+            return Task.FromResult(new CliResult(1, "", "not scripted"));
+        }
+    }
+
+    /// <summary>Replays a classic build's progress output (an "exporting manifest sha256:…" line
+    /// scraped for the pre-fix fallback id) and then answers `system status`/`image inspect` exactly
+    /// like <see cref="ScriptedInspectCli"/>, so BuildImageAsync's post-build lookup resolves the
+    /// content-addressed config id instead of the scraped manifest digest.</summary>
+    private sealed class ScriptedBuildCli(string? statusJson, string inspectJson)
+        : ContainerCli(new AppleContainerOptions(), NullLogger.Instance)
+    {
+        public override Task<CliResult> RunStreamingAsync(
+            IReadOnlyList<string> args,
+            Action<string, bool> onLine,
+            CancellationToken ct,
+            TimeSpan? timeout = null)
+        {
+            onLine($"#6 exporting manifest sha256:{ManifestDigestHex} done", false);
+            return Task.FromResult(new CliResult(0, "", ""));
+        }
+
         public override Task<CliResult> RunAsync(
             IReadOnlyList<string> args,
             CancellationToken ct,

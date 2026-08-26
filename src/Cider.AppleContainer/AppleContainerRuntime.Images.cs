@@ -719,16 +719,31 @@ public sealed partial class AppleContainerRuntime
             // success into a failure" rule ListImagesAsync's own doc comment credits to cider-ede.24) —
             // it just leaves the scraped digest as the answer instead.
             RuntimeImageDetail? detail = null;
+            RuntimeException? inspectFailure = null;
             try
             {
                 detail = await InspectImageAsync(tags[0], ct);
             }
             catch (RuntimeException ex)
             {
-                _logger.LogDebug(ex, "could not resolve the content-addressed id of the image just built; falling back to the scraped build output");
+                inspectFailure = ex;
             }
 
             var imageId = string.IsNullOrEmpty(detail?.Id) ? scrapedId : detail.Id;
+
+            // Covers both the exception path above and InspectImageAsync succeeding with no usable
+            // id: either way the reported id is the scraped manifest digest, not the content-addressed
+            // config digest a subsequent listing would report, so this is worth a Warning, not silence
+            // (matching this file's own precedent for degraded results at line 41/657). Logged once,
+            // here, rather than also inside the catch block above, so the exception path never double-logs.
+            if (string.IsNullOrEmpty(detail?.Id))
+            {
+                _logger.LogWarning(
+                    inspectFailure,
+                    "could not resolve the content-addressed id of image {Tag} just built; falling back to the scraped build output {ScrapedId}, which is a manifest digest that will not match a subsequent listing",
+                    tags[0],
+                    scrapedId);
+            }
 
             if (imageId is null)
             {

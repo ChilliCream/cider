@@ -103,6 +103,11 @@ public sealed class AppleContainerRuntimeImageTests
             new CollectingProgress(events),
             CancellationToken.None);
 
+        // ScriptedContainerCli.RunAsync above is deliberately left unscripted (always "not scripted"),
+        // so InspectImageAsync inside BuildImageAsync can never resolve the content-addressed id here
+        // -- this asserts the documented best-effort fallback to the scraped manifest digest, not the
+        // inspect-preferred id a real build reports. That path is covered by
+        // AppleContainerRuntimeContentAddressedIdTests.BuildImageAsync_ReportsTheContentAddressedConfigId_NotTheScrapedManifestDigest.
         Assert.Equal("sha256:611305aa6efdbc4c0bbd5a5e0451b715cf7fd0e342b635a2ed1ed3758e0eb3b5", id);
         Assert.DoesNotContain(events, e => e.Stream is not null && e.Stream.StartsWith("Successfully", StringComparison.Ordinal));
         Assert.Equal(2, events.Count);
