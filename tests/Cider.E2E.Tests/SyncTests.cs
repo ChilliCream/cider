@@ -101,6 +101,60 @@ public sealed class SyncTests(SyncFixture daemon)
         }
     }
 
+    /// <summary>
+    /// E2E — cider-ede.37 leg 3: cider-ede.29 (commit 021efa5) fixed <c>AdoptContainerAsync</c> storing
+    /// an adopted container's raw engine index digest as its <c>ImageId</c> verbatim, instead of
+    /// resolving it through <c>RuntimeImage.IndexDigests</c> to the same content-addressed config id
+    /// <c>docker images</c> prints — so <c>docker inspect &lt;adopted&gt; --format '{{.Image}}'</c>
+    /// matched nothing in <c>docker images</c> for any container the Apple CLI created directly. Its
+    /// own Verification section named this live leg, never run before this task: create a container
+    /// with the Apple CLI, adopt it through <c>POST /_cider/sync</c> (the endpoint this class already
+    /// drives), and assert the adopted container's <c>.Image</c> equals the image's own
+    /// <c>docker images -q</c> id.
+    /// </summary>
+    [E2EFact]
+    public async Task Sync_resolves_an_adopted_containers_image_to_the_docker_visible_id()
+    {
+        var name = DaemonFixture.NewName("adopt-img");
+
+        // Pulled through cider first so the image is already docker-visible with a known id, then the
+        // container itself is created straight through the Apple CLI -- cider never sees this
+        // container come into being, exactly the "created outside cider" precondition adoption exists
+        // for (see the class doc comment and Logs_on_a_container_started_outside_cider... above).
+        var pull = await daemon.DockerAsync(["pull", Image], timeout: TimeSpan.FromMinutes(6));
+        Assert.True(pull.Ok, pull.ToString());
+
+        var run = await Cmd.RunAsync(
+            "container",
+            ["run", "-d", "--name", name, Image, "sleep", "120"],
+            timeout: TimeSpan.FromMinutes(4));
+        Assert.True(run.Ok, run.ToString());
+
+        try
+        {
+            await WaitUntilVisibleAsync(name);
+
+            var report = await PostSyncAsync();
+            Assert.Contains(name, report.Containers.Adopted);
+
+            var inspect = await daemon.DockerAsync("inspect", name, "--format", "{{.Image}}");
+            Assert.True(inspect.Ok, inspect.ToString());
+            var adoptedImageId = inspect.Stdout.Trim();
+
+            var imagesQ = await daemon.DockerAsync("images", "--no-trunc", "-q", Image);
+            Assert.True(imagesQ.Ok, imagesQ.ToString());
+            var dockerVisibleId = imagesQ.Stdout.Trim();
+
+            Assert.NotEmpty(dockerVisibleId);
+            Assert.Equal(dockerVisibleId, adoptedImageId);
+        }
+        finally
+        {
+            await daemon.DockerAsync(["rm", "-f", name], timeout: TimeSpan.FromMinutes(2));
+            await Cmd.RunAsync("container", ["delete", "-f", name], timeout: TimeSpan.FromSeconds(30));
+        }
+    }
+
     /// <summary>Runs a <c>container</c> CLI command, retrying a few times on "not found" (see the caller).</summary>
     private static async Task RunAppleCliAsync(IReadOnlyList<string> arguments)
     {

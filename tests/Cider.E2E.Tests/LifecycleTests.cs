@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Linq;
 using Cider.Daemon.Hosting;
 using Cider.E2E.Tests.Infrastructure;
 using Xunit;
@@ -199,6 +200,66 @@ public sealed class LifecycleTests(DaemonFixture daemon)
         {
             await daemon.DockerAsync(["rm", "-f", name], timeout: TimeSpan.FromMinutes(2));
             await Cmd.RunAsync("container", ["delete", "-f", name], timeout: TimeSpan.FromSeconds(30));
+        }
+    }
+
+    /// <summary>
+    /// E2E — cider-ede.37 leg 2: cider-ede.28 (commit 2eccb14) fixed <c>ProcessConfigurationBuilder.Build</c>
+    /// hardcoding <c>SupplementalGroups = []</c> for every <c>docker exec</c>, dropping the container's
+    /// own group memberships; its own Verification section named a live <c>id -G</c> leg that was
+    /// never run. cider's default container (no <c>--user</c>) gets <c>User.OfId(0, 0)</c> — an
+    /// explicit gid, which suppresses the guest's own group-membership resolution — so a container
+    /// whose user actually carries secondary groups needs <c>--user &lt;name&gt;</c> (a bare name, no
+    /// gid — <see cref="Cider.AppleContainer.Xpc.ContainerConfigurationBuilder.BuildUser"/>), which
+    /// makes alpine's real <c>/etc/group</c> membership (root: bin, daemon, sys, adm, disk, wheel,
+    /// dialout, tape, video) resolve. <c>root</c> is the only user guaranteed present in every alpine
+    /// image without building one, so it stands in for "a container whose user has secondary groups"
+    /// here — confirmed live against this alpine:3.22 image before writing this test.
+    /// </summary>
+    [E2EFact]
+    public async Task Exec_without_a_user_override_sees_the_same_secondary_groups_as_the_main_process()
+    {
+        var name = DaemonFixture.NewName("grp");
+        var run = await daemon.DockerAsync(
+            ["run", "-d", "--name", name, "--user", "root", Image, "sleep", "60"],
+            timeout: TimeSpan.FromMinutes(4));
+        Assert.True(run.Ok, run.ToString());
+
+        try
+        {
+            // Ground truth for the main (pid 1) process's own kernel-assigned supplementary groups —
+            // read via /proc, not a fresh `id -G` (there is no way to invoke `id` *as* pid 1), then
+            // reformatted to the same space-separated decimal shape `id -G` prints so the two are
+            // directly comparable.
+            var status = await daemon.DockerAsync(["exec", name, "cat", "/proc/1/status"]);
+            Assert.True(status.Ok, status.ToString());
+            var groupsLine = status.Stdout
+                .Split('\n')
+                .FirstOrDefault(line => line.StartsWith("Groups:", StringComparison.Ordinal));
+            Assert.NotNull(groupsLine);
+            var mainProcessGroups = string.Join(
+                ' ',
+                groupsLine!["Groups:".Length..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+            // The actual claim under test: a plain `docker exec` (no --user of its own) must inherit
+            // the same secondary groups, not the empty list cider-ede.28 fixed.
+            var execGroups = await daemon.DockerAsync(["exec", name, "id", "-G"]);
+            Assert.True(execGroups.Ok, execGroups.ToString());
+
+            Assert.NotEqual("0", mainProcessGroups);
+            Assert.Equal(mainProcessGroups, execGroups.Stdout.Trim());
+
+            // An exec that overrides the user gets its own groups, not the container's -- spec.User
+            // non-empty sends an empty list rather than resolving a guest identity cider cannot read
+            // (ProcessConfigurationBuilder's own documented limit, cider-ede.28). "1" (daemon's own
+            // primary/only group in /etc/passwd) has no secondary memberships in alpine's /etc/group.
+            var overriddenExec = await daemon.DockerAsync(["exec", "--user", "1", name, "id", "-G"]);
+            Assert.True(overriddenExec.Ok, overriddenExec.ToString());
+            Assert.NotEqual(mainProcessGroups, overriddenExec.Stdout.Trim());
+        }
+        finally
+        {
+            await daemon.DockerAsync(["rm", "-f", name], timeout: TimeSpan.FromMinutes(2));
         }
     }
 }

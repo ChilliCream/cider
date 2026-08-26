@@ -119,6 +119,16 @@ public class DaemonFixture : IAsyncLifetime
     /// </summary>
     protected virtual int? PollIntervalOverride => null;
 
+    /// <summary>
+    /// The runtime transport this fixture instance pins <see cref="Options"/> to, overriding <see
+    /// cref="Transport"/> (the ambient <c>CIDER_RUNTIME_TRANSPORT</c>-driven default every other
+    /// fixture uses). For a test whose own verification names one transport specifically — e.g.
+    /// cider-ede.31's decisive experiment says "on the xpc transport" — so it runs there even when
+    /// CI's transport matrix has moved the ambient default to <c>cli</c>. Left at its <c>null</c>
+    /// default, every fixture behaves exactly as before (<see cref="Transport"/> decides).
+    /// </summary>
+    protected virtual string? RuntimeTransportOverride => null;
+
     /// <inheritdoc />
     public async Task InitializeAsync()
     {
@@ -164,7 +174,7 @@ public class DaemonFixture : IAsyncLifetime
             // `auto` by default, like the real daemon; CI's transport matrix sets
             // CIDER_RUNTIME_TRANSPORT=xpc or =cli to pin this fixture's daemon to one transport for
             // the whole run instead of letting each fixture instance decide for itself.
-            RuntimeTransport = Transport,
+            RuntimeTransport = RuntimeTransportOverride ?? Transport,
         };
 
         // Only assign when a fixture actually wants a pinned interval: the setter latches
