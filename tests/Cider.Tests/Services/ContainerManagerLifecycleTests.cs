@@ -180,6 +180,77 @@ public sealed class ContainerManagerLifecycleTests
     }
 
     [Fact]
+    public async Task Start_returns_with_the_published_listener_bound_but_registration_and_publication_still_pending()
+    {
+        // cider-ede.27: Start returns once containerStartProcess succeeds and cider-ede.18's
+        // listeners are bound, not once every side effect of the start has settled. This proves both
+        // halves of that split are observably still in flight the instant Start hands back control —
+        // not merely "eventually done" — and that both settle on their own afterwards without anyone
+        // calling Start (or the poller) again.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        harness.Containers.NetworkPollInterval = TimeSpan.FromMilliseconds(10);
+
+        // Twenty empty inspects vastly outlives anything the detached continuation could race through
+        // between StartAsync's own await returning and the assertions right below it, so the pending
+        // state asserted here does not depend on winning a timing race — the delay count guarantees
+        // no address has been found yet regardless of how many inspects happen to have already run.
+        harness.Runtime.DelayNetworkAttachment("web", 20);
+
+        var record = await harness.CreateShellAsync("sleep 5", "web", request =>
+            request.HostConfig = new HostConfig { PortBindings = { ["8080/tcp"] = [new PortBinding()] } });
+
+        await harness.Containers.StartAsync(record.Id, default);
+
+        Assert.True(record.State.Running);
+        Assert.False(
+            harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "DNS must not already be registered the instant Start returns -- that would mean registration ran inline again");
+
+        var pending = harness.Publisher.LiveFor(record.Id);
+        Assert.NotEmpty(pending);
+        Assert.All(pending, port => Assert.Null(port.ContainerIp));
+
+        // Both settle on their own, on a later tick, with nobody calling Start (or the poller) again.
+        await ContainerTestHarness.WaitUntilAsync(
+            () => harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "DNS to register once the detached continuation finds the address");
+        await ContainerTestHarness.WaitUntilAsync(
+            () => harness.Publisher.LiveFor(record.Id).Any(port => port.ContainerIp is not null),
+            "the port publisher to learn the backend address once the detached continuation finds it");
+
+        await harness.Containers.KillAsync(record.Id, "SIGKILL", default);
+    }
+
+    [Fact]
+    public async Task Start_of_a_container_that_exits_immediately_reaches_HandleExitAsync_exactly_once_despite_a_pending_address()
+    {
+        // cider-ede.27 fix direction: "HandleExitAsync must still win a race with the continuation."
+        // Withholding the address for the whole test is the worst case for that race -- the detached
+        // post-start continuation (cider-ede.26/27) never gets a resolved address to stop early on, so
+        // whatever inspecting it manages to do happens against a container that is, by the time it
+        // gets anywhere, already exited.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await using var events = await harness.CollectEventsAsync();
+        harness.Containers.NetworkPollInterval = TimeSpan.FromMilliseconds(5);
+
+        var record = await harness.CreateShellAsync("exit 0", "web");
+        harness.Runtime.DelayNetworkAttachment("web", 1000);
+
+        await harness.Containers.StartAsync(record.Id, default);
+        await events.WaitForAsync("die");
+
+        // Give any continuation that raced past the exit a chance to run its course before checking
+        // that it did not regress anything HandleExitAsync already settled.
+        await Task.Delay(TimeSpan.FromMilliseconds(200));
+
+        Assert.Equal(1, events.Actions.Count(action => action == "die"));
+        Assert.Equal("exited", record.State.Status);
+        Assert.False(
+            harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "the detached continuation must not win a race with HandleExitAsync and leave DNS registered for an exited container");
+    }
+
+    [Fact]
     public async Task Wait_next_exit_returns_the_exit_code_of_the_run_that_follows()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

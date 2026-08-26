@@ -451,10 +451,23 @@ public sealed partial class ContainerManager
     /// Copies IP/gateway/MAC/network id from an inspect result into the record and registers the
     /// container's DNS names for every attachment that already has an address. Returns <c>true</c>
     /// once the record has nothing left to wait for: either it declares no networks, or every one of
-    /// the runtime's reported attachments has a non-empty <c>IPv4Address</c>.
+    /// the runtime's reported attachments has a non-empty <c>IPv4Address</c>, or (cider-ede.27) the
+    /// container has already exited by the time this runs — <see cref="HandleExitAsync"/> has already
+    /// unregistered its DNS names, and this must not race it and re-register them for a container
+    /// that is no longer running. Both callers (this file's own detached
+    /// <see cref="AwaitStartupAndRegisterNetworkNamesAsync"/>, and <see cref="RefreshNetworkInfoAsync"/>
+    /// via <see cref="StatePoller"/>) can legitimately still be mid-flight when the container exits;
+    /// <see cref="StatePoller"/> already gates its call on <c>record.State.Running</c>, but the
+    /// detached post-start continuation has no equivalent gate around this specific call, so it lives
+    /// here instead of being duplicated at every call site.
     /// </summary>
     private bool ApplyNetworkInfo(ContainerRecord record, RuntimeContainer inspected)
     {
+        if (!record.State.Running)
+        {
+            return true;
+        }
+
         if (record.Networks.Count == 0)
         {
             return true;
