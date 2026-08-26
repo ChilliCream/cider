@@ -130,6 +130,10 @@ start_daemon() {
 
   _cider_log "daemon did not answer /_ping within ${CIDER_COMPAT_PING_TIMEOUT}s; log tail:"
   tail -n 60 "$CIDER_COMPAT_DAEMON_LOG" >&2 || true
+  # Callers install `trap stop_daemon EXIT` only after start_daemon returns
+  # success, so on this failure path nothing else will reap the daemon we
+  # just launched -- stop it ourselves before returning.
+  stop_daemon
   return 1
 }
 

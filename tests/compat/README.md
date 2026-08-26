@@ -77,7 +77,12 @@ script. Provides:
   answers (or `CIDER_COMPAT_PING_TIMEOUT` seconds elapse, default 60).
   Returns 1 with `daemon binary not found at <path>` when the binary for
   `$CIDER_COMPAT_FRAMEWORK` has not been built (notably under
-  `CIDER_COMPAT_SKIP_BUILD=1`).
+  `CIDER_COMPAT_SKIP_BUILD=1`). If `/_ping` does not answer within
+  `CIDER_COMPAT_PING_TIMEOUT`, `start_daemon` tails the daemon log, stops
+  the daemon it launched (the same captured-PID SIGTERM/wait/SIGKILL path
+  as `stop_daemon`), and returns 1 — so a failed start never leaves a
+  daemon behind even though callers install their `EXIT` trap only after a
+  successful start.
 - `stop_daemon` — kills only the PID `start_daemon` captured via `$!` at
   launch (SIGTERM, wait, SIGKILL fallback) and unlinks the socket. No
   `pgrep`/`pkill` pattern matching is used, so cleanup can never hit the
