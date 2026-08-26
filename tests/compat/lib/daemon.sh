@@ -70,6 +70,12 @@ build_daemon() {
 start_daemon() {
   mkdir -p "$CIDER_COMPAT_DOCKER_CONFIG"
 
+  # A leftover PID file from a previous run must never survive into this
+  # run's stop_daemon: PIDs are recycled by the OS, so a stale file could
+  # cause cleanup to signal an unrelated process (including, worst case, the
+  # operator's real installed daemon if it happened to reuse that PID).
+  rm -f "$CIDER_COMPAT_PID_FILE"
+
   # `docker compose` (and buildx, etc.) are CLI *plugins*, discovered under
   # $DOCKER_CONFIG/cli-plugins -- which we just pointed at an isolated,
   # empty directory for config isolation. Without this, `docker compose ...`

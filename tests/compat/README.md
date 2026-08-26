@@ -69,13 +69,19 @@ script. Provides:
 
 - `start_daemon` — `dotnet build src/Cider.Daemon -c Release` (skip
   with `CIDER_COMPAT_SKIP_BUILD=1` once you've built it yourself), then
-  `dotnet run --project src/Cider.Daemon -c Release --no-build --
-  serve --socket /tmp/cider-compat.sock --data-dir /tmp/cider-compat-data` in the
-  background, and polls `/_ping` over the unix socket until it answers (or
-  `CIDER_COMPAT_PING_TIMEOUT` seconds elapse, default 60).
-- `stop_daemon` — kills both the `dotnet run` wrapper and its child
-  `cider` process (the wrapper does not reliably forward signals to
-  the app it launches) and unlinks the socket. Idempotent.
+  launches the built apphost binary
+  `src/Cider.Daemon/bin/Release/$CIDER_COMPAT_FRAMEWORK/cider serve --socket
+  /tmp/cider-compat.sock --data-dir /tmp/cider-compat-data` directly in the
+  background (no `dotnet run` wrapper, so the PID captured via `$!` IS the
+  daemon's real PID), and polls `/_ping` over the unix socket until it
+  answers (or `CIDER_COMPAT_PING_TIMEOUT` seconds elapse, default 60).
+  Returns 1 with `daemon binary not found at <path>` when the binary for
+  `$CIDER_COMPAT_FRAMEWORK` has not been built (notably under
+  `CIDER_COMPAT_SKIP_BUILD=1`).
+- `stop_daemon` — kills only the PID `start_daemon` captured via `$!` at
+  launch (SIGTERM, wait, SIGKILL fallback) and unlinks the socket. No
+  `pgrep`/`pkill` pattern matching is used, so cleanup can never hit the
+  operator's real installed daemon. Idempotent.
 - Exports `DOCKER_HOST=unix:///tmp/cider-compat.sock` and
   `DOCKER_CONFIG=/tmp/cider-compat-dockercfg` for the whole calling script, so
   every plain `docker ...` invocation after `source lib/daemon.sh`
