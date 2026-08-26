@@ -524,7 +524,7 @@ public sealed partial class CiderOptions
             },
             Runtime = new RuntimeModel { Transport = options.RuntimeTransport },
             PortPublishing = options.PortPublishing,
-            PollIntervalSeconds = options.PollIntervalSeconds,
+            PollIntervalSeconds = options.PollIntervalSecondsIsExplicit ? options.PollIntervalSeconds : null,
             LogMaxBytes = options.LogMaxBytes,
             LogLevel = options.LogLevel,
         };
