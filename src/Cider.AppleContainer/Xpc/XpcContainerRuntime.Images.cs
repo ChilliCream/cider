@@ -51,7 +51,7 @@ internal sealed partial class XpcContainerRuntime
             {
                 var descriptions = await _imagesClient.ImageListAsync(ct).ConfigureAwait(false);
                 var images = new List<RuntimeImage>();
-                var unresolvedDigests = new List<string>();
+                var unresolvedDigests = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var group in GroupByDigest(descriptions))
                 {
                     var digest = group[0].Descriptor.Digest;
@@ -61,12 +61,13 @@ internal sealed partial class XpcContainerRuntime
 
                 // Parity with the CLI transport's own dangling-content Warning (cider-ede.24 fix
                 // direction item 3): a single unresolvable blob must never fail the whole listing on
-                // either transport, and an operator must see the same guidance either way — one
+                // either transport, and an operator must see the same guidance either way — exactly one
                 // Warning per listing call, not one per unresolved blob (a manifest and its config
-                // digest for the same image can both be unresolvable at once).
-                foreach (var digest in unresolvedDigests)
+                // digest for the same image can both be unresolvable at once, and unresolvedDigests
+                // de-dupes a digest shared by two groups so it is only named once).
+                if (unresolvedDigests.Count > 0)
                 {
-                    _logger.LogWarning("{Message}", CliErrorMapper.DanglingContentRemedy(digest));
+                    _logger.LogWarning("{Message}", CliErrorMapper.DanglingContentRemedy(string.Join(", ", unresolvedDigests)));
                 }
 
                 return (IReadOnlyList<RuntimeImage>)images;
@@ -117,7 +118,7 @@ internal sealed partial class XpcContainerRuntime
     /// invalidation surface).
     /// </summary>
     private async Task<(List<OciDescriptor> Variants, Dictionary<string, AppleOciManifest> Manifests, Dictionary<string, AppleOciImageDocument> Configs)>
-        LoadBlobsAsync(string? digest, CancellationToken ct, List<string>? unresolvedDigests = null)
+        LoadBlobsAsync(string? digest, CancellationToken ct, ISet<string>? unresolvedDigests = null)
     {
         var index = await GetBlobAsync<OciIndex>(digest, ct, unresolvedDigests).ConfigureAwait(false);
         var variants = RealVariants(index);
@@ -155,20 +156,24 @@ internal sealed partial class XpcContainerRuntime
     /// <c>contentGet(digest)</c> → local path → <see cref="LocalBlobReader.TryReadAsync{T}"/> (§6's
     /// two-step read). <c>null</c> on a missing digest, a <c>notFound</c> from <c>contentGet</c> itself,
     /// or an unparsable/missing blob file — every case collapses to "nothing recovered", exactly like
-    /// the CLI transport's own best-effort blob reads.
+    /// the CLI transport's own best-effort blob reads, and every one of them records
+    /// <paramref name="digest"/> into <paramref name="unresolvedDigests"/> for the caller's single
+    /// per-listing Warning (item 3) — not just the exception path below, since
+    /// <see cref="ImagesServiceClient.ContentGetAsync"/> already swallows a <c>notFound</c> itself and
+    /// answers <c>null</c>, and a <paramref name="digest"/> whose blob file has since been deleted from
+    /// disk resolves to a path that simply no longer exists — both far more common live shapes than an
+    /// actual thrown exception.
     ///
     /// cider-ede.24 fix direction item 2: a single dangling/unresolvable content reference must never
     /// fail the whole listing (parity with the CLI transport's own tolerance in
     /// <c>AppleContainerRuntime.ListImagesAsync</c>) — so any <see cref="XpcException"/>
     /// <see cref="ContentGetAsync"/> raises beyond the <c>notFound</c> it already swallows itself is
-    /// caught here too and collapses to "nothing recovered" the same way, recording
-    /// <paramref name="digest"/> into <paramref name="unresolvedDigests"/> for the caller's single
-    /// per-listing Warning (item 3) instead of logging one line per blob here. The one exception is
+    /// caught here too and collapses to "nothing recovered" the same way. The one exception is
     /// <see cref="RuntimeErrorKind.Unavailable"/>, which must keep propagating unchanged — that is what
     /// lets <see cref="XpcReadAsync{T}"/>'s own catch fall the *entire* call back to the CLI transport
     /// rather than this method silently absorbing an apiserver that is not there at all.
     /// </summary>
-    private async Task<T?> GetBlobAsync<T>(string? digest, CancellationToken ct, List<string>? unresolvedDigests = null) where T : class
+    private async Task<T?> GetBlobAsync<T>(string? digest, CancellationToken ct, ISet<string>? unresolvedDigests = null) where T : class
     {
         if (string.IsNullOrEmpty(digest))
         {
@@ -187,7 +192,13 @@ internal sealed partial class XpcContainerRuntime
             return null;
         }
 
-        return await LocalBlobReader.TryReadAsync<T>(path, _logger, ct).ConfigureAwait(false);
+        var blob = await LocalBlobReader.TryReadAsync<T>(path, _logger, ct).ConfigureAwait(false);
+        if (blob is null)
+        {
+            unresolvedDigests?.Add(digest);
+        }
+
+        return blob;
     }
 
     /// <summary>
