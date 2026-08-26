@@ -93,7 +93,7 @@ cider serve [--socket PATH] [--data-dir DIR] [--log-level LEVEL] [--no-dns]   # 
 cider status [--socket PATH]        # socket / launchd / Apple container status
 cider sync [--socket PATH] [--data-dir DIR] [--json]   # resync cider's state with Apple container
 cider uninstall [--data-dir DIR]    # unload the agent, drop the context, restore the system socket
-cider host-loopback enable|disable  # opt in/out of the 127.0.0.1 pf redirect, see below
+cider host-loopback enable|disable  # opt in/out of the 127.0.0.1 pf redirect (experimental, see below)
 cider version
 ```
 
@@ -369,6 +369,17 @@ turn it back off, and:
   removes its three lines from `/etc/pf.conf` and releases pf via reference-counted
   `pfctl -X <token>`, using the token `enable`'s `pfctl -E` printed and recorded — it never runs
   `pfctl -d` and never touches any other anchor, Apple's included.
+- **Experimental — two known defects (cider-ede.22), found by review and not yet fixed.** `pfctl -E`
+  prints its `Token : <n>` line on **stderr**, but the token parser only reads stdout
+  (`PfRedirect.ParseEnableToken`/`RecordEnableToken`), so the token is never actually recorded; a
+  later `disable` then has nothing to pass to `pfctl -X` and never releases pf's reference count at
+  all. Separately, if `pfctl -E` succeeds but a later step in `enable` fails, the token it *did* parse
+  (when parsing worked) is dropped without being persisted or released either. Both leak a pf
+  reference until it clears itself: `sudo pfctl -a com.chillicream.cider.hostloopback -F all` flushes
+  the anchor's rules, but the reference-counted `pfctl -E` enable itself was never matched by a
+  `pfctl -X <token>` disable, and there is no token on hand to construct one by hand either — a
+  reboot is the reliable way to clear it. Treat `host-loopback enable` as unverified until this is
+  fixed.
 
 ## Limitations
 
@@ -376,6 +387,7 @@ turn it back off, and:
 |---|---|
 | **BuildKit is single-platform and cannot export to a cache or a registry** | `builder.enabled` defaults to `true` and `docker build`/`buildx build`/`bake`/`compose build` all reach BuildKit through `/grpc` + `/session` (see [Building images](#building-images)) — but only `linux/arm64`: a multi-platform `--platform` request fails at Solve time because the docker (tar) exporter every build is rewritten to cannot produce a manifest list. `--cache-to`/`--cache-from` are not supported (no cache export), and `--output type=docker,dest=<path>`/`type=oci` are rejected — buildx refuses both for the docker driver without a containerd snapshotter, and Apple's worker is made to look like it has none on purpose (see [How it works](#how-it-works)) so buildx does not enable exporters this proxy cannot serve. The build cache lives inside Apple's *own* builder VM, not on the host, and is wiped by `container builder delete`. Set `builder.enabled: false` (or `CIDER_BUILDKIT=0`) to turn BuildKit off entirely and force the classic builder with `DOCKER_BUILDKIT=0` |
 | **BuildKit context uploads are paced to 32 MiB/s by default** | Only the bytes the daemon sends *to* buildkitd — build context uploads via FileSync/DiffCopy — pass through a token-bucket pacer (`TokenBucketPacer.DefaultBytesPerSecond`) on the exec pipe (`container exec -i buildkit buildctl dial-stdio`), so a large upload cannot overrun buildkitd's HTTP/2 receive window and wedge it. Bytes buildkitd sends back — image tar exports via FileSend, and the Control/Status streams — are not paced at all; that direction is bounded only by the connection's 256 KiB initial HTTP/2 stream window (`BuilderConnection.InitialStreamWindowBytes`). Retuned (cider-ger.21) from the original 8 MiB/s placeholder shipped before any large-context measurement existed: a 200 MiB build context now transfers in ~6.2s (~32 MiB/s, matching the new steady rate — was ~25s at 8 MiB/s), with zero stalls or link-recovery events. 32 MiB/s, rather than a rate closer to the exec pipe's demonstrated ~120-260 MiB/s single-stream ceiling (a 585 MB `--output type=tar` export — unaffected by the pacer, since exports travel the unpaced direction — moved at ~266 MiB/s, and a 512 MiB/s pacer diagnostic moved the same 200 MiB context in ~1s, both with zero stalls), was chosen to leave margin for buildkitd being busy or a slow consumer on the far side; concurrent builds share one link and so one aggregate token bucket rather than multiplying the rate. Full reasoning and the evidence behind the margin are recorded on `TokenBucketPacer.DefaultBytesPerSecond`'s doc comment |
+| Legacy `POST /build?version=2&session=...&remote=client-session` clients are not supported | Old `docker-py` (`images.build(..., version='2')`) and some `Docker.DotNet` build paths post the context over a separate `/session` upload instead of the request body. The daemon ignores `version` and always runs the classic single-shot build, which rejects `remote=client-session` outright with a 501 (`ImageManager.BuildAsync`, `request.Remote`) rather than fetching the context over `/session`. Evaluated and closed as won't-do (cider-ger.14): wiring it through the daemon's BuildKit control-proxy plumbing would mean pulling the `Solve`/session-attach helpers off the real inbound gRPC call context they depend on today, which risks the modern, working `buildx`/`/grpc`+`/session` path for a compatibility shim that the current `docker` CLI (v29.7.2) never even exercises. `docker build`/`buildx build` and everything under [Building images](#building-images) are unaffected |
 | No pause/unpause | `POST /containers/{id}/pause` and `/unpause` return 501 — there is no apiserver route for it, and no cgroup-freezer equivalent inside Apple's guest init (`vminitd`); the closest approximation, `SIGSTOP`/`SIGCONT` to just the container's init process, freezes PID 1 but not its whole process tree for most images, so it is not offered as a substitute |
 | No `--privileged` | Mapped to `--cap-add ALL` plus empty masked/read-only path lists — `--masked-path NONE --read-only-path NONE` over the CLI fallback, typed empty `maskedPaths`/`readonlyPaths` arrays over XPC, same semantics either way — which is not a true privileged mode; Docker-in-Docker and some device access will not behave |
 | No `--network host` / `none` / `container:*` | Rejected with 400. A compose service using `network_mode: host` does not come up |
@@ -392,8 +404,8 @@ turn it back off, and:
 | No `diff`, best-effort `top` | `changes` is not implemented (Apple exposes no layer view); `top` runs `ps` inside the container as an approximation |
 | Restart policies and healthchecks are emulated | The daemon supervises `always`/`unless-stopped`/`on-failure` restarts and runs healthcheck probes itself; Apple `container` has no native support for either. On the XPC transport this got more reliable across a daemon restart: a still-running container's exit is now actually waited for (see the exit-codes row above) and republished as a normal `die` event, so a `restart: always` container that is still running when the daemon comes back and exits afterwards is picked back up correctly, instead of the daemon never finding out. A container that exited *during* the daemon's downtime is still not restarted: reconcile records it as `exited` with `exit code unknown (daemon restarted)` and raises no `die` state change, so the restart supervisor never sees it (same limit as the exit-codes row above) |
 | No swarm | Every `/swarm`, `/services`, `/tasks`, `/nodes`, `/secrets`, `/configs`, `/plugins` route answers with a clear "not supported" error instead of a raw 404. Apple `container` 1.3 ships its own local single-node orchestration answer, the `container k8s` plugin, if that shape fits — this daemon does not proxy to it |
-| IPv6 management is limited | Container IPv6 addresses are reported: `docker inspect` surfaces `NetworkSettings`/`EndpointSettings` `GlobalIPv6Address` from Apple's own `ipv6Address`, and `docker network create --subnet-v6`/`-6` is honoured and passed straight through as `container network create --subnet-v6`. What's still missing: no `--ip6` (no field to request a static IPv6 address, the same structural gap as the static-IPv4 row above), and IPv6-only or dual-stack publish/connect behaviour beyond that is unexercised |
-| `host.docker.internal` reaches only `0.0.0.0`-bound services, unless you opt in | A host service bound to `127.0.0.1` only is not reachable from containers by default — and many dev servers bind loopback by default. `cider host-loopback enable` closes the gap with a pf redirect; see [Reaching loopback-only host services](#reaching-loopback-only-host-services) |
+| IPv6 management is limited | Container IPv6 addresses are reported: `docker inspect` surfaces `NetworkSettings`/`EndpointSettings` `GlobalIPv6Address` from Apple's own `ipv6Address`, and `docker network create --subnet-v6`/`-6` is honoured and passed straight through as `container network create --subnet-v6`. `IPv6Gateway` is always empty though, and not just unpopulated by an oversight: Apple's XPC `Attachment` type has no per-attachment IPv6 gateway field at all to read (`docs/spikes/xpc/02-apiserver-xpc-protocol.md` §2.2), so there is nothing upstream to plumb through. Also still missing: no `--ip6` (no field to request a static IPv6 address, the same structural gap as the static-IPv4 row above), and IPv6-only or dual-stack publish/connect behaviour beyond what's above is unexercised |
+| `host.docker.internal` reaches only `0.0.0.0`-bound services, unless you opt in | A host service bound to `127.0.0.1` only is not reachable from containers by default — and many dev servers bind loopback by default. `cider host-loopback enable` closes the gap with a pf redirect, but treat it as **experimental**: it has two known defects (cider-ede.22) that can leak a pf reference-count token on every `enable`; see [Reaching loopback-only host services](#reaching-loopback-only-host-services) for what that means before turning it on |
 | Published ports flow through the daemon (default `proxy`) | Traffic is relayed by the daemon process, not by the kernel or Apple's forwarder, so it stops when the daemon stops and adds one userland hop. `portPublishing: "apple"` avoids the hop but depends on macOS Local Network permission |
 | `docker cp` **into** a created container is emulated | Apple `container cp` refuses a container that is not running, so a tar `PUT` into a created container is staged under the data dir and bind-mounted in when the container starts (this is how .NET Aspire injects its dev certificates). Up to 64 files are mounted; beyond that they are copied in immediately after the start instead |
 | `docker cp` **out of** a stopped container is emulated | The same refusal, in the other direction: `container cp`/`containerCopyOut` both guard on the container being started. The path is selected out of the container's own rootfs export (over XPC, the same no-VM-boot `containerExport` the commit/import row above uses, so at least no subprocess or VM boot on the way), which still costs O(rootfs) rather than O(path). A path that reaches its target through a symbolic link inside the container is not resolved <!-- wording taken from the cp-out implementation's own note; src/Cider.Core/Services/ContainerManager.Archive.cs --> |
@@ -637,8 +649,8 @@ dotnet test Cider.sln
 ```
 
 Unit and integration tests against a fake in-memory container runtime, plus — when the real `docker`
-CLI is on `PATH` — an in-process daemon over a temp socket: **1058 passing and 12 skipped** in
-`Cider.Tests` (the 12 need the opt-in below) and **16** in `Cider.Dns.Tests`, on both target
+CLI is on `PATH` — an in-process daemon over a temp socket: **1338 passing and 29 skipped** in
+`Cider.Tests` (the 29 need the opt-in below) and **16** in `Cider.Dns.Tests`, on both target
 frameworks.
 
 Tests against the real Apple `container` runtime are opt-in and slower:
@@ -647,11 +659,17 @@ Tests against the real Apple `container` runtime are opt-in and slower:
 CIDER_E2E=1 dotnet test Cider.sln
 ```
 
-That adds the adapter tests in `tests/Cider.Tests/AppleContainer/` and the `tests/Cider.E2E.Tests`
-suite — **33 tests, last run 32 passed / 1 skipped / 0 failed** (roughly 4 minutes), driving the real
-`docker` CLI, `docker compose`, Testcontainers and a .NET Aspire AppHost against an in-process daemon
-on the real runtime. The single skip is the `apple`-mode port characterization, which only runs with
-`CIDER_PORT_PUBLISHING=apple`.
+That adds the adapter tests in `tests/Cider.Tests/AppleContainer/` (29) and the
+`tests/Cider.E2E.Tests` suite (69, including a handful of always-on fixture-ownership unit tests) —
+**98 tests today**, up from 33 the last time this section was checked, driving the real `docker` CLI,
+`docker compose`, Testcontainers and a .NET Aspire AppHost against an in-process daemon on the real
+runtime. A bare `CIDER_E2E=1` run against the default `auto` transport skips at least four of them:
+the `apple`-mode port characterization (`CIDER_PORT_PUBLISHING=apple`), the two XPC-only fast-path
+latency characterizations in `PerfSmokeTests` (`CIDER_RUNTIME_TRANSPORT=xpc` set *explicitly* — `auto`
+resolving to XPC at runtime does not count, since the attribute cannot see that resolution), and the
+large build-context characterization (`CIDER_E2E_LARGE=1`). Exact pass/skip counts and timing depend
+on what's already on the machine (see the per-TFM note below), so no fixed "last run" number is
+quoted here.
 
 The Testcontainers and Aspire fixtures (`tests/e2e-testcontainers`, `tests/e2e-aspire`) sit outside
 `Cider.sln` on purpose and are built by those tests on demand; the Aspire fixture pins SDK 10.0.302
