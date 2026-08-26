@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.RegularExpressions;
 using Cider.E2E.Tests.Infrastructure;
 using Xunit;
 
@@ -19,6 +21,50 @@ public sealed class EventsTests(DaemonFixture daemon)
     /// </summary>
     private static bool RanUnderXpc(DaemonFixture fixture) =>
         fixture.DaemonLog.Any(line => line.Contains("runtime transport: xpc", StringComparison.Ordinal));
+
+    /// <summary>Matches <c>StatePoller.StartAsync</c>'s own startup line (<c>StatePoller.cs:77-82</c>):
+    /// <c>"state poller: interval {N}s ({default|configured}, transport {xpc|cli})"</c>.</summary>
+    private static readonly Regex StatePollerLine = new(
+        @"state poller: interval (?<seconds>\d+)s \((?<source>default|configured), transport (?<transport>xpc|cli)\)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// task cider-27t's own named E2E verification, closed directly: asserts the daemon's actual
+    /// resolved poll interval straight from its own startup log line, rather than trying to infer it
+    /// from a die-latency budget. No <c>/events</c>-watching latency test can do that inference — see
+    /// the second remark on <see cref="Events_on_xpc_sees_die_within_1_5s_of_container_exit"/>'s doc
+    /// comment for why. This needs no container and is deterministic: it asserts the log line's source
+    /// token is <c>"default"</c> (proving <see cref="DaemonFixture"/> no longer pins
+    /// <c>PollIntervalSeconds</c> explicit — exactly what task cider-27t changed) and that the interval
+    /// it resolved to matches the transport table task cider-ede.19 introduced: 1s under xpc, 3s under
+    /// the CLI transport.
+    /// </summary>
+    [E2EFact]
+    public void The_daemons_own_log_shows_the_unpinned_transport_aware_poll_interval()
+    {
+        var match = daemon.DaemonLog
+            .Select(line => StatePollerLine.Match(line))
+            .FirstOrDefault(m => m.Success);
+
+        Assert.True(
+            match is { Success: true },
+            "expected a \"state poller: interval …\" startup line in the daemon log; got:\n"
+            + string.Join('\n', daemon.DaemonLog));
+
+        var seconds = int.Parse(match!.Groups["seconds"].Value, CultureInfo.InvariantCulture);
+        var source = match.Groups["source"].Value;
+        var transport = match.Groups["transport"].Value;
+
+        Assert.Equal("default", source);
+
+        var expectedSeconds = transport switch
+        {
+            "xpc" => 1,
+            "cli" => 3,
+            _ => throw new InvalidOperationException($"unexpected transport token \"{transport}\" in: {match.Value}"),
+        };
+        Assert.Equal(expectedSeconds, seconds);
+    }
 
     [E2EFact]
     public async Task Events_stream_create_start_die_and_stop_for_one_container()
@@ -67,6 +113,13 @@ public sealed class EventsTests(DaemonFixture daemon)
     /// daemon run under that real default instead of a fixture-pinned value. Off xpc (the CLI transport,
     /// or a machine <c>RuntimeTransportSelector</c> fell back from) the budget is not asserted — the CLI
     /// default is 3s, above the 1.5s bar by design — but the event must still eventually show up.
+    /// Separately, and regardless of transport: this test cannot exercise <c>Interval</c> at all, even
+    /// for the (inapplicable) poller-drop path, because it keeps a <c>docker events</c> stream open for
+    /// its whole run, and <c>StatePoller.RunAsync</c> switches to <c>FastInterval</c> (a fixed 1s)
+    /// whenever <c>EventBus.SubscriberCount</c> is above zero — so an events-watching test times
+    /// <c>FastInterval</c>, never <c>Interval</c>, whichever path emits <c>die</c>. Closing the actual
+    /// gap this leaves — observing the resolved <c>Interval</c> default end to end — is what
+    /// <see cref="The_daemons_own_log_shows_the_unpinned_transport_aware_poll_interval"/> does instead.
     /// </summary>
     [E2EFact]
     public async Task Events_on_xpc_sees_die_within_1_5s_of_container_exit()
@@ -120,6 +173,12 @@ public sealed class EventsTests(DaemonFixture daemon)
                 // detection instant.
                 var exitedAtUpperBound = readyAt + TimeSpan.FromSeconds(sleepSeconds);
                 var detectionLatency = observedAt - exitedAtUpperBound;
+
+                Assert.True(
+                    detectionLatency > TimeSpan.Zero,
+                    $"detection latency was {detectionLatency.TotalSeconds:F2}s (<= 0): the readiness "
+                    + $"anchor at {readyAt:O} overshot the container's real exit, so the budget below "
+                    + "was not actually exercised — this run would otherwise pass empty-handed");
 
                 Assert.True(
                     detectionLatency <= TimeSpan.FromSeconds(1.5),

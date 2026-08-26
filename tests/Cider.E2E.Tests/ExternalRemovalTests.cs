@@ -73,7 +73,12 @@ public sealed class ExternalRemovalTests(RestartableDaemonFixture daemon)
                         .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                         .Contains(name, StringComparer.Ordinal);
                 },
-                TimeSpan.FromSeconds((daemon.Options.PollIntervalSeconds * 3) + 15),
+                // A literal worst-case budget, not `daemon.Options.PollIntervalSeconds * 3 + 15`: this
+                // fixture leaves the interval unset (task cider-27t), so that property only ever
+                // returns CiderOptions' constructor default (3) — never the transport-aware value
+                // StatePoller actually resolves at startup (StatePoller.cs:58-59, 1s xpc / 3s cli).
+                // 30s covers two consecutive misses at either default with slack to spare.
+                TimeSpan.FromSeconds(30),
                 TimeSpan.FromSeconds(1));
             Assert.True(dropped, $"container {name} was never dropped after being removed outside cider");
 
