@@ -10,42 +10,88 @@ internal interface IPortForwarder : IDisposable
 {
     /// <summary>The host endpoint actually bound (the port is resolved when it was requested as 0).</summary>
     IPEndPoint HostEndPoint { get; }
+
+    /// <summary>
+    /// Supplies the backend address to a forwarder that was bound without one yet, unblocking whatever
+    /// connections are already waiting on it (cider-ede.18). A no-op on a forwarder that already has a
+    /// target — which is every <see cref="UdpPortForwarder"/>: it has no accept-and-hold mode and is
+    /// never constructed without one to begin with.
+    /// </summary>
+    void ResolveTarget(IPAddress containerIp);
 }
 
 /// <summary>
 /// A TCP listener on the host that accepts connections and pumps them, in both directions, to
-/// <c>containerIp:containerPort</c>. Half-closes are propagated (an EOF on one side shuts the other
-/// side's send half down), so protocols that rely on the peer seeing FIN — plain HTTP/1.0 responses,
-/// <c>nc</c>-style servers — behave the way they would through dockerd's userland proxy. Idle
-/// connections are never timed out; only a close on either side or <see cref="Dispose"/> ends them.
+/// <c>containerIp:containerPort</c>. The listener binds and starts accepting immediately, whether or
+/// not <c>containerIp</c> is known yet (cider-ede.18: the daemon no longer waits for the container's
+/// VM address before publishing a TCP mapping, so a client racing to connect during the VM boot is
+/// accepted and queued instead of refused). A connection accepted before the address is known waits,
+/// up to <see cref="TargetWaitTimeout"/>, for <see cref="ResolveTarget"/> to supply it; past that it is
+/// closed without ever having been relayed. Half-closes are propagated once relaying starts (an EOF on
+/// one side shuts the other side's send half down), so protocols that rely on the peer seeing FIN —
+/// plain HTTP/1.0 responses, <c>nc</c>-style servers — behave the way they would through dockerd's
+/// userland proxy. Idle connections are never timed out; only a close on either side or
+/// <see cref="Dispose"/> ends them.
 /// </summary>
 internal sealed class TcpPortForwarder : IPortForwarder
 {
     private const int BufferSize = 64 * 1024;
     private const int Backlog = 128;
 
+    /// <summary>
+    /// How long an accepted connection waits for <see cref="ResolveTarget"/> before it is closed.
+    /// Generous on purpose: it only bounds the pathological case (the address never arrives at all,
+    /// e.g. the container's network attachment itself failed) rather than the ordinary VM boot the
+    /// daemon is not trying to add its own latency on top of.
+    /// </summary>
+    internal static readonly TimeSpan TargetWaitTimeout = TimeSpan.FromSeconds(30);
+
     private readonly Socket _listener;
-    private readonly IPEndPoint _target;
+    private readonly int _containerPort;
     private readonly ILogger _logger;
     private readonly CancellationTokenSource _cts = new();
+    private readonly TaskCompletionSource<IPAddress> _targetTcs =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Task _acceptLoop;
 
-    /// <summary>Binds the host endpoint and starts accepting.</summary>
+    private volatile IPAddress? _containerIp;
+
+    /// <summary>
+    /// Binds the host endpoint and starts accepting. <paramref name="containerIp"/> may be <c>null</c>
+    /// when the container's address is not known yet.
+    /// </summary>
     /// <exception cref="SocketException">The host endpoint could not be bound.</exception>
-    public TcpPortForwarder(IPEndPoint host, IPEndPoint target, ILogger logger)
+    public TcpPortForwarder(IPEndPoint host, IPAddress? containerIp, int containerPort, ILogger logger)
     {
         ArgumentNullException.ThrowIfNull(host);
-        ArgumentNullException.ThrowIfNull(target);
 
-        _target = target;
+        _containerPort = containerPort;
         _logger = logger;
         _listener = Bind(host);
         HostEndPoint = (IPEndPoint)_listener.LocalEndPoint!;
+        if (containerIp is not null)
+        {
+            SetTarget(containerIp);
+        }
+
         _acceptLoop = Task.Run(() => AcceptAsync(_cts.Token), CancellationToken.None);
     }
 
     /// <inheritdoc />
     public IPEndPoint HostEndPoint { get; }
+
+    /// <inheritdoc />
+    public void ResolveTarget(IPAddress containerIp)
+    {
+        ArgumentNullException.ThrowIfNull(containerIp);
+        SetTarget(containerIp);
+    }
+
+    private void SetTarget(IPAddress containerIp)
+    {
+        _containerIp = containerIp;
+        _targetTcs.TrySetResult(containerIp);
+    }
 
     /// <summary>
     /// Binds a listener. <c>::</c> is dual-mode so one listener serves both families, except when the
@@ -114,14 +160,32 @@ internal sealed class TcpPortForwarder : IPortForwarder
         }
     }
 
+    /// <summary>
+    /// Waits (bounded) for the backend address if it is not known yet, then pumps the connection both
+    /// ways. A connection whose wait times out, or that arrives after the forwarder started shutting
+    /// down, is closed without ever being relayed.
+    /// </summary>
     private async Task RelayAsync(Socket client, CancellationToken ct)
     {
         Socket? upstream = null;
+        IPEndPoint? target = null;
         try
         {
             client.NoDelay = true;
-            upstream = new Socket(_target.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            await upstream.ConnectAsync(_target, ct);
+
+            var containerIp = await AwaitTargetAsync(ct);
+            if (containerIp is null)
+            {
+                _logger.LogDebug(
+                    "closing a connection on published port {Endpoint}: no backend address within {Timeout}",
+                    HostEndPoint,
+                    TargetWaitTimeout);
+                return;
+            }
+
+            target = new IPEndPoint(containerIp, _containerPort);
+            upstream = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            await upstream.ConnectAsync(target, ct);
 
             await Task.WhenAll(
                 PumpAsync(client, upstream, ct),
@@ -129,11 +193,11 @@ internal sealed class TcpPortForwarder : IPortForwarder
         }
         catch (Exception ex) when (ex is SocketException or OperationCanceledException or ObjectDisposedException or IOException)
         {
-            _logger.LogDebug(ex, "relay {Endpoint} -> {Target} failed", HostEndPoint, _target);
+            _logger.LogDebug(ex, "relay {Endpoint} -> {Target} failed", HostEndPoint, target);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "relay {Endpoint} -> {Target} failed", HostEndPoint, _target);
+            _logger.LogWarning(ex, "relay {Endpoint} -> {Target} failed", HostEndPoint, target);
         }
         finally
         {
@@ -142,6 +206,26 @@ internal sealed class TcpPortForwarder : IPortForwarder
             {
                 Close(upstream);
             }
+        }
+    }
+
+    /// <summary>Returns the backend address once known, or <c>null</c> once the wait gives up.</summary>
+    private async Task<IPAddress?> AwaitTargetAsync(CancellationToken ct)
+    {
+        if (_containerIp is { } known)
+        {
+            return known;
+        }
+
+        using var timeoutCts = new CancellationTokenSource(TargetWaitTimeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+        try
+        {
+            return await _targetTcs.Task.WaitAsync(linked.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
         }
     }
 

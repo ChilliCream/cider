@@ -83,6 +83,54 @@ public sealed class PortTests(DaemonFixture daemon)
         }
     }
 
+    /// <summary>
+    /// cider-ede.18's own named verification: a published TCP port must accept connections the moment
+    /// it is bound at <c>start</c>, before the container's VM address is known, instead of refusing
+    /// them until it is. <see cref="Net.TcpPortForwarder"/> holds an accepted connection (bounded) for
+    /// the backend address rather than failing it, so — unlike before this fix, where the host port
+    /// was not even bound until the address arrived — a single <c>curl --retry 0</c> issued the moment
+    /// <c>docker run -d</c> returns succeeds without ever seeing "connection refused" in between,
+    /// whatever is left of the VM boot (Apple's, not cider's) it has to wait out to get there.
+    /// </summary>
+    [E2EFact]
+    public async Task A_published_port_accepts_immediately_after_start_instead_of_refusing_until_the_backend_is_known()
+    {
+        if (DaemonFixture.AppleModePorts)
+        {
+            // Apple's own -p forwarder is what the characterization test below pins down; this is a
+            // proxy-mode fix (accept-and-hold in the daemon's own listener).
+            return;
+        }
+
+        var name = DaemonFixture.NewName("fast");
+        var hostPort = FreeHostPort();
+
+        var run = await daemon.DockerAsync(
+            ["run", "-d", "--name", name, "-p", $"{hostPort.ToString(CultureInfo.InvariantCulture)}:80", "nginx:alpine"],
+            timeout: TimeSpan.FromMinutes(4));
+        Assert.True(run.Ok, run.ToString());
+
+        try
+        {
+            // One shot, no retries: either the daemon accepted the connection right away and this
+            // eventually gets a response, or something refused it and curl fails with exit 7 having
+            // said so on stderr.
+            var curl = await Cmd.RunAsync(
+                "curl",
+                ["-sS", "--retry", "0", "--max-time", "30", $"http://127.0.0.1:{hostPort.ToString(CultureInfo.InvariantCulture)}/"],
+                timeout: TimeSpan.FromSeconds(35));
+
+            Assert.True(curl.Ok, $"the first connection attempt did not succeed: {curl}");
+            Assert.DoesNotContain("refused", curl.Stderr, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("refused", curl.Stdout, StringComparison.OrdinalIgnoreCase);
+            Assert.NotEmpty(curl.Stdout);
+        }
+        finally
+        {
+            await daemon.DockerAsync(["rm", "-f", name], timeout: TimeSpan.FromMinutes(2));
+        }
+    }
+
     /// <summary>A host-IP-qualified mapping binds that address only, exactly as dockerd does.</summary>
     [E2EFact]
     public async Task A_loopback_binding_is_reachable_on_loopback_only()

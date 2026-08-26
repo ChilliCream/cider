@@ -11,7 +11,7 @@ namespace Cider.Tests.Fakes;
 /// </summary>
 public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
 {
-    private readonly ConcurrentDictionary<string, List<PublishedPort>> _byContainer = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, List<PublishedPortHandle>> _byContainer = new(StringComparer.Ordinal);
 
     /// <inheritdoc />
     public bool Enabled { get; } = enabled;
@@ -28,11 +28,13 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
         string proto,
         IPAddress hostIp,
         int hostPort,
-        IPAddress containerIp,
+        IPAddress? containerIp,
         int containerPort,
         CancellationToken ct)
     {
         var port = new PublishedPort(containerId, proto, hostIp, hostPort, containerIp, containerPort);
+        var handle = new PublishedPortHandle(port, null);
+
         lock (Published)
         {
             Published.Add(port);
@@ -41,10 +43,10 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
         var live = _byContainer.GetOrAdd(containerId, static _ => []);
         lock (live)
         {
-            live.Add(port);
+            live.Add(handle);
         }
 
-        return Task.FromResult(new PublishedPortHandle(port, null));
+        return Task.FromResult(handle);
     }
 
     /// <inheritdoc />
@@ -63,6 +65,60 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
         _byContainer.TryGetValue(containerId, out var live) && live.Count > 0;
 
     /// <inheritdoc />
+    public bool IsPublished(string containerId, string proto, IPAddress hostIp, int hostPort)
+    {
+        if (!_byContainer.TryGetValue(containerId, out var live))
+        {
+            return false;
+        }
+
+        lock (live)
+        {
+            return live.Exists(handle =>
+                string.Equals(handle.Port.Proto, proto, StringComparison.OrdinalIgnoreCase) &&
+                handle.Port.HostPort == hostPort &&
+                handle.Port.HostIp.Equals(hostIp));
+        }
+    }
+
+    /// <inheritdoc />
+    public bool NeedsAddress(string containerId)
+    {
+        if (!_byContainer.TryGetValue(containerId, out var live))
+        {
+            return false;
+        }
+
+        lock (live)
+        {
+            return live.Exists(handle => handle.Port.ContainerIp is null);
+        }
+    }
+
+    /// <inheritdoc />
+    public void ResolveAddress(string containerId, IPAddress containerIp)
+    {
+        if (!_byContainer.TryGetValue(containerId, out var live))
+        {
+            return;
+        }
+
+        lock (live)
+        {
+            for (var i = 0; i < live.Count; i++)
+            {
+                var handle = live[i];
+                if (handle.Port.ContainerIp is not null)
+                {
+                    continue;
+                }
+
+                handle.Port = handle.Port with { ContainerIp = containerIp };
+            }
+        }
+    }
+
+    /// <inheritdoc />
     public IReadOnlyList<PublishedPort> Snapshot()
     {
         var result = new List<PublishedPort>();
@@ -70,7 +126,7 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
         {
             lock (live)
             {
-                result.AddRange(live);
+                result.AddRange(live.Select(handle => handle.Port));
             }
         }
 
@@ -78,8 +134,18 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
     }
 
     /// <summary>Every publication currently live for one container.</summary>
-    public IReadOnlyList<PublishedPort> LiveFor(string containerId) =>
-        _byContainer.TryGetValue(containerId, out var live) ? [.. live] : [];
+    public IReadOnlyList<PublishedPort> LiveFor(string containerId)
+    {
+        if (!_byContainer.TryGetValue(containerId, out var live))
+        {
+            return [];
+        }
+
+        lock (live)
+        {
+            return live.Select(handle => handle.Port).ToList();
+        }
+    }
 
     /// <inheritdoc />
     public void Dispose() => _byContainer.Clear();

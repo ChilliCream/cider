@@ -11,32 +11,45 @@ namespace Cider.Core.Net;
 /// <param name="Proto"><c>tcp</c> or <c>udp</c>.</param>
 /// <param name="HostIp">The address actually bound on the host.</param>
 /// <param name="HostPort">The host port actually bound.</param>
-/// <param name="ContainerIp">The container's VM address traffic is forwarded to.</param>
+/// <param name="ContainerIp">
+/// The container's VM address traffic is forwarded to, or <c>null</c> when the listener is already
+/// bound but the address is not known yet (cider-ede.18: TCP only — see <see cref="TcpPortForwarder"/>).
+/// </param>
 /// <param name="ContainerPort">The container port traffic is forwarded to.</param>
 public sealed record PublishedPort(
     string ContainerId,
     string Proto,
     IPAddress HostIp,
     int HostPort,
-    IPAddress ContainerIp,
+    IPAddress? ContainerIp,
     int ContainerPort)
 {
     /// <inheritdoc />
     public override string ToString() => string.Create(
         CultureInfo.InvariantCulture,
-        $"{HostIp}:{HostPort} -> {ContainerIp}:{ContainerPort}/{Proto}");
+        $"{HostIp}:{HostPort} -> {(ContainerIp is null ? "(pending)" : $"{ContainerIp}:{ContainerPort}")}/{Proto}");
 }
 
 /// <summary>A publication's lifetime: disposing it closes the listener and every live connection.</summary>
-/// <param name="port">What this handle publishes.</param>
-/// <param name="resource">The bound listener, released on dispose.</param>
-public sealed class PublishedPortHandle(PublishedPort port, IDisposable? resource) : IDisposable
+public sealed class PublishedPortHandle : IDisposable
 {
-    /// <summary>What this handle publishes.</summary>
-    public PublishedPort Port { get; } = port;
+    private readonly IDisposable? _resource;
+
+    /// <summary>Creates a handle over <paramref name="resource"/>, the bound listener released on dispose.</summary>
+    public PublishedPortHandle(PublishedPort port, IDisposable? resource)
+    {
+        Port = port;
+        _resource = resource;
+    }
+
+    /// <summary>What this handle publishes; replaced in place once a pending address resolves.</summary>
+    public PublishedPort Port { get; set; }
+
+    /// <summary>The forwarder backing this publication, when it is one (every real publication is).</summary>
+    internal IPortForwarder? Forwarder => _resource as IPortForwarder;
 
     /// <inheritdoc />
-    public void Dispose() => resource?.Dispose();
+    public void Dispose() => _resource?.Dispose();
 }
 
 /// <summary>
@@ -49,13 +62,18 @@ public interface IPortPublisher : IDisposable
     /// <summary><c>true</c> when the daemon carries published-port traffic itself.</summary>
     bool Enabled { get; }
 
-    /// <summary>Binds <paramref name="hostIp"/>:<paramref name="hostPort"/> and forwards it into the container.</summary>
+    /// <summary>
+    /// Binds <paramref name="hostIp"/>:<paramref name="hostPort"/> and forwards it into the container.
+    /// <paramref name="containerIp"/> may be <c>null</c> for a <c>tcp</c> mapping — the listener binds
+    /// and accepts right away, holding each connection (bounded) until <see cref="ResolveAddress"/>
+    /// supplies it (cider-ede.18); a <c>udp</c> mapping has no such mode and requires it up front.
+    /// </summary>
     Task<PublishedPortHandle> PublishAsync(
         string containerId,
         string proto,
         IPAddress hostIp,
         int hostPort,
-        IPAddress containerIp,
+        IPAddress? containerIp,
         int containerPort,
         CancellationToken ct);
 
@@ -64,6 +82,22 @@ public interface IPortPublisher : IDisposable
 
     /// <summary><c>true</c> when this container currently has at least one live publication.</summary>
     bool IsPublished(string containerId);
+
+    /// <summary><c>true</c> when this container has a live publication at that exact endpoint.</summary>
+    bool IsPublished(string containerId, string proto, IPAddress hostIp, int hostPort);
+
+    /// <summary>
+    /// <c>true</c> when at least one live publication of this container was bound with
+    /// <paramref name="containerId"/>'s address still unknown and has not been resolved since.
+    /// </summary>
+    bool NeedsAddress(string containerId);
+
+    /// <summary>
+    /// Supplies the container's address to every publication of it that was bound without one, and
+    /// unblocks whatever connections were waiting on it. A no-op for a container with no publications,
+    /// or none still pending.
+    /// </summary>
+    void ResolveAddress(string containerId, IPAddress containerIp);
 
     /// <summary>Every live publication, for diagnostics and tests.</summary>
     IReadOnlyList<PublishedPort> Snapshot();
@@ -84,7 +118,7 @@ public sealed class NullPortPublisher : IPortPublisher
         string proto,
         IPAddress hostIp,
         int hostPort,
-        IPAddress containerIp,
+        IPAddress? containerIp,
         int containerPort,
         CancellationToken ct) =>
         throw new InvalidOperationException("cider: port publishing is handled by Apple container in this mode");
@@ -96,6 +130,17 @@ public sealed class NullPortPublisher : IPortPublisher
 
     /// <inheritdoc />
     public bool IsPublished(string containerId) => false;
+
+    /// <inheritdoc />
+    public bool IsPublished(string containerId, string proto, IPAddress hostIp, int hostPort) => false;
+
+    /// <inheritdoc />
+    public bool NeedsAddress(string containerId) => false;
+
+    /// <inheritdoc />
+    public void ResolveAddress(string containerId, IPAddress containerIp)
+    {
+    }
 
     /// <inheritdoc />
     public IReadOnlyList<PublishedPort> Snapshot() => [];
@@ -134,26 +179,32 @@ public sealed class PortProxyManager : IPortPublisher
         string proto,
         IPAddress hostIp,
         int hostPort,
-        IPAddress containerIp,
+        IPAddress? containerIp,
         int containerPort,
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(containerId);
         ArgumentNullException.ThrowIfNull(hostIp);
-        ArgumentNullException.ThrowIfNull(containerIp);
         ct.ThrowIfCancellationRequested();
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         var isUdp = string.Equals(proto, "udp", StringComparison.OrdinalIgnoreCase);
+        if (isUdp)
+        {
+            // UdpPortForwarder has no accept-and-hold mode: a datagram with nowhere to go cannot wait
+            // the way a TCP SYN can, so the caller (ContainerManager.EnsurePublishedPortsAsync) never
+            // asks for one of these before the address is known.
+            ArgumentNullException.ThrowIfNull(containerIp);
+        }
+
         var host = new IPEndPoint(hostIp, hostPort);
-        var target = new IPEndPoint(containerIp, containerPort);
 
         IPortForwarder forwarder;
         try
         {
             forwarder = isUdp
-                ? new UdpPortForwarder(host, target, _logger)
-                : new TcpPortForwarder(host, target, _logger);
+                ? new UdpPortForwarder(host, new IPEndPoint(containerIp!, containerPort), _logger)
+                : new TcpPortForwarder(host, containerIp, containerPort, _logger);
         }
         catch (SocketException ex)
         {
@@ -218,6 +269,62 @@ public sealed class PortProxyManager : IPortPublisher
         lock (handles)
         {
             return handles.Count > 0;
+        }
+    }
+
+    /// <inheritdoc />
+    public bool IsPublished(string containerId, string proto, IPAddress hostIp, int hostPort)
+    {
+        if (string.IsNullOrEmpty(containerId) || !_byContainer.TryGetValue(containerId, out var handles))
+        {
+            return false;
+        }
+
+        lock (handles)
+        {
+            return handles.Exists(handle =>
+                string.Equals(handle.Port.Proto, proto, StringComparison.OrdinalIgnoreCase) &&
+                handle.Port.HostPort == hostPort &&
+                handle.Port.HostIp.Equals(hostIp));
+        }
+    }
+
+    /// <inheritdoc />
+    public bool NeedsAddress(string containerId)
+    {
+        if (string.IsNullOrEmpty(containerId) || !_byContainer.TryGetValue(containerId, out var handles))
+        {
+            return false;
+        }
+
+        lock (handles)
+        {
+            return handles.Exists(handle => handle.Port.ContainerIp is null);
+        }
+    }
+
+    /// <inheritdoc />
+    public void ResolveAddress(string containerId, IPAddress containerIp)
+    {
+        ArgumentNullException.ThrowIfNull(containerIp);
+        if (string.IsNullOrEmpty(containerId) || !_byContainer.TryGetValue(containerId, out var handles))
+        {
+            return;
+        }
+
+        lock (handles)
+        {
+            foreach (var handle in handles)
+            {
+                if (handle.Port.ContainerIp is not null)
+                {
+                    continue;
+                }
+
+                handle.Forwarder?.ResolveTarget(containerIp);
+                handle.Port = handle.Port with { ContainerIp = containerIp };
+                _logger.LogDebug("resolved {Publication} for container {Container}", handle.Port, containerId);
+            }
         }
     }
 

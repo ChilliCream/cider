@@ -46,6 +46,16 @@ internal sealed class UdpPortForwarder : IPortForwarder
     /// <inheritdoc />
     public IPEndPoint HostEndPoint { get; }
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// A no-op: a <see cref="UdpPortForwarder"/> has no accept-and-hold mode (cider-ede.18 scoped
+    /// TCP only) and is never constructed without <c>containerIp</c> already known, so this is never
+    /// called with anything left to resolve.
+    /// </remarks>
+    public void ResolveTarget(IPAddress containerIp)
+    {
+    }
+
     private static Socket Bind(IPEndPoint host)
     {
         var wildcardV6 = host.AddressFamily == AddressFamily.InterNetworkV6 && host.Address.Equals(IPAddress.IPv6Any);

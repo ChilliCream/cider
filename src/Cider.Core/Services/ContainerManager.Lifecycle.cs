@@ -113,6 +113,17 @@ public sealed partial class ContainerManager
             await BindAttachmentsAsync(handle);
             handle.ExitHandling = Task.Run(() => HandleExitAsync(record.Id, handle, process, stderrTail), CancellationToken.None);
 
+            // Bind every published TCP host listener now, before the container's address (or even
+            // its "running" status) is known: cider-ede.18. Published ports used to stay unbound
+            // until AwaitStartupAndRegisterNetworkNamesAsync below found an address, so every
+            // connection attempt during the VM boot it polls through (~3.5 s, plus up to
+            // StartReturnBudget past that) got a bare "connection refused" instead of anything
+            // queuing. The listener is already accepting by the time that wait even starts now;
+            // TcpPortForwarder holds each accepted connection until EnsurePublishedPortsAsync
+            // resolves the backend address (the second call below, once it is found — or a later
+            // poller/refresh tick, if it is not, in time) instead of failing it.
+            await EnsurePublishedPortsAsync(record, ct);
+
             await AwaitStartupAndRegisterNetworkNamesAsync(record, process, ct);
 
             // Everything `docker cp`'d into the container while it was not running goes in here,

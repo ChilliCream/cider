@@ -34,8 +34,14 @@ public sealed class ContainerManagerPortProxyTests
         // Nothing was handed to the engine: the daemon carries the traffic itself.
         Assert.Empty(harness.Runtime.GetSpec("web")!.Ports);
 
+        // The TCP listeners are already bound (pending an address) by the time StartAsync returns
+        // (cider-ede.18); the address itself, and the UDP mapping that needs it up front, resolve on
+        // the background network-registration task StartAsync no longer waits for, so this polls
+        // exactly like the address genuinely arriving late (below) would.
         var address = harness.Runtime.GetContainer("web")!.Address;
-        var published = harness.Publisher.LiveFor(record.Id);
+        var published = await WaitUntil(
+            () => harness.Publisher.LiveFor(record.Id),
+            ports => ports.Count == 3 && ports.All(port => port.ContainerIp is not null));
 
         // The wildcard binding covers both families, as Docker's does; the explicit one does not.
         Assert.Equal(3, published.Count);
@@ -131,7 +137,8 @@ public sealed class ContainerManagerPortProxyTests
         await using var harness = await ContainerTestHarness.CreateAsync();
 
         // The engine reports no attachment at all for the first inspects, so the start path cannot
-        // learn the address and publishes nothing.
+        // learn the address. The TCP listener is bound anyway (cider-ede.18) but stays pending —
+        // unresolved — until something re-inspects and finds it.
         harness.Runtime.DelayNetworkAttachment("web", 100);
         harness.Containers.NetworkPollBudget = TimeSpan.FromMilliseconds(50);
         harness.Containers.StartReturnBudget = TimeSpan.FromMilliseconds(50);
@@ -142,14 +149,19 @@ public sealed class ContainerManagerPortProxyTests
                 PortBindings = { ["8080/tcp"] = [new PortBinding()] },
             });
 
-        Assert.Empty(harness.Publisher.LiveFor(record.Id));
+        // The wildcard binding covers both families, so this is the listener for each of them.
+        var pending = harness.Publisher.LiveFor(record.Id);
+        Assert.Equal(2, pending.Count);
+        Assert.All(pending, port => Assert.Null(port.ContainerIp));
 
         harness.Runtime.DelayNetworkAttachment("web", 0);
         await using var poller = new StatePoller(
             harness.Containers, harness.Runtime, harness.Events, harness.Options, NullLogger<StatePoller>.Instance);
         await poller.PollOnceAsync(default);
 
-        Assert.NotEmpty(harness.Publisher.LiveFor(record.Id));
+        var resolved = harness.Publisher.LiveFor(record.Id);
+        Assert.NotEmpty(resolved);
+        Assert.All(resolved, port => Assert.NotNull(port.ContainerIp));
 
         await harness.Containers.KillAsync(record.Id, "SIGKILL", default);
     }
@@ -174,5 +186,29 @@ public sealed class ContainerManagerPortProxyTests
         Assert.NotEmpty(harness.Publisher.LiveFor(record.Id));
 
         await harness.Containers.KillAsync(record.Id, "SIGKILL", default);
+    }
+
+    /// <summary>
+    /// Polls <paramref name="value"/> until <paramref name="isDone"/> accepts it, for work that now
+    /// happens off a background task StartAsync no longer waits for (cider-ede.18).
+    /// </summary>
+    private static async Task<T> WaitUntil<T>(Func<T> value, Func<T, bool> isDone)
+    {
+        var deadline = Environment.TickCount64 + 5000;
+        T current;
+        do
+        {
+            current = value();
+            if (isDone(current))
+            {
+                return current;
+            }
+
+            await Task.Delay(5);
+        }
+        while (Environment.TickCount64 < deadline);
+
+        Assert.Fail("timed out waiting for the condition to hold");
+        return current;
     }
 }

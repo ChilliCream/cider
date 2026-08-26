@@ -17,15 +17,27 @@ public sealed partial class ContainerManager
     private bool ProxyPublishing => _publisher.Enabled;
 
     /// <summary>
-    /// Binds the host side of every port mapping of a running container and forwards it to the
-    /// container's VM address. Idempotent and cheap: it returns immediately unless the container is
-    /// running, has bindings, has an address, and has nothing published yet — so the post-start path,
-    /// the network refresh and the state poller can all call it on every tick.
+    /// Binds the host side of every port mapping of a running container. In <c>proxy</c> mode a TCP
+    /// listener is bound the moment the container starts, whether or not its VM address is known yet
+    /// (<see cref="Net.TcpPortForwarder"/> holds accepted connections until it is — cider-ede.18, so a
+    /// client racing to connect during the VM boot gets queued instead of refused); a UDP mapping has
+    /// no such accept-and-hold mode, so it still waits for the address before it is bound at all, same
+    /// as before. Idempotent and cheap once every mapping the record declares is bound and — address
+    /// permitting — resolved, so the post-start path, the network refresh, the poller and reconcile can
+    /// all call it on every tick.
     /// </summary>
     internal async Task EnsurePublishedPortsAsync(ContainerRecord record, CancellationToken ct)
     {
-        if (!ProxyPublishing || record.Ports.Count == 0 || !record.State.Running ||
-            _publisher.IsPublished(record.Id) || !TryGetContainerAddress(record, out var containerIp))
+        if (!ProxyPublishing || record.Ports.Count == 0 || !record.State.Running)
+        {
+            return;
+        }
+
+        var haveAddress = TryGetContainerAddress(record, out var containerIp);
+
+        // The steady-state case on every tick once a container has settled: everything this record
+        // declares is already bound, and — if the address is known — every listener already has it.
+        if (_publisher.IsPublished(record.Id) && (!haveAddress || !_publisher.NeedsAddress(record.Id)))
         {
             return;
         }
@@ -34,14 +46,25 @@ public sealed partial class ContainerManager
         try
         {
             // Re-check under the gate: start, the poller and the network refresh all race here.
-            if (!record.State.Running || _publisher.IsPublished(record.Id))
+            if (!record.State.Running)
             {
                 return;
+            }
+
+            if (haveAddress && _publisher.NeedsAddress(record.Id))
+            {
+                _publisher.ResolveAddress(record.Id, containerIp);
             }
 
             foreach (var (key, bindings) in record.Ports)
             {
                 var (containerPort, proto) = SplitPortKey(key);
+                var isUdp = string.Equals(proto, "udp", StringComparison.OrdinalIgnoreCase);
+                if (isUdp && !haveAddress)
+                {
+                    continue;
+                }
+
                 foreach (var binding in bindings)
                 {
                     if (!int.TryParse(binding.HostPort, NumberStyles.Integer, CultureInfo.InvariantCulture, out var hostPort))
@@ -51,9 +74,15 @@ public sealed partial class ContainerManager
 
                     foreach (var hostIp in HostAddressesFor(binding.HostIp))
                     {
+                        if (_publisher.IsPublished(record.Id, proto, hostIp, hostPort))
+                        {
+                            continue;
+                        }
+
                         try
                         {
-                            await _publisher.PublishAsync(record.Id, proto, hostIp, hostPort, containerIp, containerPort, ct);
+                            await _publisher.PublishAsync(
+                                record.Id, proto, hostIp, hostPort, haveAddress ? containerIp : null, containerPort, ct);
                         }
                         catch (SocketException ex)
                         {
