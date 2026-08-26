@@ -239,15 +239,40 @@ public sealed class ContainerManagerLifecycleTests
         await harness.Containers.StartAsync(record.Id, default);
         await events.WaitForAsync("die");
 
-        // Give any continuation that raced past the exit a chance to run its course before checking
-        // that it did not regress anything HandleExitAsync already settled.
-        await Task.Delay(TimeSpan.FromMilliseconds(200));
-
         Assert.Equal(1, events.Actions.Count(action => action == "die"));
         Assert.Equal("exited", record.State.Status);
         Assert.False(
             harness.NameRegistry.TryResolve("bridge", "web", out _),
             "the detached continuation must not win a race with HandleExitAsync and leave DNS registered for an exited container");
+    }
+
+    [Fact]
+    public async Task Network_refresh_racing_past_an_exit_does_not_re_register_dns()
+    {
+        // cider-ede.27 correction: the test above pins HandleExitAsync's own race against the
+        // detached post-start continuation, but nothing exercised ApplyNetworkInfo's
+        // `!record.State.Running` guard itself -- a mutant that deletes that guard still passed
+        // every test in this file. RefreshNetworkInfoAsync calls ApplyNetworkInfo unconditionally,
+        // so calling it directly against an already-exited record (as an apply that was already
+        // in flight when HandleExitAsync ran would land) is the direct way to pin the guard.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var record = await harness.RunShellAsync("sleep 5", "web");
+        await ContainerTestHarness.WaitUntilAsync(
+            () => harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "the container's DNS name to be registered");
+
+        await harness.Containers.KillAsync(record.Id, "SIGKILL", default);
+        await ContainerTestHarness.WaitUntilAsync(
+            () => !record.State.Running && !harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "the exit to be accounted and the DNS name unregistered");
+
+        // An apply that was already in flight when HandleExitAsync ran (the detached post-start
+        // continuation, or a poller tick) lands here against an already-exited record.
+        await harness.Containers.RefreshNetworkInfoAsync(record, default);
+
+        Assert.False(
+            harness.NameRegistry.TryResolve("bridge", "web", out _),
+            "an apply that lands after HandleExitAsync must not re-register DNS");
     }
 
     [Fact]

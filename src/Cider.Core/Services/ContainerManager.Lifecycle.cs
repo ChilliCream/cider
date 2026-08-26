@@ -160,7 +160,7 @@ public sealed partial class ContainerManager
                     await AwaitStartupAndRegisterNetworkNamesAsync(record, process, CancellationToken.None);
                     await EnsurePublishedPortsAsync(record, CancellationToken.None);
                 }
-                catch (Exception ex) when (ex is RuntimeException or IOException)
+                catch (Exception ex)
                 {
                     _logger.LogDebug(ex, "post-start network registration failed for container {Container}", record.Id);
                 }
