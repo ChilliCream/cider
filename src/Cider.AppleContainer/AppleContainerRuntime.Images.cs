@@ -681,7 +681,7 @@ public sealed partial class AppleContainerRuntime
 
             var args = ArgBuilder.Build(spec, tags);
 
-            string? imageId = null;
+            string? scrapedId = null;
             var result = await _cli.RunStreamingAsync(
                 args,
                 (line, _) =>
@@ -690,7 +690,7 @@ public sealed partial class AppleContainerRuntime
                     var exported = ProgressParser.ParseBuiltImageId(line);
                     if (exported is not null)
                     {
-                        imageId = exported;
+                        scrapedId = exported;
                     }
                 },
                 ct,
@@ -703,11 +703,32 @@ public sealed partial class AppleContainerRuntime
                 throw exception;
             }
 
-            if (imageId is null)
+            // cider-ger.20: `scrapedId` is an OCI manifest/manifest-list digest off the "exporting
+            // manifest[ list] …" progress lines, never the content-addressed *config* digest that
+            // RuntimeImage.Id actually is (RecoverContentAddressedIdsAsync above, and its XPC
+            // transport twin) -- a classic build's own freshly-printed "Successfully built <id>"
+            // then could never appear in that same build's `docker images --filter dangling=true`
+            // listing, because the two were never the same kind of digest to begin with. The
+            // authoritative id is whatever InspectImageAsync resolves the tag Apple's CLI was just
+            // told to apply to -- the very same content-addressed lookup ListImagesAsync/InspectImageAsync
+            // already do for every other image, so this is guaranteed to agree with what a listing
+            // reports right afterward. That lookup is best-effort, not load-bearing, the same way
+            // WithSiblingReferencesAsync's own listing call is: the build itself already succeeded
+            // (the throw above would have fired otherwise), so a transient failure resolving its id
+            // afterward must never turn that success into a reported failure (the same "never turn a
+            // success into a failure" rule ListImagesAsync's own doc comment credits to cider-ede.24) —
+            // it just leaves the scraped digest as the answer instead.
+            RuntimeImageDetail? detail = null;
+            try
             {
-                var detail = await InspectImageAsync(tags[0], ct);
-                imageId = detail?.Id;
+                detail = await InspectImageAsync(tags[0], ct);
             }
+            catch (RuntimeException ex)
+            {
+                _logger.LogDebug(ex, "could not resolve the content-addressed id of the image just built; falling back to the scraped build output");
+            }
+
+            var imageId = string.IsNullOrEmpty(detail?.Id) ? scrapedId : detail.Id;
 
             if (imageId is null)
             {
