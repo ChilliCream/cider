@@ -12,9 +12,37 @@ public sealed partial class AppleContainerRuntime
 {
     private const string DefaultRegistry = "docker.io";
 
+    /// <summary>
+    /// <c>image ls</c> fails hard when Apple's store holds even one dangling content reference,
+    /// even though every other entry is fine (cider-ede.24, verified live on this machine: <c>Error:
+    /// content with digest sha256:…</c>, the blob gone but <c>state.json</c> still naming it). Cider
+    /// must not repair another tool's store, but it also must not let one bad row 500 every
+    /// <c>docker images</c> call — so that specific failure logs one Warning naming the digest and the
+    /// operator remedy, and degrades to an empty listing (Apple gives no partial JSON to salvage; a
+    /// caller after one specific image can still fall back to <c>image inspect &lt;ref&gt;</c>, which
+    /// keeps working). Every other failure still throws exactly as before.
+    /// </summary>
     public Task<IReadOnlyList<RuntimeImage>> ListImagesAsync(CancellationToken ct) => GuardAsync(async () =>
     {
-        var images = await _cli.RunJsonAsync<List<AppleImageJson>>(["image", "ls", "--format", "json"], ct);
+        var result = await _cli.RunAsync(["image", "ls", "--format", "json"], ct);
+        if (!result.Succeeded)
+        {
+            if (CliErrorMapper.IsDanglingContent(result.Stderr))
+            {
+                _logger.LogWarning(
+                    "the Apple container image store has a dangling content reference ({Digest}) that " +
+                    "`container image ls` cannot resolve; `docker images` will list only what is " +
+                    "enumerable until it is repaired with Apple's own tooling (`container image prune`, " +
+                    "or `container image delete <ref>` for the offending image) -- cider does not modify " +
+                    "Apple's store",
+                    CliErrorMapper.ExtractDanglingDigest(result.Stderr) ?? result.Stderr);
+                return (IReadOnlyList<RuntimeImage>)Array.Empty<RuntimeImage>();
+            }
+
+            throw CliErrorMapper.ToException(result, "image ls");
+        }
+
+        var images = ContainerCli.ParseJson<List<AppleImageJson>>(result.Stdout, "container image ls");
         if (images is null)
         {
             return (IReadOnlyList<RuntimeImage>)Array.Empty<RuntimeImage>();
@@ -135,25 +163,44 @@ public sealed partial class AppleContainerRuntime
     }
 
     /// <summary>
-    /// Apple's own <c>id</c> (<see cref="AppleImageJson.Id"/>) is the OCI *index* digest, and
-    /// <c>container image load</c> recomputes/reassigns it on every import — reproduced (cider-ger.19):
-    /// loading the same byte-identical BuildKit-exported docker tar twice yields two different
-    /// <c>container image ls</c> ids for the same tag, even though the tar's own manifest+config
-    /// digests never change between the two exports. That id drift is exactly what surfaced as
-    /// <c>docker images -q</c>/<c>--iidfile</c> disagreeing with each other for two builds of the same
-    /// Dockerfile (tests/compat/run-buildkit.sh scenario 6). Docker's own image id is not the index
-    /// digest at all — it is the digest of the image *config* blob — and Apple's local
-    /// content-addressed store already keys that config blob by its real content digest, so reading
-    /// it back (the same local-store lookup <see cref="RecoverLayerSizesAsync"/> already does for
-    /// per-layer sizes) gives a value that is genuinely stable across reloads of identical content,
-    /// unlike the id the CLI hands back directly. Recovery is best-effort, exactly like
-    /// <see cref="RecoverExposedPortsAsync"/>: a store miss just leaves Apple's own (possibly
-    /// unstable) id in place rather than failing the call.
+    /// Apple's own <c>id</c> (<see cref="AppleImageJson.Id"/>) is the OCI *index* digest — reproduced
+    /// (cider-ger.19): loading the same byte-identical BuildKit-exported docker tar twice yields two
+    /// different <c>container image ls</c> ids for the same tag, even though the tar's own
+    /// manifest+config digests never change between the two exports. That id drift is exactly what
+    /// surfaced as <c>docker images -q</c>/<c>--iidfile</c> disagreeing with each other for two builds
+    /// of the same Dockerfile (tests/compat/run-buildkit.sh scenario 6).
+    ///
+    /// What is actually confirmed about the root cause (task comments, planner-1, run directly against
+    /// Apple <c>container</c> 1.3.0 with no cider in the path): Apple's <c>image load</c> is itself
+    /// deterministic and content-addressed — the same byte-identical tar loaded four different ways
+    /// (image absent, image already present, after a delete, under a second tag) produced the exact
+    /// same index id every time. So Apple does not simply "recompute a fresh id on every load" the way
+    /// this comment used to claim; that hypothesis was tested and falsified. The instability this task
+    /// reports comes from comparing *two separate BuildKit exports* of the same Dockerfile: their
+    /// manifest and config blobs are byte-identical, but the OCI *index* blob each export produces is
+    /// not — which specific field varies (annotation, entry order, or an extra entry) was never
+    /// isolated, because it stopped mattering once the fix below was in place. What is not in question
+    /// either way: Docker's own image id is the digest of the image *config* blob, not of an index, and
+    /// Apple's local content-addressed store already keys that config blob by its real content digest —
+    /// so reading it back (the same local-store lookup <see cref="RecoverLayerSizesAsync"/> already
+    /// does for per-layer sizes) gives a value that is genuinely stable across separate exports of
+    /// identical content, unlike the index id the CLI hands back directly. Recovery is best-effort,
+    /// exactly like <see cref="RecoverExposedPortsAsync"/>: a store miss just leaves
+    /// <see cref="AppleImageJson.ContentAddressedId"/> unset, and callers fall back to Apple's own
+    /// (possibly unstable) id rather than the call failing.
     /// </summary>
     private async Task RecoverContentAddressedIdsAsync(List<AppleImageJson> images, CancellationToken ct)
     {
         string? appRoot = null;
         var appRootResolved = false;
+
+        // Apple's `image ls` answers one row per *reference* (RuntimeMapper.ToImages' own doc
+        // comment), so two tags of the same image are two rows naming the same manifest digest — cache
+        // the blob read per digest rather than re-reading the same file for every tag (fix direction
+        // item 8: don't let this recovery add an unbounded number of file reads to the hot listing
+        // path; an image's manifest never changes once written, so nothing invalidates this cache and
+        // scoping it to one call is enough).
+        var manifestCache = new Dictionary<string, AppleOciManifest?>(StringComparer.Ordinal);
 
         foreach (var image in images)
         {
@@ -174,11 +221,16 @@ public sealed partial class AppleContainerRuntime
                 return; // No local store to recover from; leave every remaining row's id as-is.
             }
 
-            var manifest = await LocalBlobReader.TryReadBlobAsync<AppleOciManifest>(appRoot, variant.Digest, _logger, ct).ConfigureAwait(false);
+            if (!manifestCache.TryGetValue(variant.Digest, out var manifest))
+            {
+                manifest = await LocalBlobReader.TryReadBlobAsync<AppleOciManifest>(appRoot, variant.Digest, _logger, ct).ConfigureAwait(false);
+                manifestCache[variant.Digest] = manifest;
+            }
+
             var configDigest = manifest?.Config?.Digest;
             if (!string.IsNullOrEmpty(configDigest))
             {
-                image.Id = configDigest;
+                image.ContentAddressedId = configDigest;
             }
         }
     }

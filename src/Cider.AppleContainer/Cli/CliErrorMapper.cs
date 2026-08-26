@@ -190,6 +190,48 @@ internal static class CliErrorMapper
         return line.Trim();
     }
 
+    /// <summary>The prefix Apple's store uses for a dangling content reference it cannot resolve —
+    /// distinct from every other failure this mapper classifies (cider-ede.24, verified live: a
+    /// listing fails with exactly <c>Error: content with digest sha256:&lt;hex&gt;</c> while the blob
+    /// file itself is missing from the store, though <c>state.json</c> still names it).</summary>
+    private const string DanglingContentMarker = "content with digest";
+
+    /// <summary>
+    /// True when a failure is Apple's own store reporting one dangling content reference among
+    /// otherwise-good entries, not a genuine runtime failure. This is deliberately narrower than the
+    /// generic <see cref="NotFoundMarkers"/> check: those mean "the one thing asked for was not
+    /// found"; this means "the whole listing call itself is poisoned by one bad row", which a caller
+    /// must degrade (return what it can enumerate) rather than fail outright (cider-ede.24).
+    /// </summary>
+    public static bool IsDanglingContent(string? stderr) =>
+        (stderr ?? string.Empty).Contains(DanglingContentMarker, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The <c>sha256:…</c> digest named by an <see cref="IsDanglingContent"/> failure, for
+    /// the operator-facing warning — <c>null</c> when the text has no recognizable digest.</summary>
+    public static string? ExtractDanglingDigest(string? stderr)
+    {
+        if (string.IsNullOrEmpty(stderr))
+        {
+            return null;
+        }
+
+        const string Prefix = "sha256:";
+        var start = stderr.IndexOf(Prefix, StringComparison.OrdinalIgnoreCase);
+        if (start < 0)
+        {
+            return null;
+        }
+
+        var hexStart = start + Prefix.Length;
+        var end = hexStart;
+        while (end < stderr.Length && char.IsAsciiHexDigit(stderr[end]))
+        {
+            end++;
+        }
+
+        return end > hexStart ? stderr[start..end] : null;
+    }
+
     /// <summary>Builds the exception for a failed invocation.</summary>
     public static RuntimeException ToException(CliResult result, string context)
     {

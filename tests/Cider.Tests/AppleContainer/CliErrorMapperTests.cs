@@ -153,4 +153,33 @@ public class CliErrorMapperTests
     [Fact]
     public void Successful_results_do_not_throw() =>
         ContainerCli.ThrowIfFailed(new CliResult(0, "ok", ""), "test");
+
+    // ---- IsDanglingContent / ExtractDanglingDigest (cider-ede.24) --------------------------------
+
+    [Fact]
+    public void IsDanglingContent_recognizes_a_dangling_content_reference_failure()
+    {
+        // Verified live on a real machine (cider-ede.24): `container image ls --format json` failing
+        // exactly this way while the store still names a blob that is no longer on disk.
+        const string Stderr = "Error: content with digest sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1";
+
+        Assert.True(CliErrorMapper.IsDanglingContent(Stderr));
+        Assert.Equal(
+            "sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1",
+            CliErrorMapper.ExtractDanglingDigest(Stderr));
+    }
+
+    [Fact]
+    public void IsDanglingContent_is_false_for_an_unrelated_failure()
+    {
+        Assert.False(CliErrorMapper.IsDanglingContent("Error: image not found: doesnotexist:1"));
+        Assert.Null(CliErrorMapper.ExtractDanglingDigest("Error: image not found: doesnotexist:1"));
+    }
+
+    [Fact]
+    public void IsDanglingContent_is_false_for_null_or_empty_stderr()
+    {
+        Assert.False(CliErrorMapper.IsDanglingContent(null));
+        Assert.False(CliErrorMapper.IsDanglingContent(""));
+    }
 }
