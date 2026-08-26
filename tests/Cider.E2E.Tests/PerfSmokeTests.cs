@@ -11,9 +11,12 @@ namespace Cider.E2E.Tests;
 /// <summary>
 /// cider-ede.15's create-latency smoke assertion: a guard that the XPC fast path (containerCreate
 /// over the apiserver, replacing a held <c>container create</c> child process) stays fast, not a
-/// precise benchmark. XPC-only (<see cref="XpcOnlyFactAttribute"/>) — the CLI transport has none of
-/// the latency properties these thresholds characterize, and running them there would just assert
-/// something else's numbers under the wrong name.
+/// precise benchmark. The two create-timing tests are XPC-only (<see cref="XpcOnlyFactAttribute"/>)
+/// — the CLI transport has none of the latency properties those thresholds characterize, and running
+/// them there would just assert something else's numbers under the wrong name.
+/// <see cref="Docker_ps_a_is_fast"/> is the exception: <c>GET /containers/json?all=1</c> is served
+/// entirely from in-memory state regardless of transport, so it runs under both (<see
+/// cref="E2EFactAttribute"/>) and is not really a runtime measurement at all — see its own doc.
 ///
 /// Every timed call goes straight over the daemon's own unix socket (<see cref="DaemonClient"/>),
 /// never through a spawned <c>docker</c> CLI process: a cider-ede.15 fixer re-verification
@@ -93,7 +96,7 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
     /// process-spawn or HTTP-connection overhead; it looks like a real per-container cost that does
     /// not fully parallelize once several creates are in flight at once. The budget below is set well
     /// above that observed range rather than trying to characterize it precisely — narrowing it is
-    /// follow-up work, not this ticket's.
+    /// tracked as follow-up work in cider-ede.30, not this ticket's.
     /// </summary>
     [XpcOnlyFact]
     public async Task Eight_parallel_creates_of_a_cached_image_finish_within_budget()
@@ -104,13 +107,14 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
 
         const int parallelism = 8;
         var names = Enumerable.Range(0, parallelism).Select(_ => DaemonFixture.NewName("perf-par")).ToArray();
+        var creates = names.Select(name => CreateContainerAsync(client, name)).ToArray();
 
         var stopwatch = Stopwatch.StartNew();
-        var ids = await Task.WhenAll(names.Select(name => CreateContainerAsync(client, name)));
-        stopwatch.Stop();
-
         try
         {
+            var ids = await Task.WhenAll(creates);
+            stopwatch.Stop();
+
             Assert.True(
                 stopwatch.Elapsed <= TimeSpan.FromMilliseconds(2500),
                 $"{parallelism} parallel containerCreate-over-XPC calls took " +
@@ -118,14 +122,41 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
         }
         finally
         {
-            foreach (var id in ids)
+            // Delete every container that actually got created, even if one of the parallel
+            // creates above threw (leaving `creates` partially completed) — otherwise up to 7
+            // perf-par-* containers leak into DaemonCollection's shared daemon. Swallow delete
+            // failures here so a cleanup error can never mask the original create exception.
+            foreach (var task in creates)
             {
-                using var delete = await client.DeleteAsync(new Uri($"/containers/{id}?force=true", UriKind.Relative));
+                if (!task.IsCompletedSuccessfully)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using var delete = await client.DeleteAsync(
+                        new Uri($"/containers/{task.Result}?force=true", UriKind.Relative));
+                }
+                catch
+                {
+                    // Best-effort cleanup only.
+                }
             }
         }
     }
 
-    [XpcOnlyFact]
+    /// <summary>
+    /// Not a runtime measurement, despite the <c>docker ps -a</c> naming: <c>GET
+    /// /containers/json?all=1</c> is served entirely from in-memory state
+    /// (<c>ContainerManager.ListAsync</c> iterates <c>_store.GetAll()</c>; <c>ContainerManager.Query.cs</c>
+    /// makes no <c>_runtime.</c> call at all), so it never reaches the XPC or CLI runtime and runs
+    /// identically under both transports (<see cref="E2EFactAttribute"/>). What this guards is the
+    /// Docker-API list path over the daemon socket staying cheap. The 2 ms budget is tight against the
+    /// observed ~0.1 ms median deliberately — an 8 ms budget on a ~0.1 ms operation is 80x headroom,
+    /// wide enough that this test could never actually fail a regression.
+    /// </summary>
+    [E2EFact]
     public async Task Docker_ps_a_is_fast()
     {
         using var client = await CreateWarmClientAsync();
@@ -144,8 +175,8 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
         var median = Percentile(samples, 0.50);
 
         Assert.True(
-            median <= 8,
-            $"median GET /containers/json?all=1 latency was {median:F1} ms (budget 8 ms) over " +
+            median <= 2,
+            $"median GET /containers/json?all=1 latency was {median:F1} ms (budget 2 ms) over " +
             $"{PsIterations} runs: " + string.Join(", ", samples.Select(s => s.ToString("F1"))));
     }
 

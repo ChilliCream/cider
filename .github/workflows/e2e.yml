@@ -85,13 +85,15 @@ jobs:
         run: dotnet test tests/Cider.E2E.Tests -f net10.0 --filter "FullyQualifiedName!~PerfSmokeTests"
         timeout-minutes: 30
 
-      # PerfSmokeTests (cider-ede.15) asserts latency budgets calibrated only against a local
-      # developer machine under real contention, never against this hosted runner (see the class
-      # doc on PerfSmokeTests for the numbers and conditions) — so it must not fail the build on
-      # latency alone yet. continue-on-error keeps it informative without gating; drop that flag
-      # once a run here has actually confirmed the budgets hold on macos-15.
-      - name: dotnet test (Cider.E2E.Tests PerfSmokeTests, transport=${{ matrix.transport }}, non-gating)
-        continue-on-error: true
+      # PerfSmokeTests (cider-ede.15) asserts latency budgets calibrated against a local developer
+      # machine under real contention (see the class doc on PerfSmokeTests for the numbers and
+      # conditions) with 2.5-8x headroom over what was actually observed there — enough margin that
+      # this step gates the build like any other functional step. It stays a separate step (its own
+      # timeout) purely so a perf failure is distinguishable from a functional one in the job log. If
+      # the first real macos-15 run can't meet a budget, widen that one number in PerfSmokeTests.cs
+      # and record the runner measurement in the class doc — do not re-add continue-on-error here;
+      # a widened budget plus a non-gating step is the same CI outcome as no test at all.
+      - name: dotnet test (Cider.E2E.Tests PerfSmokeTests, transport=${{ matrix.transport }})
         run: dotnet test tests/Cider.E2E.Tests -f net10.0 --filter "FullyQualifiedName~PerfSmokeTests"
         timeout-minutes: 10
 
