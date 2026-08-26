@@ -24,7 +24,7 @@ namespace Cider.Tests.AppleContainer.Xpc;
 /// </summary>
 public sealed class XpcContainerRuntimePruneScopedReclaimTests
 {
-    private static readonly string DanglingDigest = RepeatDigest('9');
+    private static readonly string DanglingDigest = RepeatDigest('a');
 
     [Fact]
     public async Task PruneImagesAsync_ScopedFallback_DeletesExactlyTheDeletedImagesConfigAndLayerDigests()
@@ -166,11 +166,16 @@ public sealed class XpcContainerRuntimePruneScopedReclaimTests
     /// the safety rule refuses to prove non-reference for any candidate. Since virtually every
     /// official docker.io image is multi-arch and a real pull only ever fetches one platform, this
     /// scoped path can be expected to abort on essentially any real store that still holds even one
-    /// ordinary pulled image alongside whatever the sweep is failing on — see the doc comments this
-    /// measurement updates on <see cref="XpcContainerRuntime.TryScopedReclaimAsync"/> and
+    /// ordinary pulled image alongside whatever the sweep is failing on. It is not a dead path,
+    /// though: a store whose only remaining images are single-platform — locally built, committed, or
+    /// imported, never pulled from a registry — lets every remaining image resolve fully and the
+    /// fallback still fires, as
+    /// <see cref="PruneImagesAsync_ScopedFallback_ExcludesADigestStillReferencedByARemainingImage"/>
+    /// already demonstrates with such a fixture. See the doc comments this measurement updates on
+    /// <see cref="XpcContainerRuntime.TryScopedReclaimAsync"/> and
     /// <see cref="XpcContainerRuntime.CollectManifestDigestsAsync"/>, and the README's Limitations
-    /// entry, for the recorded conclusion. No behaviour change: this is a regression pin on the
-    /// answer, not a new safety rule.
+    /// entry, for the recorded, bounded conclusion. No behaviour change: this is a regression pin on
+    /// the answer, not a new safety rule.
     /// </summary>
     [Fact]
     public async Task PruneImagesAsync_ScopedFallback_AbortsOnARealisticMultiArchRemainingImage()
@@ -234,7 +239,68 @@ public sealed class XpcContainerRuntimePruneScopedReclaimTests
             c => c.StartsWith("ContentGetAsync:", StringComparison.Ordinal) && c.Contains(Amd64Digest, StringComparison.Ordinal));
 
         var warnings = logger.Entries.Where(e => e.Level == LogLevel.Warning).ToList();
-        Assert.Contains(warnings, w => w.Message.Contains("deleting nothing", StringComparison.Ordinal));
+        // Pin the safety-rule abort specifically, not the generic catch-all warning both this path and
+        // an unrelated exception would produce — "deleting nothing" alone matches either.
+        Assert.Contains(warnings, w => w.Message.Contains("non-reference cannot be proven", StringComparison.Ordinal));
+        Assert.DoesNotContain(warnings, w => w.Message.Contains("could not complete the scoped reclaim", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The other half of the cider-6dw bound: the scoped fallback is not dead code, it fires whenever
+    /// every *remaining* image is single-platform — the shape a locally built or imported image has,
+    /// e.g. the <c>cider-build-*</c> entries this store's own classic-build path leaves behind (a
+    /// one-manifest index whose single manifest resolves, mirrored here as a synthetic digest pair in
+    /// the same shape). Companion to <see cref="PruneImagesAsync_ScopedFallback_AbortsOnARealisticMultiArchRemainingImage"/>:
+    /// same mechanism (<see cref="XpcContainerRuntime.CollectManifestDigestsAsync"/> walking a
+    /// *remaining* image), opposite outcome, because here the index names only the one platform that
+    /// was actually fetched, so nothing fails to resolve and the safety rule has nothing to abort on.
+    /// </summary>
+    [Fact]
+    public async Task PruneImagesAsync_ScopedFallback_FiresWhenEveryRemainingImageIsSinglePlatform()
+    {
+        using var tempDir = new TempDir();
+
+        var deletedIndexDigest = RepeatDigest('1');
+        var deletedManifestDigest = RepeatDigest('2');
+        var configDigest = RepeatDigest('3');
+        var layerDigest = RepeatDigest('4');
+
+        var remainingArm64ManifestDigest = RepeatDigest('6');
+        var remainingConfigDigest = RepeatDigest('7');
+        var remainingLayerDigest = RepeatDigest('8');
+
+        // A one-manifest index — no other platform listed at all, unlike the multi-arch case above —
+        // the shape a locally built image (e.g. a cider-build-* classic-build tag) actually has on
+        // disk, as opposed to a registry pull's multi-arch index with unfetched siblings.
+        var remainingIndexPath = tempDir.WriteMultiArchIndex(
+            "cider-build-single-platform-index",
+            (remainingArm64ManifestDigest, "arm64", "linux", "v8"));
+
+        var resolvable = new Dictionary<string, string?>
+        {
+            [deletedIndexDigest] = tempDir.WriteIndex("deleted-index", deletedManifestDigest),
+            [deletedManifestDigest] = tempDir.WriteManifest("deleted-manifest", configDigest, layerDigest),
+
+            [RepeatDigest('a')] = remainingIndexPath,
+            [remainingArm64ManifestDigest] = tempDir.WriteManifest("remaining-arm64-manifest", remainingConfigDigest, remainingLayerDigest),
+        };
+
+        var remaining = new List<ImageDescription>
+        {
+            Description("cider-build-11111111-1111-1111-1111-111111111111:latest", RepeatDigest('a')),
+        };
+        var fake = new FakeImagesServiceClient(DanglingContentFailure(), remaining, resolvable);
+        var runtime = NewRuntime(fake);
+        using var _ = runtime;
+
+        await runtime.PruneImagesAsync([deletedIndexDigest], CancellationToken.None);
+
+        var deleteCall = Assert.Single(fake.ContentDeleteCalls);
+        Assert.Equal(
+            new[] { configDigest, layerDigest }.OrderBy(d => d, StringComparer.Ordinal),
+            deleteCall.OrderBy(d => d, StringComparer.Ordinal));
+        Assert.DoesNotContain(remainingConfigDigest, deleteCall);
+        Assert.DoesNotContain(remainingLayerDigest, deleteCall);
     }
 
     /// <summary>
