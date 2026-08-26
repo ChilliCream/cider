@@ -212,6 +212,7 @@ you want to override a default. Environment variables win over the file, and exp
 | `dataDir` | `CIDER_DATA_DIR` | `~/.cider` | Root of all daemon state (`state/`, `logs/`, `volumes/`, `tmp/`) |
 | `socketPath` | `CIDER_SOCKET` | `<dataDir>/docker.sock` | Unix socket the daemon listens on (max 104 characters) |
 | `containerCliPath` | `CIDER_CONTAINER_CLI` | `container` | Path to, or `PATH`-resolved name of, the Apple `container` CLI |
+| `runtime.transport` | `CIDER_RUNTIME_TRANSPORT` | `auto` | Which transport talks to Apple `container`: `auto` pings the apiserver over XPC and decides (the default), `xpc` requires XPC and fails fast if the apiserver is unreachable or too old, `cli` always shells out to the CLI instead. XPC needs apiserver ≥ 1.2.0; cider is tested through 1.3.0 — older than the minimum falls back to `cli` with a warning in `auto` (or fails fast in `xpc`), newer than tested is used untested. See [How it works](#how-it-works) |
 | `portPublishing` | `CIDER_PORT_PUBLISHING` | `proxy` | `proxy` (the daemon binds host ports and forwards itself) or `apple` (hand `-p` to Apple `container`). Anything other than `apple` means `proxy` |
 | `logLevel` | `CIDER_LOG_LEVEL` | `Information` | The daemon's own log verbosity |
 | `builder.enabled` | `CIDER_BUILDKIT` | `true` | Whether the daemon offers BuildKit through Apple's builder VM at all. `false` (or `CIDER_BUILDKIT=0`/`=false`) makes `/grpc` and `/session` answer 404 and drops `Builder-Version` on `/_ping` to `1`, which is what makes buildx report the default builder unsupported — see [Building images](#building-images) |
@@ -315,8 +316,9 @@ Apple's services is allowed under System Settings → Privacy & Security → Loc
 
 ### Container-name DNS
 
-Apple `container`'s embedded resolver does not resolve container names, and once Apple's network
-stack is up, host port 53 is already bound by macOS/vmnet — so Cider cannot simply serve DNS there.
+Apple `container`'s embedded resolver does not resolve container names, and host port 53 is not free
+for Cider to bind either way — Apple's own embedded resolver listens on `127.0.0.1:2053`/`:1053`, never
+on 53, so it is macOS's own resolver machinery that holds the port, not Apple's container networking.
 Instead the daemon runs its own DNS server on `0.0.0.0:10053` and lazily starts one small CoreDNS
 forwarder container per Docker network (`cider-dns-<network>-<hash>`, hidden from `docker ps`) that
 listens on the network's normal port 53 and relays to `<gateway-ip>:10053`. Containers on that
@@ -374,29 +376,27 @@ turn it back off, and:
 |---|---|
 | **BuildKit is single-platform and cannot export to a cache or a registry** | `builder.enabled` defaults to `true` and `docker build`/`buildx build`/`bake`/`compose build` all reach BuildKit through `/grpc` + `/session` (see [Building images](#building-images)) — but only `linux/arm64`: a multi-platform `--platform` request fails at Solve time because the docker (tar) exporter every build is rewritten to cannot produce a manifest list. `--cache-to`/`--cache-from` are not supported (no cache export), and `--output type=docker,dest=<path>`/`type=oci` are rejected — buildx refuses both for the docker driver without a containerd snapshotter, and Apple's worker is made to look like it has none on purpose (see [How it works](#how-it-works)) so buildx does not enable exporters this proxy cannot serve. The build cache lives inside Apple's *own* builder VM, not on the host, and is wiped by `container builder delete`. Set `builder.enabled: false` (or `CIDER_BUILDKIT=0`) to turn BuildKit off entirely and force the classic builder with `DOCKER_BUILDKIT=0` |
 | **BuildKit context uploads are paced to 32 MiB/s by default** | Only the bytes the daemon sends *to* buildkitd — build context uploads via FileSync/DiffCopy — pass through a token-bucket pacer (`TokenBucketPacer.DefaultBytesPerSecond`) on the exec pipe (`container exec -i buildkit buildctl dial-stdio`), so a large upload cannot overrun buildkitd's HTTP/2 receive window and wedge it. Bytes buildkitd sends back — image tar exports via FileSend, and the Control/Status streams — are not paced at all; that direction is bounded only by the connection's 256 KiB initial HTTP/2 stream window (`BuilderConnection.InitialStreamWindowBytes`). Retuned (cider-ger.21) from the original 8 MiB/s placeholder shipped before any large-context measurement existed: a 200 MiB build context now transfers in ~6.2s (~32 MiB/s, matching the new steady rate — was ~25s at 8 MiB/s), with zero stalls or link-recovery events. 32 MiB/s, rather than a rate closer to the exec pipe's demonstrated ~120-260 MiB/s single-stream ceiling (a 585 MB `--output type=tar` export — unaffected by the pacer, since exports travel the unpaced direction — moved at ~266 MiB/s, and a 512 MiB/s pacer diagnostic moved the same 200 MiB context in ~1s, both with zero stalls), was chosen to leave margin for buildkitd being busy or a slow consumer on the far side; concurrent builds share one link and so one aggregate token bucket rather than multiplying the rate. Full reasoning and the evidence behind the margin are recorded on `TokenBucketPacer.DefaultBytesPerSecond`'s doc comment |
-| No pause/unpause | `POST /containers/{id}/pause` and `/unpause` return 501 — Apple `container` has no equivalent |
-| No `--privileged` | Mapped to `--cap-add ALL --masked-path NONE --read-only-path NONE`, which is not a true privileged mode; Docker-in-Docker and some device access will not behave |
+| No pause/unpause | `POST /containers/{id}/pause` and `/unpause` return 501 — there is no apiserver route for it, and no cgroup-freezer equivalent inside Apple's guest init (`vminitd`); the closest approximation, `SIGSTOP`/`SIGCONT` to just the container's init process, freezes PID 1 but not its whole process tree for most images, so it is not offered as a substitute |
+| No `--privileged` | Mapped to `--cap-add ALL` plus empty masked/read-only path lists — `--masked-path NONE --read-only-path NONE` over the CLI fallback, typed empty `maskedPaths`/`readonlyPaths` arrays over XPC, same semantics either way — which is not a true privileged mode; Docker-in-Docker and some device access will not behave |
 | No `--network host` / `none` / `container:*` | Rejected with 400. A compose service using `network_mode: host` does not come up |
-| `network connect`/`disconnect` only before the first start | Apple fixes a container's networks at create time, so both work on a container that was created and never started (the daemon re-creates it with the new network list) and return 501 with an explanatory message afterwards. A container always keeps at least one network |
-| Every container is a VM | Each container gets its own lightweight VM; defaults are 2 CPUs / 2 GiB unless overridden. Many services at once cost real RAM |
-| Exit codes can be lost | The daemon captures a container's exit code live from the held `container start -a` process; if the daemon restarts while the container keeps running, that exit code is unrecoverable from Apple `container` afterwards |
-| Logs merged for containers the daemon did not start | Containers created outside the daemon are surfaced read-only; their historical logs are not in the daemon's log store |
-| `docker commit` / `import` flatten the image | Apple has no commit primitive, so both export the container's whole root filesystem and load it back as a **single-layer** OCI image: real and runnable, but sharing no layer with its parent. `--change` accepts `CMD`, `ENTRYPOINT`, `ENV`, `EXPOSE`, `WORKDIR`, `USER`, `LABEL` and `VOLUME`; anything else is a 400. `docker import <url>` (as opposed to `docker import -`) is not supported |
-| `docker history` reports no per-layer size | Instruction text, comment and timestamp of every row are real; `Size` is always `0`, because Apple reports one total size per platform and no per-blob sizes at all |
+| `network connect`/`disconnect` only before the first start | Apple fixes a container's networks at create time, so both work on a container that was created and never started (the daemon deletes and re-creates it with the new network list — over XPC that is a `containerDelete` + `containerCreate` pair with the config already in hand, no CLI arg round-trip) and return 501 with an explanatory message afterwards. A container always keeps at least one network |
+| Every container is a VM | Each container gets its own lightweight VM. Apple's own default is 4 CPUs / 1 GiB plus one extra `cpuOverhead` core per VM; Cider passes its own, more conservative default of 2 CPUs / 2 GiB unless the container asks for something else (`defaultCpus`/`defaultMemoryBytes`, see [Configuration](#configuration)). Many services at once cost real RAM either way, and it only grows: memory a guest frees internally is never returned to macOS while its VM lives (Apple's own `docs/technical-overview.md`), so a long-lived service's VM accumulates RSS until it restarts |
+| Exit codes can be lost | On the XPC transport the daemon captures a container's exit code with `containerWait`, which is not tied to who started the container — if the daemon restarts while the container is still running, it simply re-issues `containerWait` for it and recovers the real exit code once the container actually exits (see [How it works](#how-it-works)). Only a container that exited *during* the daemon's downtime is unrecoverable — Apple stores no post-mortem exit code anywhere once the runtime helper for it has shut down. On `runtime.transport: cli` the older, blunter loss still applies: the exit code comes from a held `container start -a` child, so any daemon restart while that container is running loses it outright |
+| Foreign containers' logs are one merged stdout+stderr stream, with no history | `docker logs` now works for containers the daemon did not start too, via the apiserver's own `containerLogs` fd — but that fd is one file Apple's runtime always tees stdout *and* stderr into together, so the streams cannot be told apart, and the file is truncated on every container start, so nothing survives a restart. Cider's own log store still keeps stdout/stderr separated with history, for containers it started itself |
+| `docker commit` / `import` flatten the image | Apple has no commit primitive, so both export the container's whole root filesystem and load it back as a **single-layer** OCI image: real and runnable, but sharing no layer with its parent. On a *stopped* container this export no longer boots a VM at all — the daemon (over XPC, `containerExport`) reads the ext4 rootfs image directly, so `commit`/`export` on a stopped container is now cheap; a running container still needs a live snapshot. `--change` accepts `CMD`, `ENTRYPOINT`, `ENV`, `EXPOSE`, `WORKDIR`, `USER`, `LABEL` and `VOLUME`; anything else is a 400. `docker import <url>` (as opposed to `docker import -`) is not supported |
 | `docker image prune`'s orphaned-blob reclaim cannot fire under normal conditions — by design, not a working fallback | Apple's whole-store `imageCleanupOrphanedBlobs` sweep is all-or-nothing: one unrelated corrupted content reference anywhere in the store fails it completely. When that happens the daemon falls back to a scoped, client-side reclaim of just the blobs this prune call's own deletions orphaned — but that fallback never infers "orphaned" from an absence (a binding safety rule), so it aborts with zero deletions the instant even one *remaining* image is genuinely multi-arch with a platform variant never actually pulled — true of nearly every ordinary image pulled from docker.io. Measured directly (cider-6dw) against the real manifest-list digests of a genuine `alpine:3.22` pull: the fallback aborts. On a store holding any such image this is not a bug or a tuning gap — it is the correct output of the safety rule, and the *only* way to make it fire there is to relax the non-reference proof, which is exactly the version that was considered and rejected: "an unfetched variant's layers were never pulled, so they can't reference an existing blob" does not hold, because layers are shared between images and a manifest absent because it was *lost* while its variant *was* pulled looks identical to one that was never fetched — relaxing the proof would delete blobs belonging to the very image already damaged, which is the exact failure this fallback exists to survive. It can still fire, trivially, when every remaining image is fully resolvable locally — single-platform images such as those `container build` / cider's own build path produce, or the single-layer OCI images `docker commit` / `docker import` produce (see the row above) — or when no image remains at all. If the corrupted-store case itself needs covering, the fix is upstream — Apple's whole-store sweep and `container image ls` both being all-or-nothing on one bad entry instead of skipping it with a warning — not in cider. Every prune still deletes the dangling images themselves and reports their own space either way; only the *extra* orphaned-blob reclaim on top of that is affected |
-| `ExposedPorts` are invisible on images | Apple's image inspect omits `ExposedPorts` (and `Volumes`) from every image config, so `docker inspect <image>` shows none and `docker run -P` publishes nothing. Publish explicitly with `-p` |
 | Only the `json-file` log driver | Another `HostConfig.LogConfig.Type` is rejected at create — an unknown name with dockerd's own 400, a driver dockerd has but this daemon cannot honour (including `none`) with a 501 — rather than being accepted and silently logged json-file anyway |
 | Volumes have only the `local` driver | `POST /volumes/create` with any other `Driver` is a 404, in dockerd's plugin-lookup wording |
 | Volumes are single-attach ext4 images | Apple volumes are sparse ext4 disk images (512 GiB virtual size by default), not host directories: you cannot read one from the host, only through a container. Bind mounts behave normally |
 | A static container IP cannot be honoured | Apple has no `--ip`, so `EndpointsConfig[net].IPAMConfig.IPv4Address` is not applied and the runtime picks the address. A malformed address, or one outside the network's subnet, is still rejected at create with dockerd's wording |
 | No `diff`, best-effort `top` | `changes` is not implemented (Apple exposes no layer view); `top` runs `ps` inside the container as an approximation |
-| Restart policies and healthchecks are emulated | The daemon supervises `always`/`unless-stopped`/`on-failure` restarts and runs healthcheck probes itself; Apple `container` has no native support for either |
-| No swarm | Every `/swarm`, `/services`, `/tasks`, `/nodes`, `/secrets`, `/configs`, `/plugins` route answers with a clear "not supported" error instead of a raw 404 |
-| IPv6 not handled | Container IPv6 addresses exist on the wire but are not managed or exposed |
+| Restart policies and healthchecks are emulated | The daemon supervises `always`/`unless-stopped`/`on-failure` restarts and runs healthcheck probes itself; Apple `container` has no native support for either. On the XPC transport this got more reliable across a daemon restart: a still-running container's exit is now actually waited for (see the exit-codes row above) and republished as a normal `die` event, so a `restart: always` container that exits while the daemon happens to be down is still picked back up correctly, instead of the daemon never finding out |
+| No swarm | Every `/swarm`, `/services`, `/tasks`, `/nodes`, `/secrets`, `/configs`, `/plugins` route answers with a clear "not supported" error instead of a raw 404. Apple `container` 1.3 ships its own local single-node orchestration answer, the `container k8s` plugin, if that shape fits — this daemon does not proxy to it |
+| IPv6 management is limited | Container IPv6 addresses are reported: `docker inspect` surfaces `NetworkSettings`/`EndpointSettings` `GlobalIPv6Address` from Apple's own `ipv6Address`, and `docker network create --subnet-v6`/`-6` is honoured and passed straight through as `container network create --subnet-v6`. What's still missing: no `--ip6` (no field to request a static IPv6 address, the same structural gap as the static-IPv4 row above), and IPv6-only or dual-stack publish/connect behaviour beyond that is unexercised |
 | `host.docker.internal` reaches only `0.0.0.0`-bound services, unless you opt in | A host service bound to `127.0.0.1` only is not reachable from containers by default — and many dev servers bind loopback by default. `cider host-loopback enable` closes the gap with a pf redirect; see [Reaching loopback-only host services](#reaching-loopback-only-host-services) |
 | Published ports flow through the daemon (default `proxy`) | Traffic is relayed by the daemon process, not by the kernel or Apple's forwarder, so it stops when the daemon stops and adds one userland hop. `portPublishing: "apple"` avoids the hop but depends on macOS Local Network permission |
 | `docker cp` **into** a created container is emulated | Apple `container cp` refuses a container that is not running, so a tar `PUT` into a created container is staged under the data dir and bind-mounted in when the container starts (this is how .NET Aspire injects its dev certificates). Up to 64 files are mounted; beyond that they are copied in immediately after the start instead |
-| `docker cp` **out of** a stopped container is emulated | The same refusal, in the other direction: the path is selected out of the container's own rootfs export, which costs O(rootfs) rather than O(path). A path that reaches its target through a symbolic link inside the container is not resolved <!-- wording taken from the cp-out implementation's own note; src/Cider.Core/Services/ContainerManager.Archive.cs --> |
+| `docker cp` **out of** a stopped container is emulated | The same refusal, in the other direction: `container cp`/`containerCopyOut` both guard on the container being started. The path is selected out of the container's own rootfs export (over XPC, the same no-VM-boot `containerExport` the commit/import row above uses, so at least no subprocess or VM boot on the way), which still costs O(rootfs) rather than O(path). A path that reaches its target through a symbolic link inside the container is not resolved <!-- wording taken from the cp-out implementation's own note; src/Cider.Core/Services/ContainerManager.Archive.cs --> |
 | `HEAD /containers/{id}/archive` of a non-root path is O(image) | The stat is served by copying the path out of the container; `/` is answered synthetically, but a stat of a large subtree copies that subtree |
 
 ## How it works
@@ -406,27 +406,54 @@ docker CLI / compose / Testcontainers / Aspire
           │  HTTP/1.1 over unix socket
           ▼
    cider (Kestrel, in-process)
-      │                                 │
-      │ control plane                   │ data plane, on the daemon's own sockets:
-      │ drives the `container` CLI      │  · published ports: host bind → <containerIP>:<port>
-      ▼                                 │  · DNS for guests on 0.0.0.0:10053 + CoreDNS forwarder
-   container CLI                        │
-      │ talks to container-apiserver    │ straight to the guest VM's IP, no Apple forwarder
-      ▼                                 ▼
+      │                                     │
+      │ control plane                       │ data plane, on the daemon's own sockets:
+      │ XPC to the apiserver (primary),     │  · published ports: host bind → <containerIP>:<port>
+      │ `container` CLI only as fallback    │  · DNS for guests on 0.0.0.0:10053 + CoreDNS forwarder
+      ▼                                     │
+   com.apple.container.apiserver            │ straight to the guest VM's IP, no Apple forwarder
+   com.apple.container.core.…-images        ▼
+      │  mach services, over libxpc
+      ▼
    container-apiserver ── one lightweight VM per container
 ```
 
 The daemon is a single ASP.NET Core (Kestrel) process listening on a unix socket. Its **control
 plane** — everything that creates, starts, stops, inspects, execs into or lists containers, images,
-networks and volumes, plus `docker cp` and `build` — goes through exactly one path: invoking the
-`container` CLI as a subprocess and parsing its output. There is no XPC and no Swift bridge, and that
-path is the single implementation behind `IContainerRuntime`.
+networks and volumes, plus `docker cp`, image save/load and (partly) `build` — talks directly to
+Apple's own daemons over XPC: `com.apple.container.apiserver` for containers/networks/volumes, and the
+separate `com.apple.container.core.container-core-images` mach service for images, both reached
+through a .NET P/Invoke `libxpc` client (`src/Cider.AppleContainer/Xpc`) — no Swift bridge, no helper
+process, and no CLI subprocess for anything this path covers. This is the primary transport
+(`runtime.transport: auto`, the default) whenever a `ping` reports an apiserver version ≥ 1.2.0 —
+measured floor from the probe that proved the approach out: `ping` ~25 µs, a container list ~0.1 ms, a
+create ~11 ms median (`docs/spikes/xpc/04-dotnet-xpc-probe-report.md`). The `container` CLI is kept as
+a fallback only: per call, whenever XPC itself reports the apiserver unavailable; unconditionally for a
+handful of members with no reason to move (`docker login`'s credential store, the classic builder,
+starting the builder VM — the exact, current list is `FallbackMatrix`, also what `cider status` prints
+as `fallback: ...`); and for the whole runtime when the apiserver is unreachable, older than the
+version gate, or `runtime.transport` is set to `cli` outright — see [Configuration](#configuration).
 
-The **data plane** deliberately does not go through Apple. In the default `proxy` mode the daemon
-binds the host side of every `-p` mapping itself and forwards straight to the container's VM address,
-and container DNS is answered by the daemon's own DNS server through a per-network CoreDNS forwarder.
-Both exist because Apple's own forwarder is refused by macOS Local Network privacy on some machines,
-and because host port 53 is already taken once Apple's network stack is up.
+Container lifecycle ownership follows the same split. Over XPC the daemon calls `containerBootstrap`
+with pipes (or a PTY) it holds itself, then `containerStartProcess`, then `containerWait` for the exit
+code — there is no held `container start -a` child process, so a hard-killed daemon leaves nothing
+running with no parent and cannot wedge the Apple runtime the way it used to (see
+[Troubleshooting](#troubleshooting)). If a container is still running when the daemon comes back up,
+`containerWait` is simply re-issued for it and the real exit code is recovered even though the daemon
+was not there to see the exit happen live, then republished as an ordinary `die` event so
+`always`/`on-failure` restarts and `--rm` behave as if the daemon had never gone away — only a
+container that exited *during* the daemon's downtime is genuinely unrecoverable (see
+[Limitations](#limitations)). None of that holds under `runtime.transport: cli`, or for a call that
+fell back mid-flight: the CLI fallback still shells `container start -a` and still holds its child
+process the old way.
+
+The **data plane** deliberately does not go through Apple either way. In the default `proxy` mode the
+daemon binds the host side of every `-p` mapping itself and forwards straight to the container's VM
+address, and container DNS is answered by the daemon's own DNS server through a per-network CoreDNS
+forwarder. Both exist because Apple's own forwarder is refused by macOS Local Network privacy on some
+machines, and because port 53 on the host is not free either way — macOS's own resolver machinery
+holds it, not Apple's container networking (Apple's own embedded resolver listens on
+`127.0.0.1:2053`/`:1053`, never on 53).
 
 Docker's two "hijacked" endpoints (`POST /exec/{id}/start`, which always carries a body Kestrel
 refuses to upgrade, and `POST /containers/{id}/attach`) — and BuildKit's two, `POST /grpc` and
@@ -475,7 +502,7 @@ container logs live under `~/.cider/logs`; the daemon's own launchd log is `~/.c
 | Project | Purpose |
 |---|---|
 | `src/Cider.Core` | Docker wire DTOs, the `IContainerRuntime` abstraction, state stores, managers (container/exec/image/network/volume/system), events, logs, health, restart supervision — no ASP.NET dependency |
-| `src/Cider.AppleContainer` | The `IContainerRuntime` implementation that drives the `container` CLI: process launching, pty handling, JSON parsing, error mapping |
+| `src/Cider.AppleContainer` | The `IContainerRuntime` implementations: `Xpc/` talks to the apiserver directly (the primary transport — client, wire models, transport selection, `FallbackMatrix`) over a libxpc P/Invoke layer, wrapping the CLI-based implementation (process launching, pty handling, JSON parsing, error mapping) as its own fallback |
 | `src/Cider.Dns` | Standalone DNS server (UDP + TCP), message codec, resolver interface — no dependency on Core |
 | `src/Cider.Daemon` | The `cider` executable: Kestrel hosting, the hijack interceptor, Docker API routes, the BuildKit control proxy (`src/Cider.Daemon/BuildKit`), and the `serve`/`install`/`uninstall`/`status`/`sync` verbs |
 
@@ -521,14 +548,23 @@ container image delete <ref>
 
 cider never writes to Apple's `state.json` — it does not and will not attempt to repair this itself.
 
-### A hard-killed daemon can wedge the Apple runtime
+### A hard-killed daemon can wedge the Apple runtime (`runtime.transport: cli` only)
 
-The daemon holds one `container start -a <name>` child process per running container, to own that
-container's lifetime and exit code. A clean shutdown disposes them. A **hard kill** — `pkill`, a
-crash, a test harness tearing the process down — does not: the children survive with no parent, keep
-their containers running, and hold the networks those containers are attached to. Once that debris
-accumulates, `container network create` can hang for 300+ seconds *with no Cider in the path*,
-`container stop` hangs, and `container network delete` answers `network <n> has a pending operation`.
+This is a CLI-transport problem. On the default XPC transport the daemon never spawns a
+`container start -a` child in the first place (see [How it works](#how-it-works)), so there is no
+process left behind for a hard kill to orphan, and the rest of this section does not apply. It still
+applies when the daemon is running with `runtime.transport: cli`, when the version gate fell back to
+the CLI because the installed Apple `container` is older than 1.2.0, or if you are troubleshooting a
+cider from before 0.2 (the CLI-only architecture, before the XPC transport existed) — `cider status`
+prints which transport is actually active.
+
+Under the CLI transport, the daemon holds one `container start -a <name>` child process per running
+container, to own that container's lifetime and exit code. A clean shutdown disposes them. A **hard
+kill** — `pkill`, a crash, a test harness tearing the process down — does not: the children survive
+with no parent, keep their containers running, and hold the networks those containers are attached to.
+Once that debris accumulates, `container network create` can hang for 300+ seconds *with no Cider in
+the path*, `container stop` hangs, and `container network delete` answers `network <n> has a pending
+operation`.
 
 The daemon sweeps this itself: at startup it kills any `container start -a` child whose parent is
 gone *and* that carries the `CIDER_HELD=1` marker it stamps on every child it spawns — so a held
@@ -632,6 +668,17 @@ minimum* supported apiserver (`ApiServerVersion.Minimum`) instead of CI's pinned
 install that older signed `.pkg` from https://github.com/apple/container/releases locally and run
 `CIDER_E2E=1 CIDER_RUNTIME_TRANSPORT=xpc dotnet test tests/Cider.E2E.Tests` against it — see
 `tests/compat/README.md`'s "Runtime transport" section for the exact commands.
+
+**Run one target framework at a time whenever real Apple `container` state is involved**
+(`CIDER_E2E=1`, and everything under `tests/compat`) — pass `-f net10.0`/`-f net11.0` explicitly rather
+than letting `dotnet test`'s default multi-targeting run both together, and never invoke two such runs
+concurrently either. CI never does: `.github/workflows/e2e.yml` always pins `-f net10.0` for exactly
+this reason. It is structural, not a convenience — there is exactly one `apiserver` per user, on one
+fixed mach service name, so the content store cannot be partitioned per test run, and two concurrent
+runs, whatever their TFM, end up sharing one store with whatever images and containers you actually
+have on this machine. A run that only fails when something else is running against the same store at
+the same time is not a regression to chase: every such failure observed here passed cleanly on an
+immediate, isolated re-run.
 
 ## License
 
