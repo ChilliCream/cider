@@ -87,14 +87,15 @@ public sealed class ImageManagerTests : IDisposable
 
     /// <summary>
     /// cider-ede.24 correction (finding 4, "docker images answers 200 with what is enumerable" is not
-    /// covered at any seam): a runtime whose <c>ListImagesAsync</c> has already degraded to an empty
-    /// list — the tolerated shape both transports now answer with instead of throwing when Apple's
-    /// store holds a dangling content reference — must come back through <c>ImageManager.ListAsync</c>
-    /// (and so <c>GET /images/json</c>) as a plain empty result, not an exception a controller would
-    /// turn into a 500.
+    /// covered at any seam): a runtime whose <c>ListImagesAsync</c> genuinely has no images must come
+    /// back through <c>ImageManager.ListAsync</c> (and so <c>GET /images/json</c>) as a plain empty
+    /// result, not an exception a controller would turn into a 500. Per comment 66, no listing
+    /// "degrades" to empty — a failed listing throws instead (see
+    /// <see cref="LoadImagesAsync_StillSucceeds_WhenTheSnapshotListingThrows"/>); this test is only
+    /// about a store that genuinely has nothing in it.
     /// </summary>
     [Fact]
-    public async Task ListAsync_ReturnsEmpty_WhenTheRuntimesListingHasDegradedToEmpty()
+    public async Task ListAsync_ReturnsEmpty_WhenTheStoreIsGenuinelyEmpty()
     {
         var (manager, runtime) = CreateManager();
         runtime.ClearImages();
@@ -1206,6 +1207,30 @@ public sealed class ImageManagerTests : IDisposable
         var (manager, runtime) = CreateManager();
         var id = TestDigest("poisoned-snapshot");
         runtime.ListImagesFailure = RuntimeException.Internal("simulated poisoned image store");
+        await using var tar = BuildOciIndexTar(id, "app:1");
+
+        var references = await manager.LoadImagesAsync(tar, progress: null, CancellationToken.None);
+
+        Assert.Equal(["docker.io/library/app:1"], references);
+    }
+
+    /// <summary>
+    /// Correction plan item 4 (asymmetric ordering): the *before* snapshot throws (a poisoned store, or
+    /// a transient listing failure) while the *after* snapshot — taken once the load itself already
+    /// succeeded — would come back healthy. <c>SnapshotImageIdsByReferenceAsync</c> must return null,
+    /// not an empty map, for a failed "before": an empty map would make every reference already in the
+    /// store look newly loaded once "after" is diffed against it, so <c>LoadImagesAsync</c> must skip
+    /// the diff entirely (not run it against a synthesized empty "before") and fall back to the
+    /// runtime's own loaded names. The fake seeds several unrelated images so a regression back to
+    /// reporting the whole store is caught.
+    /// </summary>
+    [Fact]
+    public async Task LoadImagesAsync_DoesNotReportTheWholeStore_WhenOnlyTheBeforeSnapshotThrows()
+    {
+        var (manager, runtime) = CreateManager();
+        var id = TestDigest("before-throws-only");
+        runtime.ListImagesFailure = RuntimeException.Internal("simulated poisoned image store");
+        runtime.ListImagesFailuresRemaining = 1;
         await using var tar = BuildOciIndexTar(id, "app:1");
 
         var references = await manager.LoadImagesAsync(tar, progress: null, CancellationToken.None);

@@ -119,20 +119,32 @@ public sealed partial class FakeContainerRuntime
     ];
 
     /// <summary>
-    /// Test hook (cider-ede.24 comment 66): fails every subsequent <see cref="ListImagesAsync"/> call
-    /// with this error, simulating a poisoned Apple image store's <c>ListImagesAsync</c> now throwing
-    /// on a total enumeration failure — so a caller-side test can prove
+    /// Test hook (cider-ede.24 comment 66): fails the next <see cref="ListImagesAsync"/> call(s) with
+    /// this error, simulating a poisoned Apple image store's <c>ListImagesAsync</c> now throwing on a
+    /// total enumeration failure — so a caller-side test can prove
     /// <c>ImageManager.LoadAsync</c>/<c>LoadImagesAsync</c> still succeeds (falling back to the
     /// runtime's own <c>Loaded image:</c> names) when the before/after snapshot diff it uses can no
-    /// longer be trusted.
+    /// longer be trusted. By default this fails every subsequent call (see
+    /// <see cref="ListImagesFailuresRemaining"/> to arm a one-shot failure instead — e.g. the
+    /// before-snapshot throws while the after-snapshot succeeds).
     /// </summary>
     public RuntimeException? ListImagesFailure { get; set; }
+
+    /// <summary>
+    /// How many more times <see cref="ListImagesFailure"/> throws before <see cref="ListImagesAsync"/>
+    /// goes back to answering normally — decremented on each throw. Defaults to unlimited (every call
+    /// fails once <see cref="ListImagesFailure"/> is set); set to a small number (e.g. 1) to model the
+    /// asymmetric before-fails/after-succeeds ordering that a poisoned-store repair or a transient
+    /// listing failure produces.
+    /// </summary>
+    public int ListImagesFailuresRemaining { get; set; } = int.MaxValue;
 
     public Task<IReadOnlyList<RuntimeImage>> ListImagesAsync(CancellationToken ct)
     {
         Record("ListImagesAsync");
-        if (ListImagesFailure is { } failure)
+        if (ListImagesFailure is { } failure && ListImagesFailuresRemaining > 0)
         {
+            ListImagesFailuresRemaining--;
             throw failure;
         }
 

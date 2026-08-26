@@ -629,20 +629,26 @@ public sealed partial class AppleContainerRuntime
                 }
             }
 
-            var after = await ListReferencesToleratingFailureAsync(ct);
-            foreach (var reference in after)
+            if (before is not null)
             {
-                if (before.Contains(reference))
+                var after = await ListReferencesToleratingFailureAsync(ct);
+                if (after is not null)
                 {
-                    continue;
-                }
+                    foreach (var reference in after)
+                    {
+                        if (before.Contains(reference))
+                        {
+                            continue;
+                        }
 
-                var key = ImageReference.TryParse(reference, out var parsedReference)
-                    ? parsedReference.Normalize().ToString()
-                    : reference;
-                if (loadedKeys.Add(key))
-                {
-                    loaded.Add(reference);
+                        var key = ImageReference.TryParse(reference, out var parsedReference)
+                            ? parsedReference.Normalize().ToString()
+                            : reference;
+                        if (loadedKeys.Add(key))
+                        {
+                            loaded.Add(reference);
+                        }
+                    }
                 }
             }
 
@@ -787,12 +793,13 @@ public sealed partial class AppleContainerRuntime
     /// <summary>
     /// <see cref="ListReferencesAsync"/> for callers that use it only as a secondary, best-effort
     /// source (<see cref="LoadImagesAsync"/>'s before/after diff): <see cref="ListImagesAsync"/> can now
-    /// throw on a total enumeration failure (comment 66), and a poisoned store must not turn an
-    /// otherwise-successful <c>image load</c> into a reported failure — comment 66's other half, "never
-    /// turn a success into a failure". A throw here is caught, logged at Debug, and treated as an empty
-    /// secondary source, exactly like a genuinely empty listing.
+    /// throw on a total enumeration failure (comment 66). A caught failure here means "no diff
+    /// available" — it is NOT the same as a genuinely empty listing, and must not be conflated with one
+    /// (comment 66's ban on synthesizing an empty success out of a failure). Returns null when the
+    /// listing could not be obtained at all, so callers can tell "nothing" from "unknown" and skip the
+    /// diff entirely rather than treat an unreadable store as proof it holds no images.
     /// </summary>
-    private async Task<HashSet<string>> ListReferencesToleratingFailureAsync(CancellationToken ct)
+    private async Task<HashSet<string>?> ListReferencesToleratingFailureAsync(CancellationToken ct)
     {
         try
         {
@@ -801,7 +808,7 @@ public sealed partial class AppleContainerRuntime
         catch (RuntimeException ex)
         {
             _logger.LogDebug(ex, "could not list images while identifying an image load's references");
-            return new HashSet<string>(StringComparer.Ordinal);
+            return null;
         }
     }
 }

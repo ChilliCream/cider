@@ -576,13 +576,21 @@ public sealed class ImageManager
                 _events.Publish(DockerEvents.Image("load", reference, familiar));
             }
 
-            var after = await SnapshotImageIdsByReferenceAsync(ct).ConfigureAwait(false);
-            var changed = after
-                .Where(entry => !before.TryGetValue(entry.Key, out var beforeId) || !string.Equals(beforeId, entry.Value, StringComparison.Ordinal))
-                .Select(entry => entry.Key)
-                .ToList();
+            IReadOnlyList<string> references = loaded;
+            if (before is not null)
+            {
+                var after = await SnapshotImageIdsByReferenceAsync(ct).ConfigureAwait(false);
+                if (after is not null)
+                {
+                    var changed = after
+                        .Where(entry => !before.TryGetValue(entry.Key, out var beforeId) || !string.Equals(beforeId, entry.Value, StringComparison.Ordinal))
+                        .Select(entry => entry.Key)
+                        .ToList();
 
-            var references = changed.Count > 0 ? changed : loaded;
+                    references = changed.Count > 0 ? changed : loaded;
+                }
+            }
+
             return references
                 .Select(reference => ImageReference.TryParse(reference, out var parsed) ? parsed.Normalize().ToString() : reference)
                 .ToList();
@@ -595,13 +603,14 @@ public sealed class ImageManager
 
     /// <summary>
     /// Every reference known to the runtime right now, mapped to the image id it points at. Used only
-    /// as a before/after diff around an already-successful <see cref="LoadImagesAsync"/> load, so a
-    /// listing failure here (e.g. a poisoned Apple image store — cider-ede.24 comment 66) must not turn
-    /// that success into a reported failure: it is caught and logged at Debug, and treated as an empty
-    /// snapshot, which simply contributes nothing to the diff — <c>LoadImagesAsync</c> then falls back
-    /// to the runtime's own <c>Loaded image:</c> names.
+    /// as a before/after diff around an already-successful <see cref="LoadImagesAsync"/> load. A caught
+    /// listing failure here (e.g. a poisoned Apple image store — cider-ede.24 comment 66) means "no
+    /// snapshot available" — it is NOT the same as a genuinely empty listing, and must not be conflated
+    /// with one (comment 66's ban on synthesizing an empty success out of a failure). Returns null in
+    /// that case, so <c>LoadImagesAsync</c> can tell "unknown" from "nothing" and skip the diff
+    /// entirely, falling back to the runtime's own <c>Loaded image:</c> names.
     /// </summary>
-    private async Task<Dictionary<string, string>> SnapshotImageIdsByReferenceAsync(CancellationToken ct)
+    private async Task<Dictionary<string, string>?> SnapshotImageIdsByReferenceAsync(CancellationToken ct)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
 
@@ -613,7 +622,7 @@ public sealed class ImageManager
         catch (RuntimeException ex)
         {
             _logger.LogDebug(ex, "could not list images while snapshotting references for an image load diff");
-            return map;
+            return null;
         }
 
         foreach (var image in images)

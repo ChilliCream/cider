@@ -167,6 +167,42 @@ public sealed class AppleContainerRuntimeDanglingContentTests
     }
 
     [Fact]
+    public async Task LoadImagesAsync_ReportsOnlyTheLoadedReference_WhenOnlyTheBeforeListingTotallyFails()
+    {
+        // Correction plan item 3 (asymmetric ordering at the fake-CLI seam): the *before* `image ls`
+        // is a TOTAL failure (dangling stderr, nothing parseable on stdout) so
+        // ListReferencesToleratingFailureAsync must come back null, not an empty set — an empty "before"
+        // would make every entry in a healthy "after" listing look newly loaded (before.Contains would
+        // be false for all of them), so the diff must be skipped entirely rather than run against a
+        // synthesized empty snapshot. The *after* `image ls` then succeeds and lists several unrelated
+        // images already present in the store. The result must be exactly the one reference Apple's own
+        // stdout named as loaded — never the whole store.
+        const string severalUnrelatedImagesJson =
+            """
+            [
+              {"id":"aaa","configuration":{"name":"docker.io/library/foo:latest"},"variants":[{"platform":{"architecture":"amd64","os":"linux"},"digest":"sha256:bbb","size":10}]},
+              {"id":"ccc","configuration":{"name":"docker.io/library/bar:latest"},"variants":[{"platform":{"architecture":"amd64","os":"linux"},"digest":"sha256:ddd","size":10}]},
+              {"id":"eee","configuration":{"name":"docker.io/library/baz:latest"},"variants":[{"platform":{"architecture":"amd64","os":"linux"},"digest":"sha256:fff","size":10}]}
+            ]
+            """;
+        var cli = new ScriptedCli(new CliResult(1, "", DanglingStderr))
+        {
+            ImageLoadResult = new CliResult(0, "Loaded image: foo:latest\n", ""),
+            ImageLsSequence = new Queue<CliResult>(
+            [
+                new CliResult(1, "", DanglingStderr), // before: total failure, nothing parseable
+                new CliResult(0, severalUnrelatedImagesJson, ""), // after: several unrelated images
+            ]),
+        };
+        var runtime = new AppleContainerRuntime(new AppleContainerOptions(), NullLogger<AppleContainerRuntime>.Instance, cli);
+
+        await using var tar = new MemoryStream([1, 2, 3]);
+        var loaded = await runtime.LoadImagesAsync(tar, CancellationToken.None);
+
+        Assert.Equal(["foo:latest"], loaded);
+    }
+
+    [Fact]
     public async Task LoadImagesAsync_IgnoresStdoutNoiseThatDoesNotCarryTheLoadedImagePrefix()
     {
         // Review correction (cider-ede.24, MAJOR 1): a prior pass treated ANY non-empty stdout line as
