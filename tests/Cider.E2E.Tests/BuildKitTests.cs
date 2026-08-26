@@ -526,13 +526,13 @@ public sealed class BuildKitTests(DaemonFixture daemon)
     {
         const int bufferSize = 1024 * 1024;
         var buffer = new byte[bufferSize];
-        RandomNumberGenerator.Fill(buffer);
 
         await using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize, useAsync: true);
         var remaining = sizeBytes;
         while (remaining > 0)
         {
             var chunk = (int)Math.Min(bufferSize, remaining);
+            RandomNumberGenerator.Fill(buffer.AsSpan(0, chunk));
             await stream.WriteAsync(buffer.AsMemory(0, chunk));
             remaining -= chunk;
         }
