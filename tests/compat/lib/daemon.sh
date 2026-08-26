@@ -261,15 +261,31 @@ wait_for_ping() {
 _CIDER_COMPAT_IMAGES_BEFORE=""
 _CIDER_COMPAT_SNAPSHOT_OK=0
 
-# Repo tag prefixes this harness (and the E2E fixture) actually tags things
-# with -- the only tags a new image may be removed under. An id that carries
-# a tag outside this list, or no tag at all (<none>, i.e. untagged), is left
-# alone: it may be another concurrent run's in-flight build, or a base image
-# (alpine, nginx, ryuk, ...) newly pulled into the shared cache, which stays
-# by design -- re-pulling it is the cost this filter buys. The leak this
-# task actually measures (this harness's own synthetic tags) is still
-# cleaned.
-_CIDER_COMPAT_OWNED_TAG_RE='^(cider-build-|cider-e2e|cider-compat)'
+# Repo tag prefixes this harness (and the E2E fixture,
+# tests/Cider.E2E.Tests/Infrastructure/DaemonFixture.cs's OwnedImageTagPrefixes)
+# actually tags things with -- the only tags a new image may be removed
+# under. This list must name exactly the same prefixes as that C# array
+# (cider-3n2): this harness only ever mints "cider-compat/..." tags itself,
+# but the two definitions state one contract and must agree, not drift the
+# way they did before cider-3n2. If OwnedImageTagPrefixes changes, update
+# this regex to match, and vice versa.
+#
+# Deliberately does NOT include `cider-build-`: that synthetic untagged-build
+# marker (Cider.Core.Ids.SyntheticBuildTag) is stripped by
+# ImageManager.VisibleReferences before any image listing is built, so it is
+# never visible through `docker images` either -- not to this harness, not to
+# the C# fixture, not to a real `docker` client. Such an image always lists
+# here as `<none>:<none>` and is excluded by the `:<none>$` check below
+# regardless of what this regex says, so keeping `cider-build-` in the list
+# only misrepresented what this filter reclaims (cider-3n2).
+#
+# An id that carries a tag outside this list, or no tag at all (<none>, i.e.
+# untagged), is left alone: it may be another concurrent run's in-flight
+# build, or a base image (alpine, nginx, ryuk, ...) newly pulled into the
+# shared cache, which stays by design -- re-pulling it is the cost this
+# filter buys. The leak this task actually measures (this harness's own
+# synthetic tags) is still cleaned.
+_CIDER_COMPAT_OWNED_TAG_RE='^(e2e/|e2e-|cider-e2e|cider-compat)'
 
 snapshot_images() {
   local tmp
