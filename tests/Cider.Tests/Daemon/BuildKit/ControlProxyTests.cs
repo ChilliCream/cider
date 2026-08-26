@@ -16,6 +16,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Primitives;
 using Moby.Buildkit.V1;
 using Xunit;
 using FsBytesMessage = Moby.Filesync.V1.BytesMessage;
@@ -221,7 +222,7 @@ public sealed class ControlProxyTests : IAsyncLifetime
                 BuildKitMethods.FileSend.DiffCopy.ToLowerInvariant(),
                 BuildKitMethods.Health.Check.ToLowerInvariant(),
             };
-            var rawHeaders = _controlService.LastHttpContext!.Request.Headers;
+            var rawHeaders = _controlService.LastRequestHeaders!;
             var methodValues = rawHeaders[BuildKitMethods.MetadataKeys.SessionGrpcMethod];
             Assert.Equal(expectedMethods.Count, methodValues.Count);
             Assert.Equal(expectedMethods, new HashSet<string>(methodValues!, StringComparer.Ordinal));
@@ -459,11 +460,20 @@ public sealed class ControlProxyTests : IAsyncLifetime
         public Metadata? LastHeaders { get; private set; }
 
         /// <summary>
-        /// The raw ASP.NET Core <see cref="HttpContext"/> for the most recent <c>Session</c> call --
-        /// needed alongside <see cref="LastHeaders"/> because <see cref="Grpc.AspNetCore.Server"/>'s
+        /// A snapshot of the raw ASP.NET Core request headers for the most recent <c>Session</c>
+        /// call -- needed alongside <see cref="LastHeaders"/> because <see cref="Grpc.AspNetCore.Server"/>'s
         /// own <c>Metadata</c> construction comma-joins repeated header lines (see the usage site).
+        /// Deliberately materialized into a plain dictionary the instant <see cref="Session"/> is
+        /// entered rather than kept as a live <see cref="HttpContext"/> reference: this <c>Session</c>
+        /// call's <see cref="SessionBridgeHandle"/> tears down the instant <c>Solve</c> releases its
+        /// last reference (<see cref="SessionBridge.OpenAsync"/>/<c>Release</c>'s fire-and-forget
+        /// <c>DisposeAsync</c>), which recycles Kestrel's pooled <see cref="HttpContext"/> for this
+        /// request -- reading <c>HttpContext.Request.Headers</c> off a stashed context afterwards
+        /// throws <see cref="ObjectDisposedException"/> ("IFeatureCollection has been disposed") the
+        /// instant that teardown outraces the assertion, which is exactly what parallel test runs
+        /// make likelier by delaying this class's own continuation past Solve's return.
         /// </summary>
-        public HttpContext? LastHttpContext { get; private set; }
+        public IReadOnlyDictionary<string, StringValues>? LastRequestHeaders { get; private set; }
 
         public override Task<InfoResponse> Info(InfoRequest request, ServerCallContext context)
         {
@@ -487,7 +497,12 @@ public sealed class ControlProxyTests : IAsyncLifetime
             IAsyncStreamReader<BytesMessage> requestStream, IServerStreamWriter<BytesMessage> responseStream, ServerCallContext context)
         {
             LastHeaders = context.RequestHeaders;
-            LastHttpContext = context.GetHttpContext();
+
+            // Copy every header's StringValues out right now, synchronously, while the request is
+            // still guaranteed live -- see LastRequestHeaders' doc comment for why holding the
+            // HttpContext itself instead is unsafe.
+            LastRequestHeaders = context.GetHttpContext().Request.Headers
+                .ToDictionary(static h => h.Key, static h => h.Value, StringComparer.Ordinal);
             var sessionId = context.RequestHeaders.FirstOrDefault(h => h.Key == BuildKitMethods.MetadataKeys.SessionUuid)?.Value;
             if (sessionId == "S2")
             {
