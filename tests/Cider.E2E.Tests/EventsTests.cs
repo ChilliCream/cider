@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Cider.E2E.Tests.Infrastructure;
 using Xunit;
 
@@ -79,7 +78,6 @@ public sealed class EventsTests(DaemonFixture daemon)
 
         try
         {
-            var stopwatch = Stopwatch.StartNew();
             var run = await daemon.DockerAsync(
                 ["run", "-d", "--name", name, Image, "sh", "-c", $"sleep {sleepSeconds}"],
                 timeout: TimeSpan.FromMinutes(3));
@@ -89,7 +87,7 @@ public sealed class EventsTests(DaemonFixture daemon)
                 () => Task.FromResult(Has(events.Stdout, "die")),
                 TimeSpan.FromSeconds(sleepSeconds + 30),
                 TimeSpan.FromMilliseconds(100));
-            var elapsed = stopwatch.Elapsed;
+            var observedAt = DateTimeOffset.UtcNow;
 
             Assert.True(
                 seen,
@@ -97,11 +95,24 @@ public sealed class EventsTests(DaemonFixture daemon)
 
             if (RanUnderXpc(daemon))
             {
-                var detectionLatency = elapsed - TimeSpan.FromSeconds(sleepSeconds);
+                // Time from the container's own recorded exit (docker inspect's FinishedAt), not from
+                // when we issued `run` — that would fold create/start (and any cold-cache pull) latency
+                // into what is supposed to be a pure event-detection budget.
+                var inspect = await daemon.DockerAsync(
+                    ["inspect", "-f", "{{.State.FinishedAt}}", name],
+                    timeout: TimeSpan.FromMinutes(1));
+                Assert.True(inspect.Ok, inspect.ToString());
+
+                var finishedAt = DateTimeOffset.Parse(
+                    inspect.Stdout.Trim(),
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind);
+                var detectionLatency = observedAt - finishedAt;
+
                 Assert.True(
                     detectionLatency <= TimeSpan.FromSeconds(1.5),
                     $"die was observed {detectionLatency.TotalSeconds:F2}s after the container's own "
-                    + $"{sleepSeconds}s exit (budget 1.5s) — total wall time {elapsed.TotalSeconds:F2}s");
+                    + $"exit at {finishedAt:O} (budget 1.5s)");
             }
         }
         finally
