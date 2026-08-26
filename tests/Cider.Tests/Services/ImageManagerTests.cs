@@ -612,6 +612,42 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Equal(2, stillPresent.RepoTags.Count);
     }
 
+    [Fact]
+    public async Task PruneAsync_WhenTheRuntimeSilentlyNoOpsOnAMismatchedReference_DoesNotReportItAsDeleted()
+    {
+        // cider-eo0: PruneAsync's delete loop (RemoveAsync's `deleteAll` sibling) had the identical
+        // normalize-then-delete gap the two RemoveAsync tests above cover — a dangling image whose
+        // only reference is the legacy, non-normalized `cider-build-<uuid>` shape sends a *different*
+        // string to the runtime than the one it actually holds, so Apple's real no-op semantics
+        // (modeled here via StrictExactReferenceMatchOnRemove) silently keep the image while prune
+        // still reports it deleted and reclaims its size.
+        var (manager, runtime) = CreateManager();
+        var rawId = "sha256:" + new string('9', 64);
+        var rawRef = SyntheticBuildTag.New(); // e.g. "cider-build-<32 hex>", raw and unnormalized
+        const long size = 12_345;
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = rawId,
+            References = [rawRef],
+            Size = size,
+            Created = DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+        runtime.StrictExactReferenceMatchOnRemove = true;
+
+        var response = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
+
+        // Honest report: the runtime's own no-op really did leave the image in place, so it must not
+        // be counted as deleted or as reclaimed space.
+        Assert.DoesNotContain(response.ImagesDeleted, i => i.Deleted == rawId);
+        Assert.Equal(0, response.SpaceReclaimed);
+
+        var images = await manager.ListAsync(all: true, Filters.Empty, digests: false, CancellationToken.None);
+        Assert.Contains(images, i => i.Id == rawId);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

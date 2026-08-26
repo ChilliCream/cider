@@ -418,8 +418,14 @@ public sealed class ImageManager
         {
             throw ex.ToDockerError();
         }
+        finally
+        {
+            // By the time a verification failure above throws, some references may genuinely have
+            // been dropped by the runtime already (a multi-reference delete removes them one at a
+            // time), so the cached listing is stale even on the failure path -- not just on success.
+            InvalidateImageCache();
+        }
 
-        InvalidateImageCache();
         return items;
     }
 
@@ -835,8 +841,14 @@ public sealed class ImageManager
 
                 RuntimeException? missing = null;
                 var removedAny = false;
+                var verifyGone = false;
                 foreach (var target in targets)
                 {
+                    if (RequiredNormalization(target, image.References))
+                    {
+                        verifyGone = true;
+                    }
+
                     try
                     {
                         await _runtime.RemoveImageAsync(target, false, ct).ConfigureAwait(false);
@@ -853,6 +865,22 @@ public sealed class ImageManager
                 if (!removedAny && missing is not null)
                 {
                     throw missing;
+                }
+
+                // cider-eo0: prune verifies for exactly the reason rmi does (RemoveAsync's own
+                // `deleteAll` branch, above) -- Apple's `image delete` can silently no-op on a
+                // reference cider had to normalize/derive rather than pass back verbatim (see
+                // RequiredNormalization's doc comment), which would otherwise let prune report an
+                // image deleted, reclaim its Size, and drop its index digests from the sweep while
+                // the image is still sitting in the store. Kept inside this `try` so a genuine no-op
+                // throws RuntimeException.Internal and is caught by the `catch (RuntimeException)`
+                // below -- the same honest "not reported as deleted" outcome RemoveAsync gets, not a
+                // failure of the whole prune. The cost (an extra listing call) is bounded by
+                // RequiredNormalization to just the legacy/derived-reference images on this bulk,
+                // non-interactive path -- every other image keeps trusting the runtime's return.
+                if (verifyGone)
+                {
+                    await VerifyRuntimeDeleteActuallyHappenedAsync(image, image.Id, expectedGoneTag: null, ct).ConfigureAwait(false);
                 }
             }
             catch (RuntimeException)
@@ -1645,7 +1673,7 @@ public sealed class ImageManager
     /// genuinely still present, making this check permanently dead.
     /// </summary>
     private async Task VerifyRuntimeDeleteActuallyHappenedAsync(
-        RuntimeImageDetail imageBefore, string reference, string? expectedGoneTag, CancellationToken ct)
+        RuntimeImage imageBefore, string reference, string? expectedGoneTag, CancellationToken ct)
     {
         var images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
         var current = images.FirstOrDefault(i => string.Equals(i.Id, imageBefore.Id, StringComparison.Ordinal));
