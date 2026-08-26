@@ -307,6 +307,31 @@ public sealed class ContainerManagerLifecycleTests
     }
 
     [Fact]
+    public async Task Next_exit_wait_issued_after_a_run_already_exited_is_not_resolved_by_that_stale_result()
+    {
+        // cider-ede.33 fix direction: a container that exits twice across a restart/start cycle
+        // must not complete a stale TCS -- HandleExitAsync swaps in a fresh NextExit for the run
+        // that follows, and a wait issued after the first run already finished must capture that
+        // fresh one, not still observe the run that had already completed before it was issued.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var record = await harness.CreateShellAsync("exit 5", "web");
+
+        await harness.Containers.StartAsync(record.Id, default);
+        await ContainerTestHarness.WaitUntilAsync(() => !record.State.Running, "the first run to exit");
+        Assert.Equal(5, record.State.ExitCode);
+
+        var waiting = harness.Containers.WaitAsync(record.Id, "next-exit", default);
+        await Task.Delay(TimeSpan.FromMilliseconds(50));
+        Assert.False(waiting.IsCompleted, "a wait issued after the prior run already exited must not resolve from that stale exit");
+
+        await harness.Containers.StartAsync(record.Id, default);
+        var response = await waiting.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(5, response.StatusCode);
+        Assert.Equal("exited", record.State.Status);
+    }
+
+    [Fact]
     public async Task Output_is_captured_and_demultiplexed_into_the_log()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

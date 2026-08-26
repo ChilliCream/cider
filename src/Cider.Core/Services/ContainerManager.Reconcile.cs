@@ -338,6 +338,12 @@ public sealed partial class ContainerManager
 
         Persist(current);
 
+        // Same gap cider-ede.33 closed in StatePoller: this is a third observer of a container's
+        // exit, no held process for HandleExitAsync to run off of either, and without this call it
+        // would leave a pending `docker wait` blocked forever even though the record now correctly
+        // says exited with the real exit code this path exists to recover.
+        CompleteExitWait(current.Id, exit.ExitCode);
+
         _names.Unregister(current.Id);
         UnpublishPorts(current.Id);
         Publish(current, "die", new Dictionary<string, string>(StringComparer.Ordinal)

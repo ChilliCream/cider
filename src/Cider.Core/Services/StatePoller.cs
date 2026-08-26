@@ -157,6 +157,13 @@ public sealed class StatePoller : IAsyncDisposable
                         record.State.FinishedAt ??= DateTimeOffset.UtcNow;
                         record.State.Error = "exit code unknown (daemon restarted)";
                         Save(record);
+
+                        // No held process for an adopted container means HandleExitAsync never
+                        // runs, so this is the only place `docker wait` can be unblocked from: a
+                        // wrong-but-honest exit code plus the Error above beats leaving the waiter
+                        // pending forever (cider-ede.33).
+                        _containers.CompleteExitWait(record.Id, record.State.ExitCode);
+
                         _events.Publish(DockerEvents.Container("die", record, new Dictionary<string, string>(StringComparer.Ordinal)
                         {
                             ["exitCode"] = record.State.ExitCode.ToString(CultureInfo.InvariantCulture),
@@ -205,6 +212,12 @@ public sealed class StatePoller : IAsyncDisposable
                 record.State.Status = "exited";
                 record.State.FinishedAt = DateTimeOffset.UtcNow;
                 Save(record);
+
+                // Same as the miss branch above: an adopted container has no held process to drive
+                // HandleExitAsync, so this poller-observed transition is the only place `docker
+                // wait` gets unblocked from (cider-ede.33).
+                _containers.CompleteExitWait(record.Id, record.State.ExitCode);
+
                 _events.Publish(DockerEvents.Container("die", record, new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     ["exitCode"] = record.State.ExitCode.ToString(CultureInfo.InvariantCulture),

@@ -231,6 +231,22 @@ public sealed partial class ContainerManager : IContainerCounts
     /// <summary><c>true</c> when this daemon holds the container's init process (so it sees the real exit).</summary>
     internal bool HasHeldProcess(string id) => _handles.TryGetValue(id, out var handle) && handle.Process is not null;
 
+    /// <summary>
+    /// Completes container <paramref name="id"/>'s pending `docker wait` (the <c>next-exit</c> and
+    /// default <c>not-running</c> conditions) with <paramref name="exitCode"/>, for a container
+    /// <see cref="StatePoller"/> observed transition to exited without the daemon ever holding its
+    /// process -- an adopted container. See <see cref="CompleteExitWait(ContainerHandle,int)"/> for
+    /// the shared mechanism this and <c>HandleExitAsync</c> both go through (cider-ede.33). A no-op
+    /// if no handle exists for the id (nothing has ever waited on it).
+    /// </summary>
+    internal void CompleteExitWait(string id, int exitCode)
+    {
+        if (_handles.TryGetValue(id, out var handle))
+        {
+            CompleteExitWait(handle, exitCode);
+        }
+    }
+
     /// <summary>Publishes a container event on behalf of another component.</summary>
     internal void PublishExternal(ContainerRecord record, string action, IReadOnlyDictionary<string, string>? attributes = null) =>
         Publish(record, action, attributes);

@@ -156,6 +156,13 @@ public sealed class DaemonRestartTests(RestartableDaemonFixture daemon)
         {
             await daemon.RestartAsync();
 
+            // cider-ede.33: this container is adopted by the restarted daemon (no held process to
+            // ever drive HandleExitAsync), so `docker wait` -- default `not-running` condition --
+            // must still return once it exits rather than hang forever. Started before the guest's
+            // own `exit 7` fires (still ~8s out) so this really is waiting for StatePoller to
+            // observe the exit, not returning immediately for an already-exited container.
+            var waitTask = daemon.DockerAsync(["wait", name], timeout: TimeSpan.FromSeconds(30));
+
             var settled = await DaemonFixture.EventuallyAsync(
                 async () => (await daemon.DockerAsync("inspect", "-f", "{{.State.Status}}", name)).Stdout.Trim() == "exited",
                 TimeSpan.FromSeconds(30),
@@ -167,6 +174,10 @@ public sealed class DaemonRestartTests(RestartableDaemonFixture daemon)
             Assert.True(settled, "the container never reached `exited` after restarting: " + after);
             var fields = after.Stdout.Trim().Split('|');
             Assert.Equal("exited", fields[0]);
+
+            var wait = await waitTask;
+            Assert.True(wait.Ok, "`docker wait` on the adopted container timed out instead of returning once it exited: " + wait);
+            Assert.Equal(fields[1], wait.Stdout.Trim());
 
             if (RanUnderXpc(daemon))
             {

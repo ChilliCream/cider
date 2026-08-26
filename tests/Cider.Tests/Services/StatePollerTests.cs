@@ -30,6 +30,63 @@ public sealed class StatePollerTests
     }
 
     [Fact]
+    public async Task A_single_miss_completes_a_pending_docker_wait_for_an_adopted_container()
+    {
+        // cider-ede.33: a container cider only adopted has no held process, so HandleExitAsync
+        // never runs for it -- this poller-observed transition (record entirely missing from the
+        // engine's listing) is the only place that can complete a pending `docker wait`.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await using var poller = NewPoller(harness);
+
+        var record = await harness.CreateAsync("alpine", "web");
+        record.State.Status = "running";
+        harness.Store.Upsert(record.Id, record);
+
+        var nextExit = harness.Containers.WaitAsync(record.Id, "next-exit", default);
+        var notRunning = harness.Containers.WaitAsync(record.Id, "not-running", default);
+
+        await harness.Runtime.RemoveContainerAsync("web", force: true, default);
+        await poller.PollOnceAsync(default);
+
+        var nextExitResponse = await nextExit.WaitAsync(TimeSpan.FromSeconds(2));
+        var notRunningResponse = await notRunning.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(record.State.ExitCode, nextExitResponse.StatusCode);
+        Assert.Equal(record.State.ExitCode, notRunningResponse.StatusCode);
+        Assert.Equal("exit code unknown (daemon restarted)", nextExitResponse.Error?.Message);
+    }
+
+    [Fact]
+    public async Task Still_listed_but_no_longer_running_completes_a_pending_docker_wait_for_an_adopted_container()
+    {
+        // Same gap, the other die path: the engine still lists the container (so this is the
+        // `!running && record.State.Running` branch, not the miss branch above) but reports it
+        // stopped -- e.g. a container started with the Apple CLI directly and exited on its own.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await using var poller = NewPoller(harness);
+
+        var record = await harness.CreateAsync("alpine", "web");
+        record.State.Status = "running";
+        harness.Store.Upsert(record.Id, record);
+
+        var nextExit = harness.Containers.WaitAsync(record.Id, "next-exit", default);
+        var notRunning = harness.Containers.WaitAsync(record.Id, "not-running", default);
+
+        var container = harness.Runtime.GetContainer(record.RuntimeId);
+        Assert.NotNull(container);
+        container!.State = RuntimeContainerState.Stopped;
+
+        await poller.PollOnceAsync(default);
+
+        var nextExitResponse = await nextExit.WaitAsync(TimeSpan.FromSeconds(2));
+        var notRunningResponse = await notRunning.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(record.State.ExitCode, nextExitResponse.StatusCode);
+        Assert.Equal(record.State.ExitCode, notRunningResponse.StatusCode);
+        Assert.Equal("exited", record.State.Status);
+    }
+
+    [Fact]
     public async Task A_container_missing_twice_in_a_row_is_dropped_and_its_name_freed()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();
