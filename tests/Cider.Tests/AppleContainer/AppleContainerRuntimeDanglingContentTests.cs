@@ -71,6 +71,52 @@ public sealed class AppleContainerRuntimeDanglingContentTests
         Assert.Equal(["foo:latest"], loaded);
     }
 
+    [Fact]
+    public async Task LoadImagesAsync_IgnoresStdoutNoiseThatDoesNotCarryTheLoadedImagePrefix()
+    {
+        // Review correction (cider-ede.24, MAJOR 1): a prior pass treated ANY non-empty stdout line as
+        // a loaded reference, so unrelated CLI chatter (progress/copy lines) leaked in as phantom
+        // "loaded" references. Only lines that actually carry Apple's `Loaded image:` prefix — and
+        // parse as a real reference once it is stripped — may count.
+        var cli = new ScriptedCli(new CliResult(1, "", DanglingStderr))
+        {
+            ImageLoadResult = new CliResult(
+                0,
+                "Copying blob sha256:1234567890abcdef\nunpacking...\nLoaded image: foo:latest\ndone\n",
+                ""),
+        };
+        var runtime = new AppleContainerRuntime(new AppleContainerOptions(), NullLogger<AppleContainerRuntime>.Instance, cli);
+
+        await using var tar = new MemoryStream([1, 2, 3]);
+        var loaded = await runtime.LoadImagesAsync(tar, CancellationToken.None);
+
+        Assert.Equal(["foo:latest"], loaded);
+    }
+
+    [Fact]
+    public async Task LoadImagesAsync_DoesNotThrow_WhenASuccessfulLoadNamesNothing()
+    {
+        // Review correction (cider-ede.24, MAJOR 2 / planner ruling): a successful `image load` that
+        // still can't be pinned to a reference must not be reported as a failed load — that turned
+        // `docker load`/`commit`/`import` into a failure path for a call that genuinely succeeded on
+        // Apple's side. It logs a Warning and returns an empty list instead of throwing.
+        var cli = new ScriptedCli(new CliResult(0, "[]", ""))
+        {
+            ImageLoadResult = new CliResult(0, "unpacking...\ndone\n", ""),
+        };
+        var logger = new RecordingLogger<AppleContainerRuntime>();
+        var runtime = new AppleContainerRuntime(new AppleContainerOptions(), logger, cli);
+
+        await using var tar = new MemoryStream([1, 2, 3]);
+        var loaded = await runtime.LoadImagesAsync(tar, CancellationToken.None);
+
+        Assert.Empty(loaded);
+        Assert.Contains(
+            logger.Entries,
+            e => e.Level == LogLevel.Warning &&
+                 e.Message.Contains("no loaded reference could be identified", StringComparison.Ordinal));
+    }
+
     private sealed class ScriptedCli(CliResult imageLsResult) : ContainerCli(new AppleContainerOptions(), NullLogger.Instance)
     {
         public CliResult? ImageLoadResult { get; set; }

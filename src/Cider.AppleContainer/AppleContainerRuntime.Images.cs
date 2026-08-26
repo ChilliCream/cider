@@ -550,13 +550,17 @@ public sealed partial class AppleContainerRuntime
     /// a before/after diff of it can no longer be trusted to prove what a successful <c>image load</c>
     /// just loaded — both sets collapse to empty regardless of what actually loaded, which used to read
     /// as "loaded nothing" and silently drop the reference from <c>docker load</c>/BuildKit's
-    /// <c>ExportLoader</c>. The primary source is now Apple's own stdout echo (<c>Loaded image:
-    /// &lt;ref&gt;</c>, occasionally a bare reference line with no prefix), read unconditionally — no
-    /// gate on the listing containing it. The before/after diff is kept only as a secondary source,
-    /// unioned in and contributing nothing when it found nothing (rather than being trusted as proof
-    /// nothing loaded). If a successful <c>image load</c> still leaves both sources empty, that is
-    /// reported loudly (fix direction item 5: "a silent partial list is worse than a loud one") instead
-    /// of returning an empty list.
+    /// <c>ExportLoader</c>. The primary source is Apple's own stdout echo (<c>Loaded image:
+    /// &lt;ref&gt;</c>), gated on both the line actually carrying that prefix (review correction:
+    /// treating *any* non-empty stdout line as a loaded reference swallowed unrelated CLI chatter) and
+    /// the text after it parsing as a real <see cref="ImageReference"/> — a malformed prefixed line
+    /// is dropped, not trusted. The before/after diff is kept only as a secondary source, unioned in and
+    /// contributing nothing when it found nothing (rather than being trusted as proof nothing loaded).
+    /// If a successful <c>image load</c> still leaves both sources empty, that names a real gap (cider
+    /// could not identify what it just loaded) but not a failed load: the archive did land, so this
+    /// logs a Warning naming the condition rather than throwing (review correction: throwing here turned
+    /// every such <c>docker load</c>/<c>commit</c>/<c>import</c> into a reported failure, a regression
+    /// against working behaviour — planner ruling on cider-ede.24: never turn a success into a failure).
     /// </summary>
     public Task<IReadOnlyList<string>> LoadImagesAsync(Stream tarInput, CancellationToken ct) => GuardAsync(async () =>
     {
@@ -578,13 +582,16 @@ public sealed partial class AppleContainerRuntime
             var loaded = new List<string>();
             foreach (var line in result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
-                var candidate = line.Trim();
-                if (candidate.StartsWith(LoadedImagePrefix, StringComparison.OrdinalIgnoreCase))
+                var trimmed = line.Trim();
+                if (!trimmed.StartsWith(LoadedImagePrefix, StringComparison.OrdinalIgnoreCase))
                 {
-                    candidate = candidate[LoadedImagePrefix.Length..].Trim();
+                    continue;
                 }
 
-                if (candidate.Length > 0 && !loaded.Contains(candidate, StringComparer.Ordinal))
+                var candidate = trimmed[LoadedImagePrefix.Length..].Trim();
+                if (candidate.Length > 0 &&
+                    ImageReference.TryParse(candidate, out _) &&
+                    !loaded.Contains(candidate, StringComparer.Ordinal))
                 {
                     loaded.Add(candidate);
                 }
@@ -601,9 +608,10 @@ public sealed partial class AppleContainerRuntime
 
             if (loaded.Count == 0)
             {
-                throw RuntimeException.Internal(
+                _logger.LogWarning(
                     "`image load` succeeded but no loaded reference could be identified from the CLI's " +
-                    "own output or the image listing");
+                    "own output or the image listing; the load itself is not reported as a failure, but " +
+                    "callers that rely on this result to know what was loaded will see nothing");
             }
 
             return (IReadOnlyList<string>)loaded;
