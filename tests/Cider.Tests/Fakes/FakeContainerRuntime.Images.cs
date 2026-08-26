@@ -288,6 +288,16 @@ public sealed partial class FakeContainerRuntime
         return Task.CompletedTask;
     }
 
+    /// <summary>Records the call so cider-ede.31's tests can assert <c>PruneAsync</c> triggers this
+    /// exactly once per prune (never per deleted image, never from a plain <c>rmi</c>) — the real
+    /// XPC/CLI transports' own default no-op behavior is irrelevant to this fake, which exists only to
+    /// let a test observe when/how often <see cref="IContainerRuntime.PruneImagesAsync"/> was called.</summary>
+    public Task PruneImagesAsync(CancellationToken ct)
+    {
+        Record("PruneImagesAsync");
+        return Task.CompletedTask;
+    }
+
     public async Task SaveImagesAsync(IReadOnlyList<string> references, Stream tarOutput, CancellationToken ct)
     {
         Record($"SaveImagesAsync:{string.Join(",", references)}");

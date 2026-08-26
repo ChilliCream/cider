@@ -80,6 +80,20 @@ public interface IContainerRuntime
 
     Task RemoveImageAsync(string reference, bool force, CancellationToken ct);
 
+    /// <summary>
+    /// Runs a store-wide reclaim of blobs no reference points at any more (cider-ede.31 fix direction
+    /// §2) — called only from <c>ImageManager.PruneAsync</c> (<c>docker image/system prune</c>), never
+    /// per-<c>rmi</c>: a sweep this broad racing a concurrent pull/load that has written blobs but not
+    /// yet committed its index entry is exactly what corrupted the store twice in one day
+    /// (cider-ede.31's own evidence). Defaults to a no-op so every implementation that has no separate
+    /// sweep step to defer — the CLI transport, test fakes — keeps today's behaviour unchanged: the CLI
+    /// transport's own <c>RemoveImageAsync</c> already reclaims a deleted image's blobs as an
+    /// unavoidable side effect of the underlying <c>container image delete</c> process (Apple's own
+    /// <c>ImageDelete.swift</c> sweeps inside that same one-shot invocation; there is no flag to skip
+    /// it), so there is nothing left for this call to additionally do there.
+    /// </summary>
+    Task PruneImagesAsync(CancellationToken ct) => Task.CompletedTask;
+
     Task SaveImagesAsync(IReadOnlyList<string> references, Stream tarOutput, CancellationToken ct);
 
     /// <summary>Loads a docker-save tarball; returns the references that were loaded.</summary>

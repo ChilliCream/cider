@@ -1,3 +1,4 @@
+using Cider.AppleContainer;
 using Cider.AppleContainer.Cli;
 using Cider.AppleContainer.ContentStore;
 using Cider.AppleContainer.Xpc.Models;
@@ -29,6 +30,12 @@ namespace Cider.AppleContainer.Xpc;
 /// </remarks>
 internal sealed partial class XpcContainerRuntime
 {
+    /// <summary>Gates this runtime's own pulls/loads against its own store-wide sweep
+    /// (<see cref="PruneImagesAsync"/>, and the apiserver-unavailable delete fallback in
+    /// <see cref="RemoveImageAsync"/>) — see <see cref="BlobSweepGate"/>'s own doc comment
+    /// (cider-ede.31).</summary>
+    private readonly BlobSweepGate _blobSweepGate = new();
+
     // ---- images: read paths (list/inspect) ------------------------------------------------------
 
     /// <summary>
@@ -550,6 +557,10 @@ internal sealed partial class XpcContainerRuntime
 
         var ociPlatform = ParseOciPlatform(platform);
 
+        // cider-ede.31: a pull writes blobs before its index entry is committed — it must never run
+        // while a store-wide sweep (PruneImagesAsync, or the delete fallback below) is in flight.
+        await using var write = await _blobSweepGate.EnterImageWriteAsync(ct).ConfigureAwait(false);
+
         try
         {
             using var listener = new ProgressUpdateListener(_logger, progress.Report);
@@ -669,12 +680,19 @@ internal sealed partial class XpcContainerRuntime
     });
 
     /// <summary>
-    /// <c>imageDelete{imageReference, garbageCollect:false}</c> then
-    /// <c>imageCleanupOrphanedBlobs</c> (§6, mirroring <c>ImageDelete.swift</c> — fix direction §3).
-    /// <paramref name="force"/> mirrors the CLI transport's own asymmetry with Docker's <c>-f</c>
-    /// (<c>AppleContainerRuntime.Images.cs</c>'s <c>RemoveImageAsync</c> comment: Apple's <c>-f</c>
-    /// means "ignore images that are not found", not "remove anyway") — a <c>notFound</c> is swallowed
-    /// only when <paramref name="force"/> is set.
+    /// <c>imageDelete{imageReference, garbageCollect:false}</c> — <c>garbageCollect</c> hardcoded
+    /// <c>false</c> (cider-ede.31 fix direction §1, "drop the sweep from the delete path entirely"):
+    /// this used to also call <c>imageCleanupOrphanedBlobs</c> right after, mirroring
+    /// <c>ImageDelete.swift</c>'s own one-shot CLI sequence, but that sweep is store-wide and not
+    /// scoped to the image just deleted — run on every single <c>rmi</c> from a daemon serving
+    /// concurrent clients, it kept a race window open permanently against any pull/load that had
+    /// written blobs but not yet committed its index entry (cider-ede.31: corrupted the store twice in
+    /// one day this way). The sweep now runs only from <see cref="PruneImagesAsync"/>, where the user
+    /// explicitly asked to reclaim space. Leaving this image's now-unreferenced blobs in place until
+    /// then costs disk, not correctness. <paramref name="force"/> mirrors the CLI transport's own
+    /// asymmetry with Docker's <c>-f</c> (<c>AppleContainerRuntime.Images.cs</c>'s
+    /// <c>RemoveImageAsync</c> comment: Apple's <c>-f</c> means "ignore images that are not found", not
+    /// "remove anyway") — a <c>notFound</c> is swallowed only when <paramref name="force"/> is set.
     /// </summary>
     public Task RemoveImageAsync(string reference, bool force, CancellationToken ct) => GuardAsync(async () =>
     {
@@ -683,11 +701,18 @@ internal sealed partial class XpcContainerRuntime
         try
         {
             await _imagesClient.ImageDeleteAsync(reference, garbageCollect: false, ct).ConfigureAwait(false);
-            await _imagesClient.ImageCleanupOrphanedBlobsAsync(ct).ConfigureAwait(false);
         }
         catch (XpcException ex) when (IsUnavailable(ex))
         {
             WarnFallback("imageDelete", ex);
+
+            // Apple's own `container image delete` CLI always sweeps internally, as one step of its
+            // single process invocation (ImageDelete.swift, confirmed via `container image delete
+            // --help` — no flag skips it) — unlike the primary path just above, this genuinely is a
+            // sweep from this daemon's point of view, so it takes the gate exclusively, the same as
+            // PruneImagesAsync, rather than running unguarded against this runtime's own concurrent
+            // pulls/loads.
+            await using var sweep = await _blobSweepGate.EnterSweepAsync(ct).ConfigureAwait(false);
             await _cliFallback.RemoveImageAsync(reference, force, ct).ConfigureAwait(false);
             return;
         }
@@ -698,6 +723,46 @@ internal sealed partial class XpcContainerRuntime
         catch (XpcException ex)
         {
             throw ex.ToRuntimeException($"image delete {reference}");
+        }
+    });
+
+    /// <summary>
+    /// The store-wide sweep, moved here off the per-<c>rmi</c> delete path (cider-ede.31 fix direction
+    /// §2): called only from <c>ImageManager.PruneAsync</c> (<c>docker image/system prune</c>), where a
+    /// sweep is what the user explicitly asked for, and takes <see cref="_blobSweepGate"/> exclusively
+    /// so it cannot overlap this runtime's own in-flight pulls/loads (fix direction §3). Logs at
+    /// Information what it reclaimed (fix direction §4: "so the next occurrence is attributable rather
+    /// than mysterious") — <c>Debug</c> when it reclaimed nothing, so a routine prune of an
+    /// already-clean store does not spam the log.
+    /// </summary>
+    public Task PruneImagesAsync(CancellationToken ct) => GuardAsync(async () =>
+    {
+        await using var sweep = await _blobSweepGate.EnterSweepAsync(ct).ConfigureAwait(false);
+
+        try
+        {
+            var (digests, imageSize) = await _imagesClient.ImageCleanupOrphanedBlobsAsync(ct).ConfigureAwait(false);
+            if (digests.Count > 0)
+            {
+                _logger.LogInformation(
+                    "image prune: reclaimed {Count} orphaned blob(s), {Size} byte(s)", digests.Count, imageSize);
+            }
+            else
+            {
+                _logger.LogDebug("image prune: no orphaned blobs to reclaim");
+            }
+        }
+        catch (XpcException ex) when (IsUnavailable(ex))
+        {
+            // No CLI-transport equivalent to fall back to here: the CLI's own `container image
+            // delete` already swept once per target inside RemoveImageAsync's own fallback branch
+            // above, whenever the apiserver was unavailable for *that* call — there is nothing left
+            // for this call to additionally reclaim over the CLI.
+            WarnFallback("imageCleanupOrphanedBlobs", ex);
+        }
+        catch (XpcException ex)
+        {
+            throw ex.ToRuntimeException("image prune");
         }
     });
 
@@ -768,6 +833,10 @@ internal sealed partial class XpcContainerRuntime
     public Task<IReadOnlyList<string>> LoadImagesAsync(Stream tarInput, CancellationToken ct) => GuardAsync(async () =>
     {
         ArgumentNullException.ThrowIfNull(tarInput);
+
+        // cider-ede.31: same reasoning as PullImageAsync's own gate entry — a load writes blobs
+        // before its index entry is committed, so it must never run alongside a store-wide sweep.
+        await using var write = await _blobSweepGate.EnterImageWriteAsync(ct).ConfigureAwait(false);
 
         Directory.CreateDirectory(_options.TmpDir);
         var tmp = Path.Combine(_options.TmpDir, $"cider-load-{Guid.NewGuid():N}.tar");

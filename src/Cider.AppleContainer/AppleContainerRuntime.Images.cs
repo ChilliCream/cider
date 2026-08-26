@@ -13,6 +13,21 @@ public sealed partial class AppleContainerRuntime
     private const string DefaultRegistry = "docker.io";
 
     /// <summary>
+    /// Gates this runtime's own image writes (pull/load/build) against its own deletes (cider-ede.31):
+    /// every <c>container image delete</c> invocation sweeps the whole content store as an unavoidable
+    /// step of its single process (Apple's <c>ImageDelete.swift</c> — no CLI flag skips it), so on this
+    /// transport a "sweep" is not something cider chooses to run separately, it is what
+    /// <see cref="RemoveImageAsync"/> already does every time. This instance is shared with every write
+    /// path below and with <see cref="RemoveImageAsync"/> — including when this runtime is used purely
+    /// as the XPC transport's CLI fallback (<c>XpcContainerRuntime</c>'s own <c>_cliFallback</c>), so a
+    /// pull/load/build funnelled through *this* runtime is never mid-write while *this* runtime's own
+    /// delete subprocess is sweeping. It does not (and per the task's own fix direction §3, need not)
+    /// coordinate with the XPC transport's separate, direct-XPC writes — see <see cref="BlobSweepGate"/>'s
+    /// own doc comment.
+    /// </summary>
+    private readonly BlobSweepGate _blobSweepGate = new();
+
+    /// <summary>
     /// <c>image ls</c> fails hard when Apple's store holds even one dangling content reference,
     /// even though every other entry is fine (cider-ede.24, verified live on this machine: <c>Error:
     /// content with digest sha256:…</c>, the blob gone but <c>state.json</c> still naming it). Cider
@@ -384,6 +399,11 @@ public sealed partial class AppleContainerRuntime
         ArgumentException.ThrowIfNullOrEmpty(reference);
         ArgumentNullException.ThrowIfNull(progress);
 
+        // cider-ede.31: this daemon's own `container image delete` subprocess sweeps the whole store
+        // as an unavoidable part of running at all — a pull must never be in flight while one of this
+        // runtime's own deletes is doing that.
+        await using var write = await _blobSweepGate.EnterImageWriteAsync(ct).ConfigureAwait(false);
+
         if (auth is not null && !string.IsNullOrEmpty(auth.Username))
         {
             await LoginAsync(auth, ct);
@@ -526,6 +546,13 @@ public sealed partial class AppleContainerRuntime
     {
         ArgumentException.ThrowIfNullOrEmpty(reference);
 
+        // cider-ede.31: `container image delete` sweeps the whole content store as an unavoidable part
+        // of the one subprocess this spawns (Apple's own ImageDelete.swift; there is no flag to skip
+        // it) — from this daemon's point of view that subprocess *is* a sweep, so it takes the gate
+        // exclusively, the same as an XPC-transport PruneImagesAsync, rather than running unguarded
+        // against this runtime's own concurrent pulls/loads/builds.
+        await using var sweep = await _blobSweepGate.EnterSweepAsync(ct).ConfigureAwait(false);
+
         var args = new List<string> { "image", "delete" };
         if (force)
         {
@@ -591,6 +618,9 @@ public sealed partial class AppleContainerRuntime
     public Task<IReadOnlyList<string>> LoadImagesAsync(Stream tarInput, CancellationToken ct) => GuardAsync(async () =>
     {
         ArgumentNullException.ThrowIfNull(tarInput);
+
+        // cider-ede.31: same reasoning as PullImageAsync's own gate entry above.
+        await using var write = await _blobSweepGate.EnterImageWriteAsync(ct).ConfigureAwait(false);
 
         var tmp = NewTempFile("load", ".tar");
         try
@@ -673,6 +703,10 @@ public sealed partial class AppleContainerRuntime
         {
             ArgumentNullException.ThrowIfNull(spec);
             ArgumentNullException.ThrowIfNull(progress);
+
+            // cider-ede.31: a build commits new content the same way a pull/load does — same reasoning
+            // as PullImageAsync's own gate entry above.
+            await using var write = await _blobSweepGate.EnterImageWriteAsync(ct).ConfigureAwait(false);
 
             // Apple's `-t` default is a random UUID we would not be able to look up afterwards.
             var tags = spec.Tags.Count > 0

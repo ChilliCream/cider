@@ -851,6 +851,41 @@ public sealed class ImageManagerTests : IDisposable
         var delete = Assert.Single(runtime.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
         Assert.DoesNotContain("sha256:", delete, StringComparison.Ordinal);
         Assert.Contains("cider-build-", delete, StringComparison.Ordinal);
+
+        // cider-ede.31: the store-wide sweep runs from PruneAsync itself now, exactly once, never
+        // from RemoveImageAsync's own per-image delete (which is what let a sweep race a concurrent
+        // pull/load on every single `rmi` before this fix).
+        Assert.Single(runtime.Calls, c => c == "PruneImagesAsync");
+    }
+
+    [Fact]
+    public async Task RemoveAsync_APlainRmiNeverTriggersTheStoreWideSweep()
+    {
+        // cider-ede.31: `docker rmi` removes what that one image no longer needs — it must not
+        // garbage-collect the whole machine (fix direction §1/§2). Before this fix, every single
+        // `RemoveImageAsync` call on the XPC/CLI transports also swept the entire content store;
+        // this asserts the seam this manager talks to is never told to sweep for a plain `rmi`.
+        var (manager, runtime) = CreateManager();
+
+        await manager.RemoveAsync("alpine:latest", force: false, noPrune: false, CancellationToken.None);
+
+        Assert.Contains(runtime.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
+        Assert.DoesNotContain(runtime.Calls, c => c == "PruneImagesAsync");
+    }
+
+    [Fact]
+    public async Task PruneAsync_WhenNothingIsDeleted_DoesNotSweepTheStore()
+    {
+        // The default (dangling-only) prune against a fixture with no dangling images deletes
+        // nothing — fix direction §2's "only where the user explicitly asked to reclaim space" still
+        // means "and there was actually something to reclaim", not an unconditional sweep on every
+        // prune call regardless of outcome.
+        var (manager, runtime) = CreateManager();
+
+        var response = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
+
+        Assert.Empty(response.ImagesDeleted);
+        Assert.DoesNotContain(runtime.Calls, c => c == "PruneImagesAsync");
     }
 
     [Fact]
@@ -890,6 +925,10 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Equal(2, removeCalls.Count);
         Assert.Contains(removeCalls, c => c.Contains(tagA, StringComparison.Ordinal));
         Assert.Contains(removeCalls, c => c.Contains(tagB, StringComparison.Ordinal));
+
+        // cider-ede.31: two underlying deletes from this one prune call still sweep exactly once —
+        // "exactly once per prune", not once per image it happens to remove along the way.
+        Assert.Single(runtime.Calls, c => c == "PruneImagesAsync");
 
         var ex = await Assert.ThrowsAsync<DockerApiException>(
             () => manager.InspectAsync(imageId, CancellationToken.None));

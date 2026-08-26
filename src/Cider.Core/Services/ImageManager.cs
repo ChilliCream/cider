@@ -844,6 +844,12 @@ public sealed class ImageManager
         if (deleted.Count > 0)
         {
             InvalidateImageCache();
+
+            // cider-ede.31 fix direction §2: the store-wide sweep now runs only here — the one place
+            // the user explicitly asked to reclaim space — never from RemoveAsync's own per-image
+            // delete, and exactly once for however many images this prune just removed above, not once
+            // per image.
+            await _runtime.PruneImagesAsync(ct).ConfigureAwait(false);
         }
 
         return new ImagePruneResponse { ImagesDeleted = deleted, SpaceReclaimed = space };

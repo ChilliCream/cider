@@ -19,6 +19,10 @@ namespace Cider.AppleContainer.Xpc;
 /// against a fake that fails a specific digest, without a live apiserver connection (there is no
 /// per-route interface here; a single override point on the real class is the minimal seam, matching
 /// the shape <see cref="XpcContainerRuntime"/>'s own <c>internal</c> test constructor already uses).
+/// cider-ede.31 extends the same seam to <see cref="ImagePullAsync"/>/<see cref="ImageUnpackAsync"/>/
+/// <see cref="ImageDeleteAsync"/>/<see cref="ImageCleanupOrphanedBlobsAsync"/>, so a test can prove
+/// <see cref="BlobSweepGate"/> actually blocks a pull against a concurrent sweep and back, without a
+/// live apiserver connection either.
 /// </remarks>
 internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
 {
@@ -74,7 +78,7 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
     /// step too, exactly as the real CLI's own combined pull+unpack progress bar does
     /// (§5's route table: <c>imagePull</c>/<c>imagePush</c>/<c>imageUnpack</c>/<c>installKernel</c>
     /// all honor it).</summary>
-    public async Task ImageUnpackAsync(ImageDescription image, Platform platform, CancellationToken ct, XpcObject? progressEndpoint = null)
+    public virtual async Task ImageUnpackAsync(ImageDescription image, Platform platform, CancellationToken ct, XpcObject? progressEndpoint = null)
     {
         using var request = new XpcMessage("imageUnpack");
         request.SetData("imageDescription", XpcJson.SerializeToUtf8Bytes(image));
@@ -98,7 +102,7 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
     /// no insecure-registry option anywhere above this seam, matching the Swift client's own default
     /// scheme (§7: <c>.auto</c> → <c>.https</c>, wire field unchanged).
     /// </summary>
-    public async Task<ImageDescription> ImagePullAsync(string reference, Platform? platform, XpcObject? progressEndpoint, CancellationToken ct)
+    public virtual async Task<ImageDescription> ImagePullAsync(string reference, Platform? platform, XpcObject? progressEndpoint, CancellationToken ct)
     {
         using var request = new XpcMessage("imagePull");
         request.SetString("imageReference", reference);
@@ -154,8 +158,10 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
     }
 
     /// <summary><c>imageDelete{imageReference, garbageCollect}</c> — no reply payload beyond the route
-    /// key (§6).</summary>
-    public async Task ImageDeleteAsync(string reference, bool garbageCollect, CancellationToken ct)
+    /// key (§6). <c>virtual</c> only for the cider-ede.31 test seam
+    /// (<c>tests/Cider.Tests/AppleContainer/Xpc/XpcContainerRuntimeRemoveImageTests.cs</c>), the same
+    /// shape <see cref="ImageListAsync"/>/<see cref="ContentGetAsync"/> already use.</summary>
+    public virtual async Task ImageDeleteAsync(string reference, bool garbageCollect, CancellationToken ct)
     {
         using var request = new XpcMessage("imageDelete");
         request.SetString("imageReference", reference);
@@ -163,13 +169,24 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
         using var reply = await images.SendAsync(request, XpcCallOptions.Default, ct).ConfigureAwait(false);
     }
 
-    /// <summary><c>imageCleanupOrphanedBlobs</c> — no request payload; the reply's <c>digests</c>/
-    /// <c>imageSize</c> are not needed by any caller here, so this only waits for it to complete
-    /// (mirrors <c>ImageDelete.swift</c>'s own call sequence, fix direction §3).</summary>
-    public async Task ImageCleanupOrphanedBlobsAsync(CancellationToken ct)
+    /// <summary>
+    /// <c>imageCleanupOrphanedBlobs</c> — no request payload. The store-wide sweep itself (cider-ede.31
+    /// fix direction §1/§2: no longer called from every <c>RemoveImageAsync</c>, only from
+    /// <c>PruneImagesAsync</c>, gated exclusively against this daemon's own in-flight image writes by
+    /// <see cref="BlobSweepGate"/>). Returns the reply's <c>digests</c>/<c>imageSize</c> — fix
+    /// direction §4 wants a sweep's own result logged (attributable, not mysterious), which needs
+    /// them; previously discarded since no caller read them. <c>virtual</c> for the same test seam as
+    /// <see cref="ImageDeleteAsync"/>.
+    /// </summary>
+    public virtual async Task<(IReadOnlyList<string> Digests, ulong ImageSize)> ImageCleanupOrphanedBlobsAsync(CancellationToken ct)
     {
         using var request = new XpcMessage("imageCleanupOrphanedBlobs");
         using var reply = await images.SendAsync(request, XpcCallOptions.Default, ct).ConfigureAwait(false);
+
+        var digestsBytes = reply.GetData("digests");
+        var digests = digestsBytes is null ? (IReadOnlyList<string>)[] : XpcJson.Deserialize<List<string>>(digestsBytes);
+        var imageSize = reply.GetUInt64("imageSize");
+        return (digests, imageSize);
     }
 
     /// <summary><c>imageSave{imageDescriptions, filePath}</c> — <c>ociPlatform</c> deliberately omitted
