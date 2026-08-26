@@ -172,9 +172,11 @@ internal static class ContainerConfigurationBuilder
     /// Numeric <c>uid[:gid]</c> → <see cref="User.OfId"/>; any other non-empty string → <see cref="User.OfRaw"/>;
     /// unset → <c>id{0,0}</c> (root) — task fix direction §1's <c>User</c> rule, minus the "else image
     /// config.user" branch <see cref="ContainerConfigurationBuilder"/>'s own doc comment explains is
-    /// already folded into <see cref="ContainerSpec.User"/> by the time this runs.
+    /// already folded into <see cref="ContainerSpec.User"/> by the time this runs. <c>internal</c> so
+    /// <see cref="ProcessConfigurationBuilder"/> (task cider-ede.8) can reuse the same parser for
+    /// <c>ExecSpec.User</c> — its own fix direction §1 calls this out by name ("same parser as X5").
     /// </summary>
-    private static User BuildUser(string? user)
+    internal static User BuildUser(string? user)
     {
         if (string.IsNullOrEmpty(user))
         {

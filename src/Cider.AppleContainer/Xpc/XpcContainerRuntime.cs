@@ -22,7 +22,9 @@ namespace Cider.AppleContainer.Xpc;
 /// network/volume create/delete (<c>XpcContainerRuntime.Resources.cs</c>); cider-ede.12 ports
 /// <c>CopyFromContainerAsync</c>/<c>CopyToContainerAsync</c>/<c>ExportContainerAsync</c>
 /// (<c>XpcContainerRuntime.Archive.cs</c>); cider-ede.10 ports every image operation
-/// (<c>XpcContainerRuntime.Images.cs</c>, <c>ProgressUpdateListener</c>). Every other
+/// (<c>XpcContainerRuntime.Images.cs</c>, <c>ProgressUpdateListener</c>); cider-ede.8 ports
+/// <c>ExecAsync</c> (<c>XpcContainerRuntime.Process.cs</c>, <c>ProcessConfigurationBuilder</c>).
+/// Every other
 /// <see cref="IContainerRuntime"/> member is listed in the <c>// FALLBACK</c> block at the bottom and
 /// delegates straight to the CLI runtime until a later task ports it.
 /// Mapping from the wire models to <c>Cider.Core.Runtime</c> types lives in the sibling
@@ -497,10 +499,9 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     // RemoveImageAsync/SaveImagesAsync/LoadImagesAsync are ported — see XpcContainerRuntime.Images.cs
     // (task cider-ede.10). BuildImageAsync stays on the CLI (classic builder, task's non-goals) and
     // LoginAsync stays on the CLI (registry login stores credentials the images service reads, fix
-    // direction §2) — neither is this task's job.
-
-    public Task<IContainerProcess> ExecAsync(string runtimeId, ExecSpec spec, CancellationToken ct) =>
-        _cliFallback.ExecAsync(runtimeId, spec, ct);
+    // direction §2) — neither is this task's job. ExecAsync is ported — see
+    // XpcContainerRuntime.Process.cs/XpcContainerProcess.cs (task cider-ede.8); DialBuilderAsync below
+    // benefits automatically, since it calls ExecAsync.
 
     public Task<string> BuildImageAsync(BuildSpec spec, IProgress<ProgressEvent> progress, CancellationToken ct) =>
         _cliFallback.BuildImageAsync(spec, progress, ct);
