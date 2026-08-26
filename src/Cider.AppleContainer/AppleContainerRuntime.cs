@@ -157,6 +157,17 @@ public sealed partial class AppleContainerRuntime : IContainerRuntime
     {
         ArgumentNullException.ThrowIfNull(spec);
 
+        if (spec.Networks.Count == 0)
+        {
+            // `container create` has no flag to ask for zero attachments — omitting `--network`
+            // entirely attaches the default network instead of none. Guarded here too (not only at
+            // Xpc.XpcContainerRuntime.Create.cs's fallback sites) so this CLI runtime can never
+            // silently drop a `network_mode: none` request from any caller, present or future.
+            throw new RuntimeException(
+                RuntimeErrorKind.NotSupported,
+                "cider: network mode 'none' cannot be honoured by the CLI fallback — `container create` has no way to express zero attachments, and omitting --network attaches the default network");
+        }
+
         if (spec.Hostname is { Length: > 0 } hostname &&
             !string.Equals(hostname, spec.RuntimeId, StringComparison.Ordinal))
         {

@@ -40,7 +40,17 @@ public sealed partial class ContainerManager
             // shipped by cider-ede.6). The CLI transport cannot: `container create` takes only
             // `--network <name>` and attaches the default network whenever the flag is omitted, so
             // there is no way to ask it for zero attachments — that case falls through to the throw
-            // below.
+            // below. This flag only decides whether an empty list is handed onward at all; the
+            // invariant that a zero-attachment spec never silently reaches `container create` is
+            // enforced again at the runtime boundary itself (Xpc.XpcContainerRuntime.Create.cs's
+            // fallback sites and AppleContainerRuntime.CreateContainerAsync both guard it too), not
+            // relied on here alone.
+            if (networkingConfig?.EndpointsConfig is { Count: > 0 })
+            {
+                throw DockerErrors.BadParameter(
+                    "cider: NetworkingConfig endpoints cannot be combined with network mode 'none'");
+            }
+
             return [];
         }
         else if (string.Equals(mode, "host", StringComparison.Ordinal) ||

@@ -40,6 +40,7 @@ internal sealed partial class XpcContainerRuntime
         // §1).
         if (string.IsNullOrEmpty(spec.Entrypoint))
         {
+            GuardNoNetworkFallback(spec);
             WarnFallback("containerCreate", "spec has no merged entrypoint; relying on the image's own entrypoint/cmd, which only the CLI can resolve");
             await _cliFallback.CreateContainerAsync(spec, ct).ConfigureAwait(false);
             return;
@@ -68,11 +69,13 @@ internal sealed partial class XpcContainerRuntime
         }
         catch (XpcException ex) when (IsUnavailable(ex))
         {
+            GuardNoNetworkFallback(spec);
             WarnFallback("containerCreate", ex);
             await _cliFallback.CreateContainerAsync(spec, ct).ConfigureAwait(false);
         }
         catch (RuntimeException ex) when (ex.Kind == RuntimeErrorKind.Unavailable)
         {
+            GuardNoNetworkFallback(spec);
             WarnFallback("containerCreate", ex.Message);
             await _cliFallback.CreateContainerAsync(spec, ct).ConfigureAwait(false);
         }
@@ -81,6 +84,24 @@ internal sealed partial class XpcContainerRuntime
             throw ex.ToRuntimeException($"create {spec.RuntimeId}");
         }
     });
+
+    /// <summary>
+    /// Refuses to hand a zero-attachment spec (<c>network_mode: none</c>) to the CLI fallback: Apple's
+    /// <c>container create</c> has no flag to ask for zero attachments — omitting <c>--network</c>
+    /// entirely attaches the default network instead, which would silently give a "none"-mode
+    /// container a network it never asked for. Called at every one of this method's three fallback
+    /// sites (the no-Entrypoint fallback above and both apiserver-unavailable catch arms below) so no
+    /// future fallback arm forgets it.
+    /// </summary>
+    private static void GuardNoNetworkFallback(ContainerSpec spec)
+    {
+        if (spec.Networks.Count == 0)
+        {
+            throw new RuntimeException(
+                RuntimeErrorKind.NotSupported,
+                "cider: network mode 'none' cannot be honoured by the CLI fallback — `container create` has no way to express zero attachments, and omitting --network attaches the default network");
+        }
+    }
 
     /// <summary><c>containerDelete{id, forceDelete}</c> (§8.9). No client-side timeout (§1.4: this
     /// route blocks until the daemon finishes tearing the container down).</summary>

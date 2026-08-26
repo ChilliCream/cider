@@ -260,6 +260,55 @@ public sealed class ContainerManagerCreateTests
         Assert.Empty(harness.Runtime.GetSpec("web")!.Networks);
     }
 
+    [Fact]
+    public async Task Network_mode_none_combined_with_NetworkingConfig_endpoints_is_a_400()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        harness.Runtime.IsXpcTransport = true;
+
+        var error = await Assert.ThrowsAsync<DockerApiException>(() =>
+            harness.Containers.CreateAsync(
+                new ContainerCreateRequest
+                {
+                    Image = "alpine",
+                    HostConfig = new HostConfig { NetworkMode = "none" },
+                    NetworkingConfig = new NetworkingConfig
+                    {
+                        EndpointsConfig = { ["proj_default"] = new EndpointSettings() },
+                    },
+                },
+                null,
+                null,
+                default));
+
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, error.Status);
+        Assert.Equal("cider: NetworkingConfig endpoints cannot be combined with network mode 'none'", error.Message);
+    }
+
+    /// <summary>
+    /// Daemon-level coverage for the create-through-inspect path a fixture-level unit test cannot
+    /// reach on its own (cider-ede.35 closing audit, finding 3): starting a zero-network container
+    /// must not trip <c>ApplyNetworkInfo</c>/<c>BuildNetworkSettings</c>, and inspect's
+    /// <c>NetworkSettings</c> must come back with no attachments and no address.
+    /// </summary>
+    [Fact]
+    public async Task Network_mode_none_starts_and_inspects_with_no_attachments_and_no_address()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        harness.Runtime.IsXpcTransport = true;
+
+        var record = await harness.CreateAsync("alpine", "web", request =>
+            request.HostConfig = new HostConfig { NetworkMode = "none" });
+
+        await harness.Containers.StartAsync(record.Id, CancellationToken.None);
+
+        var detail = await harness.Containers.InspectAsync(record.Id, size: false, CancellationToken.None);
+
+        Assert.Empty(detail.NetworkSettings.Networks);
+        Assert.Equal("", detail.NetworkSettings.IPAddress);
+        Assert.Equal("", detail.NetworkSettings.Gateway);
+    }
+
     [Theory]
     [InlineData("host")]
     [InlineData("container:other")]

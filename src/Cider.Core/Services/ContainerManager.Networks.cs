@@ -84,10 +84,12 @@ public sealed partial class ContainerManager : IContainerNetworkAttachments
                     $"container {record.Id} is not connected to network {dockerNetworkName}");
             }
 
-            // Apple `container` has no "no network" mode (`--network none` is rejected at create
-            // time too): a container created without `--network` silently lands on `default`. So
-            // rather than let the record claim an attachment state the engine cannot produce, the
-            // last remaining network stays put.
+            // `--network none` is now accepted at create time on the XPC transport (cider-ede.35);
+            // disconnect still refuses to drop the last attachment because Apple fixes networks at
+            // create time and the record must not claim a state the engine cannot re-create. A
+            // disconnect down to zero would need a delete-and-recreate with an empty network list —
+            // exactly the create-time path, not something this route can retrofit onto a running
+            // container after the fact.
             if (record.Networks.Count == 1)
             {
                 throw DockerErrors.NotImplemented(
