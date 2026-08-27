@@ -474,21 +474,23 @@ public class XpcContainerRuntimeE2ETests
     /// lifetime) before any sample is taken; every created container is removed as it goes, including
     /// the warm-up one, so this never accumulates containers even on failure mid-run.
     ///
-    /// cider-95p (2026-08-27) re-measured this warm on the real XPC path (the CLI-fallback
-    /// calibration cider-f8v found and fixed in 6bec054 had never been re-measured against XPC): 23
-    /// runs of this test's own 20-sample median, split across net10.0/net11.0 on this box under
-    /// concurrent-agent contention (load average ranging ~7-42, several other agent sessions active
-    /// throughout) — 10 running only this test class filtered to just this method (18.4-24.3 ms) and
-    /// 13 running the whole <see cref="XpcContainerRuntimeE2ETests"/> class as the task's own
-    /// re-verification command does (12.4-23.9 ms in 12 of those runs, but one net10.0 run reproduced
-    /// a 161.6 ms excursion at load average ~38.88, right after a heavy local build). That excursion
-    /// beats even this method's original, un-re-measured 100 ms budget, so the data does not support
-    /// tightening it: the budget below is restated at 230 ms instead — deliberately looser than the
-    /// original 100 ms, giving ~1.4x headroom over the worst reproduced excursion (161.6 ms) while
-    /// still ~10-19x over the typical 12.4-24.3 ms range — rather than leaving a budget in place that
-    /// this run already showed can flake.</summary>
+    /// cider-ede.36 (2026-08-27, discharging cider-95p) re-derived this budget warm on the real
+    /// XPC path on a quiet machine. History: the pre-cider-f8v 100 ms budget was calibrated against
+    /// the CLI fallback (fixed in 6bec054) and never re-measured against XPC; an interim revision of
+    /// this method then loosened it to 230 ms on the strength of a single 161.6 ms excursion
+    /// reproduced once under heavy contention (load average ~38.88, immediately after a heavy local
+    /// build) — one sample is not a distribution, and that revision also mis-credited the
+    /// measurements to cider-95p. The quiet re-derivation: 10 warm runs per TFM (net10.0 then
+    /// net11.0, run sequentially, one untimed build+warm-up run per TFM first), each run being this
+    /// test's own 20-sample median, 1-minute load average 8.0-16.3 recorded per run with no
+    /// competing builds or agent sessions (idle editor tooling only). Medians observed: net10.0
+    /// 12.9-26.5 ms, net11.0 17.8-23.4 ms. Even the one run whose worst individual samples reached
+    /// 482/588 ms kept its median at 26.5 ms — this assertion is on the median, which the tail
+    /// barely moves. No run's median came anywhere near 100 ms, so the budget is REVERTED to the
+    /// original 100 ms: ~3.8x headroom over the worst observed median (26.5 ms) and ~5x over the
+    /// median-of-medians (~19 ms).</summary>
     [E2EFact]
-    public async Task Twenty_serial_creates_have_a_median_latency_at_or_under_230ms()
+    public async Task Twenty_serial_creates_have_a_median_latency_at_or_under_100ms()
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
         var ct = cts.Token;
@@ -526,12 +528,12 @@ public class XpcContainerRuntimeE2ETests
         // The task's own target is 25 ms for containerCreate alone; this measures create+delete
         // together (delete has no client-side timeout and its own round trip), so the budget here is
         // deliberately more generous than the task's raw containerCreate number rather than
-        // reproducing it exactly. cider-95p (2026-08-27) re-measured 23 runs of this median warm on
-        // XPC (load average ~7-42): 12.4-24.3 ms typically, with one reproduced 161.6 ms excursion —
-        // see the method doc above. That excursion made the pre-existing 100 ms budget itself unsafe,
-        // so this is restated at 230 ms (~1.4x over the worst reproduced excursion) rather than
-        // tightened.
-        Assert.True(median <= 230.0, $"median create+delete latency was {median:F3} ms, expected <= 230 ms");
+        // reproducing it exactly. cider-ede.36 (2026-08-27) re-derived this on a quiet machine —
+        // 20 warm runs (10 per TFM, load average 8.0-16.3): medians 12.9-26.5 ms, worst-run median
+        // 26.5 ms even with 482/588 ms tail samples in that run. 100 ms is ~3.8x the worst observed
+        // median; the interim 230 ms value rested on a single load-~39 contention artifact and is
+        // reverted. See the method doc above for the full derivation.
+        Assert.True(median <= 100.0, $"median create+delete latency was {median:F3} ms, expected <= 100 ms");
     }
 
     /// <summary>Polls <see cref="IContainerRuntime.InspectContainerAsync"/> until <paramref name="name"/>
@@ -726,16 +728,15 @@ public class XpcContainerRuntimeE2ETests
     /// <c>XpcClientE2ETests.Hundred_pings_have_a_median_round_trip_under_0_2ms</c>, so JIT/connection
     /// setup is not counted against the budget.
     ///
-    /// cider-95p (2026-08-27) re-measured this warm on the real XPC path (same caveat as
-    /// <see cref="Twenty_serial_creates_have_a_median_latency_at_or_under_230ms"/>: the pre-cider-f8v
-    /// number was calibrated against the CLI fallback, never against XPC). 23 runs of this test's own
-    /// 20-sample median, split across net10.0/net11.0 on this box under concurrent-agent contention
-    /// (load average ~7-42, same runs as the create+delete re-measurement above: 10 filtered to just
-    /// this method, 13 running the whole class), ranged 0.36-2.02 ms with no comparable excursion
-    /// reproduced. The existing 5 ms budget already sits at ~2.5x the worst observed median
-    /// (2.022 ms) — in line with the headroom this task applied to the create+delete budget's worst
-    /// case above — so this is restated deliberately rather than tightened further: the data does not
-    /// show a case for moving it.</summary>
+    /// cider-ede.36 (2026-08-27, discharging cider-95p) re-measured this warm on the real XPC path
+    /// (same caveat as <see cref="Twenty_serial_creates_have_a_median_latency_at_or_under_100ms"/>:
+    /// the pre-cider-f8v number was calibrated against the CLI fallback, never against XPC). On a
+    /// quiet machine (1-minute load average 8.0-16.3, no competing builds or agent sessions), 20
+    /// warm runs of this test's own 20-sample median — 10 per TFM, net10.0 then net11.0 run
+    /// sequentially — ranged 0.13-1.20 ms (worst-run median 1.197 ms, net10.0; every other run's
+    /// median was under 0.4 ms). The existing 5 ms budget sits at ~4.2x the worst observed median,
+    /// so it is restated deliberately unchanged: the data shows no case for moving it in either
+    /// direction.</summary>
     [E2EFact]
     public async Task Twenty_ListContainers_calls_have_a_median_latency_at_or_under_5ms()
     {
