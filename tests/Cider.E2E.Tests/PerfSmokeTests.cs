@@ -35,9 +35,28 @@ namespace Cider.E2E.Tests;
 /// cores), so the numbers below already bake in a fair amount of real contention rather than
 /// characterizing a best case; the task's original literal 30/80/300/10 ms figures were never
 /// reachable through any path that includes a spawned <c>docker</c> client and are superseded here
-/// regardless. Because these were not measured on an idle machine or on the actual hosted
-/// macos-15 runner, .github/workflows/e2e.yml deliberately does not gate the build on this class
-/// (see its perf step) until real runner numbers confirm them; expected to tighten once they do.
+/// regardless. As of aab77a9, .github/workflows/e2e.yml DOES gate the build on this class (its perf
+/// step no longer sets <c>continue-on-error</c>) — an earlier version of this comment claimed
+/// otherwise; that was stale even before this revision.
+///
+/// cider-ede.36 (2026-08-27) recorded real medians against this box (still under concurrent-agent
+/// contention, not idle) to check the two create-timing budgets against the epic's promised
+/// targets (<c>docker create</c> &lt;= 25 ms median, 8-parallel &lt;= 0.2 s wall) rather than leaving
+/// them unrecorded: <see cref="Sequential_create_of_a_cached_image_is_fast"/>'s median measured
+/// 13.0-20.2 ms over 10 independent 100-sample runs split across net10.0/net11.0, comfortably and
+/// consistently under the promised 25 ms with no outliers; <see
+/// cref="Eight_parallel_creates_of_a_cached_image_finish_within_budget"/>'s wall time measured
+/// 71.4-93.5 ms over 9 runs split the same way (well below the 700-1200 ms this same test saw before
+/// cider-ede.30's eager DNS-forwarder bootstrap fix), also with no outliers. Both support tightening
+/// toward the epic's literal promise rather than restating it: the median budget below moved
+/// 40 ms -> 25 ms (matching the promise directly) and the 8-parallel budget moved 1200 ms -> 200 ms
+/// (matching the promise directly, ~2.1x headroom over the worst observed 93.5 ms). p99 (no epic
+/// target) is a different story: 9 of 10 sampled runs put it at 23.6-29.8 ms, but one run spiked to
+/// 82.0 ms with no corresponding median spike in that same run — a real, occasional tail-latency
+/// event under this box's contention rather than measurement noise to be averaged away, so p99's
+/// budget moved 300 ms -> 150 ms (not all the way to the ~2.5x-over-typical convention's ~75 ms,
+/// which the observed spike alone would already have exceeded) rather than to something tighter that
+/// this one data point shows would be flaky.
 /// </summary>
 [Collection(DaemonCollection.Name)]
 [Trait("Category", "E2E")]
@@ -80,12 +99,12 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
         var p99 = Percentile(samples, 0.99);
 
         Assert.True(
-            median <= 40,
-            $"median containerCreate-over-XPC latency was {median:F1} ms (budget 40 ms) over " +
+            median <= 25,
+            $"median containerCreate-over-XPC latency was {median:F1} ms (budget 25 ms) over " +
             $"{SequentialIterations} runs: " + string.Join(", ", samples.Select(s => s.ToString("F1"))));
         Assert.True(
-            p99 <= 300,
-            $"p99 containerCreate-over-XPC latency was {p99:F1} ms (budget 300 ms) over " +
+            p99 <= 150,
+            $"p99 containerCreate-over-XPC latency was {p99:F1} ms (budget 150 ms) over " +
             $"{SequentialIterations} runs: " + string.Join(", ", samples.Select(s => s.ToString("F1"))));
     }
 
@@ -130,9 +149,9 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
             stopwatch.Stop();
 
             Assert.True(
-                stopwatch.Elapsed <= TimeSpan.FromMilliseconds(1200),
+                stopwatch.Elapsed <= TimeSpan.FromMilliseconds(200),
                 $"{parallelism} parallel containerCreate-over-XPC calls took " +
-                $"{stopwatch.Elapsed.TotalMilliseconds:F1} ms wall (budget 1200 ms)");
+                $"{stopwatch.Elapsed.TotalMilliseconds:F1} ms wall (budget 200 ms)");
         }
         finally
         {
