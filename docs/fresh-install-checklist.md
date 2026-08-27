@@ -185,10 +185,16 @@ chillicream/tools/cider` — README's documented command, still correct for that
   `$(brew --prefix)/bin/cider`. `docker`/`docker-compose` are formula dependencies, so if either is
   missing brew installs them too — if they're already present (they are, on this machine) brew
   leaves them alone.
-- **Verify:** `cider version` — first line is `cider <version>+<git sha>` per
-  `Program.InformationalVersion()`/`ResolveGitCommit()`; UNCONFIRMED what the exact sha suffix will
-  be until the tagged commit exists, but the `<version>+<40-hex-char-sha>` *shape* is fixed by the
-  code, not a guess. Also run `brew list --versions cider` and confirm it says the new version, and
+- **Verify:** `cider version` — first line is `cider <version>` where `<version>` is exactly what
+  `Program.InformationalVersion()` (`Program.cs:504–507`, printed at `Program.cs:451`) reads back
+  from `AssemblyInformationalVersionAttribute`, verbatim. UNCONFIRMED what that string will actually
+  contain: it is whatever `-p:Version=` produced when this build was made, plus a `+<sha>` suffix
+  *only if* the SDK/SourceLink stamped one onto it — nothing in `Directory.Build.props`, the
+  `.csproj` files, or `release.yml` forces a `SourceRevisionId`, so a bare `cider 0.2.0` with no
+  `+<sha>` at all is not a failure, just an unstamped build. (`ResolveGitCommit`, at
+  `src/Cider.Core/Services/SystemManager.cs:184`, is a different thing entirely — it feeds the
+  Docker `/version` API's `GitCommit` field, with a documented `unknown` fallback, and has no bearing
+  on what `cider version` prints.) Also run `brew list --versions cider` and confirm it says the new version, and
   `which -a cider` to confirm the resolved binary is brew's, not a leftover copy elsewhere on
   `PATH`.
 - **Failure looks like, and means:**
@@ -222,14 +228,55 @@ launchctl bootout gui/<uid>/com.chillicream.cider.daemon (exit 0)
 launchctl bootstrap gui/<uid> /Users/<you>/Library/LaunchAgents/com.chillicream.cider.daemon.plist (exit 0)
 launchctl kickstart -k gui/<uid>/com.chillicream.cider.daemon (exit 0)
 Socket ready: /Users/<you>/.cider/docker.sock
-cider daemon installed and running.
 docker context update cider --docker host=unix:///Users/<you>/.cider/docker.sock (exit 0)
-Docker context 'cider' ready. Run `docker context use cider` to select it.
+cider daemon installed and running.
+/var/run/docker.sock is normally owned by root, so cider cannot replace it without elevated privileges.
+First note what it points at today, so you can put it back later:
+
+    readlink /var/run/docker.sock
+
+To let plain `docker` commands (without setting DOCKER_HOST) reach cider, run:
+
+    sudo ln -sf /Users/<you>/.cider/docker.sock /var/run/docker.sock
+
+To undo this later, restore the target you noted above:
+
+    sudo ln -sf <the path readlink printed> /var/run/docker.sock
+
+`cider uninstall` does that for you from <data-dir>/system-socket.backup.json, which `cider install
+--system-socket` writes before it touches anything. If `readlink` printed nothing there was no previous
+link to restore — remove cider's link instead (`sudo rm -f` on that path).
 
 Point Docker tooling at cider with either of:
   docker context use cider
   export DOCKER_HOST=unix:///Users/<you>/.cider/docker.sock
+
+/var/run/docker.sock is normally owned by root, so cider cannot replace it without elevated privileges.
+First note what it points at today, so you can put it back later:
+
+    readlink /var/run/docker.sock
+
+To let plain `docker` commands (without setting DOCKER_HOST) reach cider, run:
+
+    sudo ln -sf /Users/<you>/.cider/docker.sock /var/run/docker.sock
+
+To undo this later, restore the target you noted above:
+
+    sudo ln -sf <the path readlink printed> /var/run/docker.sock
+
+`cider uninstall` does that for you from <data-dir>/system-socket.backup.json, which `cider install
+--system-socket` writes before it touches anything. If `readlink` printed nothing there was no previous
+link to restore — remove cider's link instead (`sudo rm -f` on that path).
 ```
+
+The system-socket instructions block really does print twice, back to back — this is not a
+transcription error in this checklist. `LaunchdInstaller.cs:190` folds `SystemSocketLink.Instructions`
+into `result.Message` when `--system-socket` was not passed (the default used above), and
+`Program.cs:186–188` then prints that same `Instructions` text a second time itself, also gated on
+`--system-socket` not being passed. Do not read the repeated block as the daemon or your terminal
+misbehaving. (This duplication looks like a real cleanup candidate — one call site should stop
+printing it — but fixing that is out of scope here; file it as a follow-up rather than treating it
+as part of this checklist.)
 
 - **The `ProcessType changed: Background -> Interactive` line is expected and is itself a proof
   point** — this machine's existing 0.1.4 install used `ProcessType: Background` (cider-8ok), so
@@ -240,6 +287,12 @@ Point Docker tooling at cider with either of:
   `docker context create cider --docker ... (exit 0)`. Either is correct for its situation — seeing
   `create` here, on this machine, would be the surprising one (it would mean the old context was
   somehow lost).
+- **There is no separate "Docker context ready" line to look for.** `DockerContextInstaller.EnsureAsync`
+  builds a message — `` Docker context 'cider' ready. Run `docker context use cider` to select it. `` —
+  but that string is only returned to the caller and folded into an internal `steps` list;
+  `LaunchdInstaller` never prints `steps`, so it never reaches the console. The only console evidence
+  that the context step ran and succeeded is the `docker context update cider ... (exit 0)` (or
+  `create`) line above.
 - **Failure looks like, and means:**
   - `launchctl bootstrap ... (exit <nonzero>)` followed by `launchctl bootstrap failed: ...`: the
     plist itself is malformed, or something else (SIP, a stale service definition) is refusing the
