@@ -185,10 +185,11 @@ public static class LaunchdInstaller
                     message = message + "\n\n" + linkResult.Message;
                 }
             }
-            else
-            {
-                message = message + "\n" + SystemSocketLink.Instructions(options.SocketPath);
-            }
+
+            // No `else` here on purpose: when --system-socket was NOT passed, the
+            // SystemSocketLink.Instructions block is `cider install`'s (Program.cs) to print, and
+            // it does so under the same condition. Folding it into the message here too printed it
+            // twice on the first output a new user ever sees (cider-xij).
 
             return new InstallResult(socketReady, message, steps);
         }

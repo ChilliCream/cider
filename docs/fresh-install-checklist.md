@@ -230,22 +230,6 @@ launchctl kickstart -k gui/<uid>/com.chillicream.cider.daemon (exit 0)
 Socket ready: /Users/<you>/.cider/docker.sock
 docker context update cider --docker host=unix:///Users/<you>/.cider/docker.sock (exit 0)
 cider daemon installed and running.
-/var/run/docker.sock is normally owned by root, so cider cannot replace it without elevated privileges.
-First note what it points at today, so you can put it back later:
-
-    readlink /var/run/docker.sock
-
-To let plain `docker` commands (without setting DOCKER_HOST) reach cider, run:
-
-    sudo ln -sf /Users/<you>/.cider/docker.sock /var/run/docker.sock
-
-To undo this later, restore the target you noted above:
-
-    sudo ln -sf <the path readlink printed> /var/run/docker.sock
-
-`cider uninstall` does that for you from <data-dir>/system-socket.backup.json, which `cider install
---system-socket` writes before it touches anything. If `readlink` printed nothing there was no previous
-link to restore — remove cider's link instead (`sudo rm -f` on that path).
 
 Point Docker tooling at cider with either of:
   docker context use cider
@@ -269,14 +253,10 @@ To undo this later, restore the target you noted above:
 link to restore — remove cider's link instead (`sudo rm -f` on that path).
 ```
 
-The system-socket instructions block really does print twice, back to back — this is not a
-transcription error in this checklist. `LaunchdInstaller.cs:190` folds `SystemSocketLink.Instructions`
-into `result.Message` when `--system-socket` was not passed (the default used above), and
-`Program.cs:186–188` then prints that same `Instructions` text a second time itself, also gated on
-`--system-socket` not being passed. Do not read the repeated block as the daemon or your terminal
-misbehaving. (This duplication looks like a real cleanup candidate — one call site should stop
-printing it — but fixing that is out of scope here; file it as a follow-up rather than treating it
-as part of this checklist.)
+The system-socket instructions block prints exactly once, and only when `--system-socket` was not
+passed (the default used above). `Program.cs` owns that emission; `LaunchdInstaller` used to fold the
+same text into `result.Message` as well, which printed it twice — that was fixed in cider-xij. If you
+see it twice, that is a regression worth filing, not expected output.
 
 - **The `ProcessType changed: Background -> Interactive` line is expected and is itself a proof
   point** — this machine's existing 0.1.4 install used `ProcessType: Background` (cider-8ok), so
