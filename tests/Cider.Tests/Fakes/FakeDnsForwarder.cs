@@ -27,13 +27,18 @@ public sealed class FakeDnsForwarder : IDnsForwarderService
     }
 
     /// <inheritdoc />
-    public Task ReleaseAsync(string dockerNetworkName, CancellationToken ct)
+    /// <remarks>
+    /// Always reports a forwarder was torn down (<c>true</c>) — tests that need the "nothing was
+    /// there to release" outcome swap the network's forwarder for <see
+    /// cref="NullDnsForwarderService"/> instead of adding tracking state here.
+    /// </remarks>
+    public Task<bool> ReleaseAsync(string dockerNetworkName, CancellationToken ct)
     {
         lock (Released)
         {
             Released.Add(dockerNetworkName);
         }
 
-        return Task.CompletedTask;
+        return Task.FromResult(true);
     }
 }

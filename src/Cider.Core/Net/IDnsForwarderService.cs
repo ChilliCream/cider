@@ -18,9 +18,12 @@ public interface IDnsForwarderService
     /// <summary>
     /// Tears the forwarder for <paramref name="dockerNetworkName"/> down. A forwarder container is
     /// attached to the network it serves, so the network cannot be removed while it is still there
-    /// ("has active endpoints"); the network manager calls this first.
+    /// ("has active endpoints"); the network manager calls this first. Returns <c>true</c> only when a
+    /// forwarder was actually torn down here — <c>false</c> when there was none to begin with (already
+    /// gone, never created) so callers can report what really happened instead of assuming every call
+    /// stopped something.
     /// </summary>
-    Task ReleaseAsync(string dockerNetworkName, CancellationToken ct);
+    Task<bool> ReleaseAsync(string dockerNetworkName, CancellationToken ct);
 }
 
 /// <summary>An <see cref="IDnsForwarderService"/> that never provides a forwarder (DNS disabled, tests).</summary>
@@ -34,5 +37,5 @@ public sealed class NullDnsForwarderService : IDnsForwarderService
         Task.FromResult<IPAddress?>(null);
 
     /// <inheritdoc />
-    public Task ReleaseAsync(string dockerNetworkName, CancellationToken ct) => Task.CompletedTask;
+    public Task<bool> ReleaseAsync(string dockerNetworkName, CancellationToken ct) => Task.FromResult(false);
 }

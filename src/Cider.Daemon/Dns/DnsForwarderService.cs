@@ -555,7 +555,7 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
     }
 
     /// <inheritdoc />
-    public async Task ReleaseAsync(string dockerNetworkName, CancellationToken ct)
+    public async Task<bool> ReleaseAsync(string dockerNetworkName, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(dockerNetworkName);
 
@@ -570,14 +570,17 @@ public sealed class DnsForwarderService : IDnsForwarderService, IAsyncDisposable
             {
                 await _runtime.RemoveContainerAsync(containerId, force: true, ct);
                 _logger.LogDebug("removed the DNS forwarder {Container} with its network", containerId);
+                return true;
             }
             catch (RuntimeException ex) when (ex.Kind == RuntimeErrorKind.NotFound)
             {
+                return false;
             }
         }
         catch (Exception ex) when (ex is RuntimeException or IOException)
         {
             _logger.LogWarning(ex, "could not release the DNS forwarder for network {Network}", dockerNetworkName);
+            return false;
         }
         finally
         {

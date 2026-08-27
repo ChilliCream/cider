@@ -326,20 +326,27 @@ public sealed class NetworkManager
         throw DockerErrors.NoSuchNetwork(idOrName);
     }
 
-    private async Task ReleaseDnsForwarderAsync(string dockerNetworkName, CancellationToken ct)
+    /// <summary>
+    /// Releases the DNS forwarder for <paramref name="dockerNetworkName"/> and reports whether one was
+    /// actually torn down here — <c>false</c> when there was no forwarder to begin with (DNS disabled,
+    /// or none was ever running for this network) or the release warned, so callers can report the
+    /// truth instead of assuming every network had a forwarder to stop (cider-ede.39).
+    /// </summary>
+    private async Task<bool> ReleaseDnsForwarderAsync(string dockerNetworkName, CancellationToken ct)
     {
         if (_dnsForwarders is null)
         {
-            return;
+            return false;
         }
 
         try
         {
-            await _dnsForwarders.ReleaseAsync(dockerNetworkName, ct).ConfigureAwait(false);
+            return await _dnsForwarders.ReleaseAsync(dockerNetworkName, ct).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is RuntimeException or IOException)
         {
             _logger.LogWarning(ex, "could not release the DNS forwarder of network {Network}", dockerNetworkName);
+            return false;
         }
     }
 
@@ -606,8 +613,11 @@ public sealed class NetworkManager
                 continue;
             }
 
-            await ReleaseDnsForwarderAsync(record.Name, ct).ConfigureAwait(false);
-            report.Dns.Removed.Add(record.Name); // cider-ede.39: the forwarder above is stopped with its network.
+            if (await ReleaseDnsForwarderAsync(record.Name, ct).ConfigureAwait(false))
+            {
+                report.Dns.Removed.Add(record.Name); // cider-ede.39: the forwarder above is stopped with its network.
+            }
+
             _store.Delete(record.Name);
             _events.Publish(DockerEvents.Network("destroy", record.Id, record.Name));
             report.Networks.Removed.Add(record.Name);

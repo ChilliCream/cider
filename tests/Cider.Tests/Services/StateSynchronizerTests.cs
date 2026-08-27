@@ -1,5 +1,6 @@
 using Cider.Core.DockerApi;
 using Cider.Core.DockerApi.Models;
+using Cider.Core.Net;
 using Cider.Core.Runtime;
 using Cider.Core.Services;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -182,6 +183,27 @@ public sealed class StateSynchronizerTests
         Assert.True(report.Dns.IsEmpty);
         Assert.Empty(harness.Dns.Requested);
         Assert.Empty(harness.Dns.Released);
+    }
+
+    [Fact]
+    public async Task SyncAsync_DnsForwarders_DroppingANetworkWithNoForwarderPresent_ReportsNothingStopped()
+    {
+        // cider-ede.39 correction: report.Dns.Removed must not credit a network for a forwarder that
+        // was never actually torn down (DNS disabled, or none was ever running for this network) —
+        // NetworkManager.ReleaseDnsForwarderAsync now only adds the network when ReleaseAsync itself
+        // reports it removed something. Simulated here with NullDnsForwarderService, the same object a
+        // DNS-disabled daemon wires up (DaemonLifecycle.cs), whose ReleaseAsync always returns false.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        harness.Networks.SetDnsForwarders(NullDnsForwarderService.Instance);
+        var sync = NewSynchronizer(harness);
+
+        await harness.Networks.CreateAsync(new NetworkCreateRequest { Name = "vanishing-net" }, default);
+        harness.Runtime.VanishNetwork("vanishing-net");
+
+        var report = await sync.SyncAsync(default);
+
+        Assert.Contains("vanishing-net", report.Networks.Removed);
+        Assert.Empty(report.Dns.Removed);
     }
 
     [Fact]

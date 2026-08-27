@@ -403,7 +403,7 @@ public static class Program
         Console.WriteLine($"containers: {DescribeResource(report.Containers, includeUpdated: true)}");
         Console.WriteLine($"networks:   {DescribeResource(report.Networks, includeUpdated: false)}");
         Console.WriteLine($"volumes:    {DescribeResource(report.Volumes, includeUpdated: false)}");
-        Console.WriteLine($"dns:        {DescribeResource(report.Dns, includeUpdated: false, removedVerb: "stopped", adoptedVerb: "started")}");
+        Console.WriteLine($"dns:        {DescribeResource(report.Dns, includeUpdated: false, removedVerb: "stopped", adoptedVerb: "ensured")}");
 
         if (report.Warnings.Count > 0)
         {
