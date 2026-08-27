@@ -29,8 +29,12 @@ namespace Cider.E2E.Tests;
 /// characterize: cider's own containerCreate-over-XPC latency.
 ///
 /// Thresholds below were re-derived from repeated local runs against the real Apple runtime
-/// (2026-08-26) after switching to the socket, set with roughly 2.5-3x headroom over the observed
-/// medians/typical values. Those local runs were NOT on an idle machine — this box carried several
+/// (2026-08-26) after switching to the socket, originally set with roughly 2.5-3x headroom over the
+/// observed medians/typical values; the cider-ede.36 fixer correction (2026-08-27, below) tightened
+/// the two create-timing budgets to smaller multiples of the worst wall/median actually
+/// reproduced — roughly 1.4x on the median, roughly 1.6x on the 8-parallel wall time — trading the
+/// 2.5-3x convention for headroom over outliers instead of over the typical case. Those local runs
+/// were NOT on an idle machine — this box carried several
 /// other concurrently-running agent processes at the time (load average ranging ~35-70 on 16
 /// cores), so the numbers below already bake in a fair amount of real contention rather than
 /// characterizing a best case; the task's original literal 30/80/300/10 ms figures were never
@@ -43,20 +47,29 @@ namespace Cider.E2E.Tests;
 /// contention, not idle) to check the two create-timing budgets against the epic's promised
 /// targets (<c>docker create</c> &lt;= 25 ms median, 8-parallel &lt;= 0.2 s wall) rather than leaving
 /// them unrecorded: <see cref="Sequential_create_of_a_cached_image_is_fast"/>'s median measured
-/// 13.0-20.2 ms over 10 independent 100-sample runs split across net10.0/net11.0, comfortably and
-/// consistently under the promised 25 ms with no outliers; <see
-/// cref="Eight_parallel_creates_of_a_cached_image_finish_within_budget"/>'s wall time measured
-/// 71.4-93.5 ms over 9 runs split the same way (well below the 700-1200 ms this same test saw before
-/// cider-ede.30's eager DNS-forwarder bootstrap fix), also with no outliers. Both support tightening
-/// toward the epic's literal promise rather than restating it: the median budget below moved
-/// 40 ms -> 25 ms (matching the promise directly) and the 8-parallel budget moved 1200 ms -> 200 ms
-/// (matching the promise directly, ~2.1x headroom over the worst observed 93.5 ms). p99 (no epic
-/// target) is a different story: 9 of 10 sampled runs put it at 23.6-29.8 ms, but one run spiked to
-/// 82.0 ms with no corresponding median spike in that same run — a real, occasional tail-latency
-/// event under this box's contention rather than measurement noise to be averaged away, so p99's
-/// budget moved 300 ms -> 150 ms (not all the way to the ~2.5x-over-typical convention's ~75 ms,
-/// which the observed spike alone would already have exceeded) rather than to something tighter that
-/// this one data point shows would be flaky.
+/// 13.0-20.2 ms over 10 independent 100-sample runs split across net10.0/net11.0, typically under
+/// the promised 25 ms; <see cref="Eight_parallel_creates_of_a_cached_image_finish_within_budget"/>'s
+/// wall time measured 71.4-93.5 ms over 9 runs split the same way (well below the 700-1200 ms this
+/// same test saw before cider-ede.30's eager DNS-forwarder bootstrap fix). That first measurement
+/// window initially read as clean enough to tighten straight to the epic's literal promise (25 ms /
+/// 200 ms), but neither scenario is actually outlier-free: a cider-ede.36 fixer re-verification
+/// (2026-08-27) reproduced a 28.4 ms median excursion on the sequential test, and reproduced
+/// 8-parallel wall times of 373.9 ms (reviewer run) and 207.2 ms (13-run verification pass, load
+/// average 15-21) — consistent with the 101.5-561.6 ms range already on record above from the
+/// 19-run post-cider-ede.30 dataset. Both outliers made the 25 ms / 200 ms budgets fail routinely
+/// in CI, so this is the task's "option 2" outcome, not "option 1": the data does not support
+/// tightening all the way to the epic's literal promise once those outliers are counted, so the
+/// budgets are restated instead. The median budget is restored to 40 ms (unchanged from before
+/// cider-ede.36, ~1.4x over the worst observed 28.4 ms median) and the 8-parallel budget is set to
+/// 600 ms (~1.6x over the worst observed 373.9 ms wall — still a 2x tightening from the
+/// pre-cider-ede.36 1200 ms, the largest the combined data supports). The epic's 25 ms figure
+/// remains the achieved *typical* median (13.0-20.2 ms comfortably clears it); per the cider-ede.36
+/// fixer correction (2026-08-27) that gap is recorded here rather than by amending the epic's
+/// Outcome. p99 (no epic target) is a different story: 9 of 10 sampled runs put it at 23.6-29.8 ms,
+/// one run spiked to 82.0 ms, and a separate reviewer run sampled 134.2 ms — real, occasional
+/// tail-latency events under this box's contention rather than measurement noise to be averaged
+/// away — so p99's budget stands at 150 ms, which produced no failure across the 17 combined runs
+/// behind this doc.
 /// </summary>
 [Collection(DaemonCollection.Name)]
 [Trait("Category", "E2E")]
@@ -99,8 +112,8 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
         var p99 = Percentile(samples, 0.99);
 
         Assert.True(
-            median <= 25,
-            $"median containerCreate-over-XPC latency was {median:F1} ms (budget 25 ms) over " +
+            median <= 40,
+            $"median containerCreate-over-XPC latency was {median:F1} ms (budget 40 ms) over " +
             $"{SequentialIterations} runs: " + string.Join(", ", samples.Select(s => s.ToString("F1"))));
         Assert.True(
             p99 <= 150,
@@ -128,8 +141,12 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
     /// traffic, so the create path never queues behind it. Re-measured post-fix (2026-08-26, same box,
     /// load average ~30-36, i.e. not idle): 19 runs of this test against a fresh daemon ranged
     /// 101.5-561.6 ms wall (median ~180 ms, two outliers over 450 ms under momentary extra load from
-    /// other concurrently-running processes on this box) — the budget below keeps ~2x headroom over
-    /// the worst of those.
+    /// other concurrently-running processes on this box). A cider-ede.36 fixer re-verification
+    /// (2026-08-27) recorded two more datasets on the same box: 9 later runs on a quieter box ranged
+    /// 71.4-93.5 ms, and a 13-run verification pass under load average 15-21 produced one wall time of
+    /// 207.2 ms (that run's own containerBootstrap contention, not a regression) alongside the
+    /// reviewer's separately reproduced 373.9 ms wall. The budget below keeps headroom over the worst
+    /// of ALL of these (373.9 ms), not just the most favorable subset.
     /// </summary>
     [XpcOnlyFact]
     public async Task Eight_parallel_creates_of_a_cached_image_finish_within_budget()
@@ -149,9 +166,9 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
             stopwatch.Stop();
 
             Assert.True(
-                stopwatch.Elapsed <= TimeSpan.FromMilliseconds(200),
+                stopwatch.Elapsed <= TimeSpan.FromMilliseconds(600),
                 $"{parallelism} parallel containerCreate-over-XPC calls took " +
-                $"{stopwatch.Elapsed.TotalMilliseconds:F1} ms wall (budget 200 ms)");
+                $"{stopwatch.Elapsed.TotalMilliseconds:F1} ms wall (budget 600 ms)");
         }
         finally
         {
