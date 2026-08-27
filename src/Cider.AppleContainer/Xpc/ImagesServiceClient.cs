@@ -10,10 +10,12 @@ namespace Cider.AppleContainer.Xpc;
 /// routes <c>containerCreate</c>'s preconditions need (<c>imageList</c>, <c>snapshotGet</c>,
 /// <c>imageUnpack</c>); cider-ede.10 extends it with the rest of the images service —
 /// <c>imagePull</c>/<c>imagePush</c>/<c>imageTag</c>/<c>imageDelete</c>/<c>imageSave</c>/
-/// <c>imageLoad</c>/<c>imageCleanupOrphanedBlobs</c> — plus the content-store's <c>contentGet</c>
-/// (task's file-scope note: "extends the X5 stub with all routes"). cider-ehn adds the content-store's
-/// <c>contentDelete</c> — the scoped counterpart to <c>imageCleanupOrphanedBlobs</c>'s whole-store
-/// sweep, not wired until then despite <c>contentGet</c> already being here.
+/// <c>imageLoad</c> — plus the content-store's <c>contentGet</c> (task's file-scope note: "extends
+/// the X5 stub with all routes"). The sweep routes this class used to carry are gone by design
+/// (cider-ede.41): <c>imageCleanupOrphanedBlobs</c> (the whole-store sweep) and cider-ehn's scoped
+/// <c>contentDelete</c> were removed with the prune-path sweep — a sweep from one process deletes
+/// another process's mid-write pull blobs in the shared store (reproduced in ~2s, commit d63644b).
+/// Do not re-wire them; see the prevention comment in <c>XpcContainerRuntime.Images.cs</c>.
 /// </summary>
 /// <remarks>
 /// Not <c>sealed</c>, and <see cref="ImageListAsync"/>/<see cref="ContentGetAsync"/> are <c>virtual</c>
@@ -22,9 +24,8 @@ namespace Cider.AppleContainer.Xpc;
 /// per-route interface here; a single override point on the real class is the minimal seam, matching
 /// the shape <see cref="XpcContainerRuntime"/>'s own <c>internal</c> test constructor already uses).
 /// cider-ede.31 extends the same seam to <see cref="ImagePullAsync"/>/<see cref="ImageUnpackAsync"/>/
-/// <see cref="ImageDeleteAsync"/>/<see cref="ImageCleanupOrphanedBlobsAsync"/>, so a test can prove
-/// <see cref="BlobSweepGate"/> actually blocks a pull against a concurrent sweep and back, without a
-/// live apiserver connection either.
+/// <see cref="ImageDeleteAsync"/>, so a test can prove <see cref="BlobSweepGate"/> actually blocks a
+/// pull against a concurrent sweep and back, without a live apiserver connection either.
 /// </remarks>
 internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
 {
@@ -171,26 +172,6 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
         using var reply = await images.SendAsync(request, XpcCallOptions.Default, ct).ConfigureAwait(false);
     }
 
-    /// <summary>
-    /// <c>imageCleanupOrphanedBlobs</c> — no request payload. The store-wide sweep itself (cider-ede.31
-    /// fix direction §1/§2: no longer called from every <c>RemoveImageAsync</c>, only from
-    /// <c>PruneImagesAsync</c>, gated exclusively against this daemon's own in-flight image writes by
-    /// <see cref="BlobSweepGate"/>). Returns the reply's <c>digests</c>/<c>imageSize</c> — fix
-    /// direction §4 wants a sweep's own result logged (attributable, not mysterious), which needs
-    /// them; previously discarded since no caller read them. <c>virtual</c> for the same test seam as
-    /// <see cref="ImageDeleteAsync"/>.
-    /// </summary>
-    public virtual async Task<(IReadOnlyList<string> Digests, ulong ImageSize)> ImageCleanupOrphanedBlobsAsync(CancellationToken ct)
-    {
-        using var request = new XpcMessage("imageCleanupOrphanedBlobs");
-        using var reply = await images.SendAsync(request, XpcCallOptions.Default, ct).ConfigureAwait(false);
-
-        var digestsBytes = reply.GetData("digests");
-        var digests = digestsBytes is null ? (IReadOnlyList<string>)[] : XpcJson.Deserialize<List<string>>(digestsBytes);
-        var imageSize = reply.GetUInt64("imageSize");
-        return (digests, imageSize);
-    }
-
     /// <summary><c>imageSave{imageDescriptions, filePath}</c> — <c>ociPlatform</c> deliberately omitted
     /// (§6 marks it optional; cider saves every platform a multi-arch image carries, matching the CLI
     /// transport's own <c>image save</c> with no <c>--platform</c> flag) — no reply payload beyond the
@@ -241,30 +222,5 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
         {
             return null;
         }
-    }
-
-    /// <summary>
-    /// <c>contentDelete{digests}</c> → <c>digests</c> (data, the ones actually deleted) +
-    /// <c>imageSize</c> (uint64, bytes reclaimed) — §6's content-store table. Unlike
-    /// <see cref="ImageCleanupOrphanedBlobsAsync"/>'s whole-store sweep, this takes an explicit digest
-    /// list — cider-ehn's scoped reclaim (<see cref="XpcContainerRuntime.PruneImagesAsync"/>'s
-    /// fallback) is the one caller, and it is the one responsible for having already proven every
-    /// digest it passes here is unreferenced (see that method's own doc comment for the safety rule):
-    /// this route trusts the list it is given and does not itself re-derive "orphaned". The reply's
-    /// own digests/size are returned, not discarded, so the fallback can log what it actually
-    /// reclaimed rather than assuming the whole request list was honored. <c>virtual</c> for the same
-    /// fake-images-client test seam as <see cref="ImageDeleteAsync"/>/
-    /// <see cref="ImageCleanupOrphanedBlobsAsync"/>.
-    /// </summary>
-    public virtual async Task<(IReadOnlyList<string> Digests, ulong ImageSize)> ContentDeleteAsync(IReadOnlyList<string> digests, CancellationToken ct)
-    {
-        using var request = new XpcMessage("contentDelete");
-        request.SetData("digests", XpcJson.SerializeToUtf8Bytes(digests.ToList()));
-        using var reply = await images.SendAsync(request, XpcCallOptions.Default, ct).ConfigureAwait(false);
-
-        var digestsBytes = reply.GetData("digests");
-        var deleted = digestsBytes is null ? (IReadOnlyList<string>)[] : XpcJson.Deserialize<List<string>>(digestsBytes);
-        var imageSize = reply.GetUInt64("imageSize");
-        return (deleted, imageSize);
     }
 }

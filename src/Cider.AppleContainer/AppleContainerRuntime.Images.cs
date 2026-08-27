@@ -23,16 +23,17 @@ public sealed partial class AppleContainerRuntime
     /// as the XPC transport's CLI fallback (<c>XpcContainerRuntime</c>'s own <c>_cliFallback</c>), so a
     /// pull/load/build funnelled through *this* runtime is never mid-write while *this* runtime's own
     /// delete subprocess is sweeping. This instance is a separate <see cref="BlobSweepGate"/> from the
-    /// one <c>XpcContainerRuntime</c> keeps for its own direct-XPC pulls/loads/builds/
-    /// <c>PruneImagesAsync</c> — the two do not coordinate with each other. That split was a live hole
+    /// one <c>XpcContainerRuntime</c> keeps for its own direct-XPC pulls/loads/builds and its
+    /// apiserver-unavailable delete fallback — the two do not coordinate with each other. That split was a live hole
     /// (cider-ede.31 correction), not a harmless one: an XPC-transport
     /// build used to delegate straight to <em>this</em> runtime's <see cref="BuildImageAsync"/> with no
     /// XPC-side gate entry first, so it was invisible to the XPC transport's own
-    /// <c>PruneImagesAsync</c> sweep even though it commits new content the same way a pull/load does.
+    /// sweep even though it commits new content the same way a pull/load does.
     /// <c>XpcContainerRuntime.BuildImageAsync</c> now enters its own gate before delegating here, closing
     /// that hole — every write this daemon can perform on either transport is covered by whichever
     /// gate that transport's own sweep (this runtime's delete, or the XPC transport's
-    /// <c>PruneImagesAsync</c>) actually takes.
+    /// apiserver-unavailable delete fallback; cider-ede.41 removed the prune-path sweep on both
+    /// transports) actually takes.
     /// </summary>
     private readonly BlobSweepGate _blobSweepGate = new();
 
@@ -565,6 +566,14 @@ public sealed partial class AppleContainerRuntime
     private static readonly bool SkipBlobSweepGateForTest = string.Equals(
         Environment.GetEnvironmentVariable("CIDER_TEST_SKIP_BLOB_SWEEP_GATE"), "1", StringComparison.Ordinal);
 
+    /// <summary>
+    /// <c>true</c>: on this transport a delete really does free the image's blobs — Apple's
+    /// `container image delete` sweeps inside its own binary (the residual documented on
+    /// <see cref="RemoveImageAsync"/>) — so `docker image prune`'s <c>SpaceReclaimed</c> may honestly
+    /// count the deleted images' sizes (cider-ede.41 implementation requirement 1).
+    /// </summary>
+    public bool RemoveImageReclaimsBlobs => true;
+
     public Task RemoveImageAsync(string reference, bool force, CancellationToken ct) => GuardAsync(async () =>
     {
         ArgumentException.ThrowIfNullOrEmpty(reference);
@@ -572,8 +581,20 @@ public sealed partial class AppleContainerRuntime
         // cider-ede.31: `container image delete` sweeps the whole content store as an unavoidable part
         // of the one subprocess this spawns (Apple's own ImageDelete.swift; there is no flag to skip
         // it) — from this daemon's point of view that subprocess *is* a sweep, so it takes the gate
-        // exclusively, the same as an XPC-transport PruneImagesAsync, rather than running unguarded
-        // against this runtime's own concurrent pulls/loads/builds.
+        // exclusively rather than running unguarded against this runtime's own concurrent
+        // pulls/loads/builds.
+        //
+        // RESIDUAL SWEEP (cider-ede.41 implementation requirement 2 — documented, not silent):
+        // cider-ede.41 removed cider's own store-wide sweep from the prune path on both transports,
+        // because a sweep is only safe under machine-wide quiescence, which no process can establish
+        // on the shared store — a sweep in one process deletes another process's just-written,
+        // not-yet-committed pull blobs (reproduced cross-process in ~2s with the in-process gate
+        // enabled in both daemons; commit d63644b). On THIS transport, though, the sweep lives inside
+        // Apple's own `container image delete` binary and cannot be disabled from outside — so every
+        // CLI-transport rmi/prune delete still carries Apple's sweep and can still race another
+        // process's mid-write pull. Accepted as a residual (the alternative is not deleting images at
+        // all on this transport); the gate above at least keeps it from racing THIS daemon's own
+        // writes.
         //
         // cider-ede.31 fix direction §4: on this transport every delete genuinely is a sweep, so a
         // CLI-transport rmi that appears hung needs to be attributable — log Debug when acquiring the

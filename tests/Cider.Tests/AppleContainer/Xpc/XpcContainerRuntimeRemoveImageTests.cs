@@ -13,17 +13,24 @@ namespace Cider.Tests.AppleContainer.Xpc;
 /// cider-ede.31: <c>docker rmi</c> used to also sweep the *whole* content store
 /// (<c>imageCleanupOrphanedBlobs</c>) on every single call — not scoped to the image just deleted —
 /// which raced any concurrent pull/load that had written blobs but not yet committed its index entry
-/// and corrupted the store twice in one day. The fix moves that sweep to <c>PruneImagesAsync</c> (the
-/// one place a user explicitly asked to reclaim space) and gates it exclusively, via
-/// <see cref="BlobSweepGate"/>, against this runtime's own in-flight pulls/loads. Drives
-/// <see cref="XpcContainerRuntime"/> through its test-only constructor (the same
-/// <c>ImagesServiceClient</c> injection seam <c>XpcContainerRuntimeListImagesToleranceTests</c> uses),
-/// with no live apiserver connection involved.
+/// and corrupted the store twice in one day. cider-ede.41 then removed the store-wide sweep from
+/// cider entirely (planner ruling, option A — a sweep in ONE process deletes ANOTHER process's
+/// mid-write pull blobs; reproduced cross-process in ~2s with the in-process gate enabled in both
+/// daemons, commit d63644b). The one sweep left on the XPC transport is the apiserver-unavailable
+/// delete fallback, which shells to Apple's CLI delete — Apple's in-binary sweep, a documented
+/// residual — and must hold <see cref="BlobSweepGate"/> exclusively against this runtime's own
+/// in-flight pulls/builds. Drives <see cref="XpcContainerRuntime"/> through its test-only
+/// constructor (the same <c>ImagesServiceClient</c> injection seam
+/// <c>XpcContainerRuntimeListImagesToleranceTests</c> uses), with no live apiserver connection
+/// involved.
 /// </summary>
 public sealed class XpcContainerRuntimeRemoveImageTests
 {
+    /// <summary>The primary (apiserver-reachable) delete path must be a pure reference drop: one
+    /// <c>imageDelete</c> with <c>garbageCollect:false</c>, and no other images-service call — the
+    /// no-sweep delete cider-ede.31 established and cider-ede.41 depends on.</summary>
     [Fact]
-    public async Task RemoveImageAsync_IssuesNoCleanupOrphanedBlobsCall()
+    public async Task RemoveImageAsync_IssuesExactlyOneNonGarbageCollectingDelete()
     {
         var fake = new RecordingImagesServiceClient();
         var runtime = NewRuntime(fake);
@@ -31,37 +38,24 @@ public sealed class XpcContainerRuntimeRemoveImageTests
 
         await runtime.RemoveImageAsync("docker.io/library/alpine:3.19", force: false, CancellationToken.None);
 
-        var delete = Assert.Single(fake.Calls, c => c.StartsWith("ImageDeleteAsync:", StringComparison.Ordinal));
-        Assert.Equal("ImageDeleteAsync:docker.io/library/alpine:3.19:False", delete);
-        Assert.DoesNotContain(fake.Calls, c => c == "ImageCleanupOrphanedBlobsAsync");
-    }
-
-    [Fact]
-    public async Task PruneImagesAsync_CallsCleanupOrphanedBlobsExactlyOnce()
-    {
-        var fake = new RecordingImagesServiceClient();
-        var runtime = NewRuntime(fake);
-        using var _ = runtime;
-
-        await runtime.PruneImagesAsync([], CancellationToken.None);
-
-        Assert.Single(fake.Calls, c => c == "ImageCleanupOrphanedBlobsAsync");
-        Assert.DoesNotContain(fake.Calls, c => c.StartsWith("ImageDeleteAsync:", StringComparison.Ordinal));
+        var call = Assert.Single(fake.Calls);
+        Assert.Equal("ImageDeleteAsync:docker.io/library/alpine:3.19:False", call);
     }
 
     /// <summary>
-    /// The concurrency shape the task's own verification names: "a pull ... held mid-write while a
-    /// prune runs must leave the pulled image intact". <see cref="RecordingImagesServiceClient"/>'s
-    /// <c>ImageCleanupOrphanedBlobsAsync</c> blocks until released; a concurrently-started pull must
-    /// not observe the sweep complete before the pull itself does — proving
-    /// <see cref="BlobSweepGate.EnterSweepAsync"/> genuinely waits for an in-flight
+    /// The concurrency shape cider-ede.31's fix direction names: a pull held mid-write (blobs
+    /// written, index entry not yet committed) must block the one remaining sweep on this transport —
+    /// the apiserver-unavailable CLI delete fallback — from starting until the pull completes,
+    /// proving <see cref="BlobSweepGate.EnterSweepAsync"/> genuinely waits for an in-flight
     /// <see cref="BlobSweepGate.EnterImageWriteAsync"/> rather than merely documenting that it should.
     /// </summary>
     [Fact]
-    public async Task PullImageAsync_HeldMidWrite_BlocksAConcurrentSweepUntilItCompletes()
+    public async Task PullImageAsync_HeldMidWrite_BlocksAConcurrentFallbackDeleteSweepUntilItCompletes()
     {
-        var fake = new RecordingImagesServiceClient();
-        var runtime = NewRuntime(fake);
+        var fake = new RecordingImagesServiceClient { DeleteUnavailable = true };
+        var cliFallback = new FakeContainerRuntime();
+        SeedAlpine(cliFallback);
+        var runtime = NewRuntime(fake, cliFallback);
         using var _ = runtime;
 
         fake.ArmPullGate();
@@ -69,75 +63,71 @@ public sealed class XpcContainerRuntimeRemoveImageTests
         var progress = new Progress<ProgressEvent>();
         var pullTask = runtime.PullImageAsync("docker.io/library/redis:8.6", null, null, progress, CancellationToken.None);
 
-        // The pull is genuinely mid-write (inside ImagePullAsync, blocked on the armed gate) before the
-        // sweep is even started, the same shape a real pull that has written blobs but not yet
-        // committed its index entry would present to a sweep that started a moment later.
+        // The pull is genuinely mid-write (inside ImagePullAsync, blocked on the armed gate) before
+        // the fallback delete is even started.
         await fake.WaitUntilPullBlockedAsync();
 
-        var sweepTask = runtime.PruneImagesAsync([], CancellationToken.None);
+        var removeTask = runtime.RemoveImageAsync("docker.io/library/alpine:3.19", force: false, CancellationToken.None);
 
-        // The sweep must not be able to complete while the pull is still held — give it a beat to
-        // (wrongly) race ahead before releasing the pull, the way the pre-fix code would have let it.
-        var racedAhead = await Task.WhenAny(sweepTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
-        Assert.NotSame(sweepTask, racedAhead);
-        Assert.False(sweepTask.IsCompleted, "PruneImagesAsync must wait for the in-flight pull to finish");
+        // The fallback's CLI delete (the sweep) must not be able to start while the pull is still
+        // held — give it a beat to (wrongly) race ahead before releasing the pull.
+        var racedAhead = await Task.WhenAny(removeTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
+        Assert.NotSame(removeTask, racedAhead);
+        Assert.False(removeTask.IsCompleted, "the fallback delete must wait for the in-flight pull to finish");
+        Assert.DoesNotContain(cliFallback.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
 
         fake.ReleasePull();
         await pullTask;
-        await sweepTask;
+        await removeTask;
 
-        // Order proves the wait was real, not coincidental: the pull's own ImagePullAsync call is
-        // recorded before the sweep's ImageCleanupOrphanedBlobsAsync call.
-        var pullIndex = fake.Calls.IndexOf(fake.Calls.First(c => c.StartsWith("ImagePullAsync:", StringComparison.Ordinal)));
-        var sweepIndex = fake.Calls.IndexOf("ImageCleanupOrphanedBlobsAsync");
-        Assert.True(pullIndex < sweepIndex, $"expected the pull to be recorded before the sweep; calls were [{string.Join(", ", fake.Calls)}]");
+        Assert.Contains(cliFallback.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
     }
 
-    /// <summary>The reverse ordering: a sweep already in flight blocks a pull that starts after it,
-    /// until the sweep finishes — the other half of the same gate.</summary>
+    /// <summary>The reverse ordering: a fallback-delete sweep already in flight blocks a pull that
+    /// starts after it, until the sweep finishes — the other half of the same gate.</summary>
     [Fact]
-    public async Task PruneImagesAsync_InFlight_BlocksAConcurrentPullUntilItCompletes()
+    public async Task FallbackDeleteSweep_InFlight_BlocksAConcurrentPullUntilItCompletes()
     {
-        var fake = new RecordingImagesServiceClient();
-        var runtime = NewRuntime(fake);
+        var fake = new RecordingImagesServiceClient { DeleteUnavailable = true };
+        var cliFallback = new FakeContainerRuntime();
+        SeedAlpine(cliFallback);
+        var runtime = NewRuntime(fake, cliFallback);
         using var _ = runtime;
 
-        fake.ArmSweepGate();
+        cliFallback.ArmRemoveGate();
 
-        var sweepTask = runtime.PruneImagesAsync([], CancellationToken.None);
-        await fake.WaitUntilSweepBlockedAsync();
+        var removeTask = runtime.RemoveImageAsync("docker.io/library/alpine:3.19", force: false, CancellationToken.None);
+        await cliFallback.WaitUntilRemoveBlockedAsync();
 
         var progress = new Progress<ProgressEvent>();
         var pullTask = runtime.PullImageAsync("docker.io/library/redis:8.6", null, null, progress, CancellationToken.None);
 
         var racedAhead = await Task.WhenAny(pullTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
         Assert.NotSame(pullTask, racedAhead);
-        Assert.False(pullTask.IsCompleted, "PullImageAsync must wait for the in-flight sweep to finish");
+        Assert.False(pullTask.IsCompleted, "PullImageAsync must wait for the in-flight fallback delete sweep to finish");
+        Assert.DoesNotContain(fake.Calls, c => c.StartsWith("ImagePullAsync:", StringComparison.Ordinal));
 
-        fake.ReleaseSweep();
-        await sweepTask;
+        cliFallback.ReleaseRemove();
+        await removeTask;
         await pullTask;
 
-        var sweepIndex = fake.Calls.IndexOf("ImageCleanupOrphanedBlobsAsync");
-        var pullIndex = fake.Calls.IndexOf(fake.Calls.First(c => c.StartsWith("ImagePullAsync:", StringComparison.Ordinal)));
-        Assert.True(sweepIndex < pullIndex, $"expected the sweep to be recorded before the pull; calls were [{string.Join(", ", fake.Calls)}]");
+        Assert.Contains(fake.Calls, c => c.StartsWith("ImagePullAsync:", StringComparison.Ordinal));
     }
 
     /// <summary>
     /// cider-ede.31 correction: <c>BuildImageAsync</c> delegates straight to the CLI fallback
     /// (<c>XpcContainerRuntime.cs</c>'s // FALLBACK block) rather than through <c>_imagesClient</c>
     /// like <see cref="PullImageAsync"/> above — it was the one XPC-transport write path left ungated
-    /// against <see cref="PruneImagesAsync"/>. This proves it now enters the same
-    /// <see cref="BlobSweepGate"/> instance before delegating: a build held mid-write by
-    /// <see cref="FakeContainerRuntime.ArmBuildGate"/> must block a concurrently-started
-    /// <see cref="PruneImagesAsync"/> until it completes, the same shape
-    /// <see cref="PullImageAsync_HeldMidWrite_BlocksAConcurrentSweepUntilItCompletes"/> proves for pull.
+    /// against the transport's sweep. This proves it still enters the same
+    /// <see cref="BlobSweepGate"/> instance before delegating: a build held mid-write must block a
+    /// concurrently-started fallback-delete sweep until it completes.
     /// </summary>
     [Fact]
-    public async Task BuildImageAsync_HeldMidWrite_BlocksAConcurrentSweepUntilItCompletes()
+    public async Task BuildImageAsync_HeldMidWrite_BlocksAConcurrentFallbackDeleteSweepUntilItCompletes()
     {
-        var fake = new RecordingImagesServiceClient();
+        var fake = new RecordingImagesServiceClient { DeleteUnavailable = true };
         var cliFallback = new FakeContainerRuntime();
+        SeedAlpine(cliFallback);
         var runtime = NewRuntime(fake, cliFallback);
         using var _ = runtime;
 
@@ -145,146 +135,82 @@ public sealed class XpcContainerRuntimeRemoveImageTests
 
         var progress = new Progress<ProgressEvent>();
         var buildTask = runtime.BuildImageAsync(new BuildSpec { ContextDir = "/tmp/ctx" }, progress, CancellationToken.None);
-
-        // The build is genuinely mid-write (inside BuildImageAsync, blocked on the armed gate) before
-        // the sweep is even started, the same shape a real build that has written blobs but not yet
-        // committed its index entry would present to a sweep that started a moment later.
         await cliFallback.WaitUntilBuildBlockedAsync();
 
-        var sweepTask = runtime.PruneImagesAsync([], CancellationToken.None);
+        var removeTask = runtime.RemoveImageAsync("docker.io/library/alpine:3.19", force: false, CancellationToken.None);
 
-        // The sweep must not be able to complete while the build is still held — give it a beat to
-        // (wrongly) race ahead before releasing the build, the way the pre-fix code would have let it
-        // (BuildImageAsync used to delegate with no XPC-side gate entry at all).
-        var racedAhead = await Task.WhenAny(sweepTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
-        Assert.NotSame(sweepTask, racedAhead);
-        Assert.False(sweepTask.IsCompleted, "PruneImagesAsync must wait for the in-flight build to finish");
+        var racedAhead = await Task.WhenAny(removeTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
+        Assert.NotSame(removeTask, racedAhead);
+        Assert.False(removeTask.IsCompleted, "the fallback delete must wait for the in-flight build to finish");
+        Assert.DoesNotContain(cliFallback.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
 
         cliFallback.ReleaseBuild();
         await buildTask;
-        await sweepTask;
+        await removeTask;
 
-        // Order proves the wait was real, not coincidental: the build's own call is recorded before the
-        // sweep's ImageCleanupOrphanedBlobsAsync call.
-        var buildIndex = cliFallback.Calls.IndexOf(cliFallback.Calls.First(c => c.StartsWith("BuildImageAsync:", StringComparison.Ordinal)));
-        var sweepIndex = fake.Calls.IndexOf("ImageCleanupOrphanedBlobsAsync");
-        Assert.True(buildIndex >= 0 && sweepIndex >= 0, $"expected both calls to be recorded; build calls were [{string.Join(", ", cliFallback.Calls)}], sweep calls were [{string.Join(", ", fake.Calls)}]");
+        Assert.Contains(cliFallback.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
     }
 
-    /// <summary>The reverse ordering: a sweep already in flight blocks a build that starts after it,
-    /// until the sweep finishes — the other half of the same gate.</summary>
+    /// <summary>The reverse ordering: a fallback-delete sweep already in flight blocks a build that
+    /// starts after it, until the sweep finishes — the other half of the same gate.</summary>
     [Fact]
-    public async Task PruneImagesAsync_InFlight_BlocksAConcurrentBuildUntilItCompletes()
+    public async Task FallbackDeleteSweep_InFlight_BlocksAConcurrentBuildUntilItCompletes()
     {
-        var fake = new RecordingImagesServiceClient();
+        var fake = new RecordingImagesServiceClient { DeleteUnavailable = true };
         var cliFallback = new FakeContainerRuntime();
+        SeedAlpine(cliFallback);
         var runtime = NewRuntime(fake, cliFallback);
         using var _ = runtime;
 
-        fake.ArmSweepGate();
+        cliFallback.ArmRemoveGate();
 
-        var sweepTask = runtime.PruneImagesAsync([], CancellationToken.None);
-        await fake.WaitUntilSweepBlockedAsync();
+        var removeTask = runtime.RemoveImageAsync("docker.io/library/alpine:3.19", force: false, CancellationToken.None);
+        await cliFallback.WaitUntilRemoveBlockedAsync();
 
         var progress = new Progress<ProgressEvent>();
         var buildTask = runtime.BuildImageAsync(new BuildSpec { ContextDir = "/tmp/ctx" }, progress, CancellationToken.None);
 
         var racedAhead = await Task.WhenAny(buildTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
         Assert.NotSame(buildTask, racedAhead);
-        Assert.False(buildTask.IsCompleted, "BuildImageAsync must wait for the in-flight sweep to finish");
+        Assert.False(buildTask.IsCompleted, "BuildImageAsync must wait for the in-flight fallback delete sweep to finish");
+        Assert.DoesNotContain(cliFallback.Calls, c => c.StartsWith("BuildImageAsync:", StringComparison.Ordinal));
 
-        fake.ReleaseSweep();
-        await sweepTask;
+        cliFallback.ReleaseRemove();
+        await removeTask;
         await buildTask;
 
-        var sweepIndex = fake.Calls.IndexOf("ImageCleanupOrphanedBlobsAsync");
-        Assert.True(sweepIndex >= 0 && cliFallback.Calls.Any(c => c.StartsWith("BuildImageAsync:", StringComparison.Ordinal)), $"expected both calls to be recorded; build calls were [{string.Join(", ", cliFallback.Calls)}], sweep calls were [{string.Join(", ", fake.Calls)}]");
+        Assert.Contains(cliFallback.Calls, c => c.StartsWith("BuildImageAsync:", StringComparison.Ordinal));
     }
 
-    /// <summary>
-    /// cider-bci regression: <c>imageCleanupOrphanedBlobs</c> walks the *whole* store, including blobs
-    /// from images this daemon never touched, so a pre-existing dangling/unresolvable content reference
-    /// elsewhere in the store (the same cider-ede.24 class <see cref="XpcContainerRuntimeListImagesToleranceTests"/>
-    /// covers for <c>ListImagesAsync</c>) must not turn the sweep's failure into a total
-    /// <c>PruneImagesAsync</c> failure — before the fix, this exception propagated straight out and
-    /// discarded every per-image deletion <c>ImageManager.PruneAsync</c> had already made, so
-    /// `docker image prune -f` came back as a 500 (or, before cider-ede.31 made the sweep unconditional,
-    /// silently skipped every dangling image whose deletion happened to run after this exception's
-    /// spiritual predecessor). The fix degrades the same way <c>ListImagesAsync</c> does: log exactly
-    /// one Warning naming the offending digest and let the call return normally.
-    /// </summary>
-    [Fact]
-    public async Task PruneImagesAsync_ToleratesADanglingContentReferenceInTheSweep_LogsOneWarningAndDoesNotThrow()
-    {
-        var digest = "sha256:" + new string('9', 64);
-        var fake = new RecordingImagesServiceClient();
-        fake.CleanupFailure = XpcException.ApiServer("internalError", $"content with digest {digest}");
-        var logger = new RecordingLogger<XpcContainerRuntime>();
-        var runtime = NewRuntime(fake, new FakeContainerRuntime(), logger);
-        using var _ = runtime;
-
-        // Must not throw: the store-wide sweep failing over unrelated store corruption is not the
-        // caller's failure to report.
-        await runtime.PruneImagesAsync([], CancellationToken.None);
-
-        var warnings = logger.Entries.Where(e => e.Level == LogLevel.Warning).ToList();
-        var warning = Assert.Single(warnings);
-        Assert.Contains(digest, warning.Message, StringComparison.Ordinal);
-    }
-
-    /// <summary>A genuine, non-dangling-content failure from the sweep must still surface — this
-    /// tolerance is narrowly scoped to the one known corruption shape, not "swallow every sweep
-    /// error".</summary>
-    [Fact]
-    public async Task PruneImagesAsync_StillThrows_ForANonDanglingContentFailureInTheSweep()
-    {
-        var fake = new RecordingImagesServiceClient();
-        fake.CleanupFailure = XpcException.ApiServer("internalError", "something else entirely went wrong");
-        var runtime = NewRuntime(fake, new FakeContainerRuntime(), NullLogger<XpcContainerRuntime>.Instance);
-        using var _ = runtime;
-
-        await Assert.ThrowsAsync<RuntimeException>(() => runtime.PruneImagesAsync([], CancellationToken.None));
-    }
+    private static void SeedAlpine(FakeContainerRuntime cliFallback) =>
+        cliFallback.SeedImage(new RuntimeImageDetail
+        {
+            Id = "sha256:" + new string('a', 64),
+            References = ["docker.io/library/alpine:3.19"],
+            Size = 1_000,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
 
     private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient) =>
-        NewRuntime(imagesClient, new FakeContainerRuntime(), NullLogger<XpcContainerRuntime>.Instance);
+        NewRuntime(imagesClient, new FakeContainerRuntime());
 
-    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient, IContainerRuntime cliFallback) =>
-        NewRuntime(imagesClient, cliFallback, NullLogger<XpcContainerRuntime>.Instance);
-
-    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient, IContainerRuntime cliFallback, ILogger<XpcContainerRuntime> logger)
+    private static XpcContainerRuntime NewRuntime(ImagesServiceClient imagesClient, IContainerRuntime cliFallback)
     {
         var options = new AppleContainerOptions();
         var apiserver = new XpcClient("com.apple.container.test.apiserver", NullLogger.Instance);
         var images = new XpcClient("com.apple.container.test.images", NullLogger.Instance);
         var capabilities = new RuntimeCapabilities { Transport = RuntimeTransportKind.Xpc };
         return new XpcContainerRuntime(
-            cliFallback, apiserver, images, capabilities, options, logger, imagesClient);
+            cliFallback, apiserver, images, capabilities, options, NullLogger<XpcContainerRuntime>.Instance, imagesClient);
     }
 
-    /// <summary>Captures every log entry made against it — the same shape
-    /// <c>XpcContainerRuntimeListImagesToleranceTests</c> uses for the analogous <c>ListImagesAsync</c>
-    /// tolerance.</summary>
-    private sealed class RecordingLogger<T> : ILogger<T>
-    {
-        public List<(LogLevel Level, string Message)> Entries { get; } = [];
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-
-        public bool IsEnabled(LogLevel logLevel) => true;
-
-        public void Log<TState>(
-            LogLevel logLevel,
-            EventId eventId,
-            TState state,
-            Exception? exception,
-            Func<TState, Exception?, string> formatter) =>
-            Entries.Add((logLevel, formatter(state, exception)));
-    }
-
-    /// <summary>Records every call it makes, and lets a test hold <c>ImagePullAsync</c> or
-    /// <c>ImageCleanupOrphanedBlobsAsync</c> open on demand (<see cref="ArmPullGate"/>/
-    /// <see cref="ArmSweepGate"/>) to drive the two ordering tests above. Every other override is a
+    /// <summary>Records every call it makes; lets a test hold <c>ImagePullAsync</c> open on demand
+    /// (<see cref="ArmPullGate"/>) and make <c>ImageDeleteAsync</c> report the apiserver unavailable
+    /// (<see cref="DeleteUnavailable"/>), which routes <c>RemoveImageAsync</c> into its CLI fallback —
+    /// the one store-wide sweep left on this transport since cider-ede.41. Every other override is a
     /// bare no-op/empty result — this fake never talks to a real apiserver.</summary>
     private sealed class RecordingImagesServiceClient()
         : ImagesServiceClient(new XpcClient("com.apple.container.test.images.fake", NullLogger.Instance), TimeSpan.FromSeconds(30))
@@ -295,13 +221,11 @@ public sealed class XpcContainerRuntimeRemoveImageTests
         private TaskCompletionSource<bool>? _pullGate;
         private TaskCompletionSource<bool>? _pullBlockedSignal;
 
-        private TaskCompletionSource<bool>? _sweepGate;
-        private TaskCompletionSource<bool>? _sweepBlockedSignal;
-
-        /// <summary>Test hook: makes the next <see cref="ImageCleanupOrphanedBlobsAsync"/> call throw
-        /// this instead of its normal empty result — simulates the apiserver rejecting the sweep
-        /// (a dangling content reference, or any other failure a test wants to arm).</summary>
-        public XpcException? CleanupFailure { get; set; }
+        /// <summary>Test hook: makes every <c>ImageDeleteAsync</c> call throw a transport-level
+        /// "interrupted" <see cref="XpcException"/> (mapped to <c>RuntimeErrorKind.Unavailable</c>),
+        /// so <c>RemoveImageAsync</c> takes its apiserver-unavailable CLI fallback — Apple's
+        /// in-binary sweep, the residual cider-ede.41 documents.</summary>
+        public bool DeleteUnavailable { get; set; }
 
         public void ArmPullGate()
         {
@@ -312,16 +236,6 @@ public sealed class XpcContainerRuntimeRemoveImageTests
         public Task WaitUntilPullBlockedAsync() => _pullBlockedSignal!.Task;
 
         public void ReleasePull() => _pullGate?.TrySetResult(true);
-
-        public void ArmSweepGate()
-        {
-            _sweepGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _sweepBlockedSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        }
-
-        public Task WaitUntilSweepBlockedAsync() => _sweepBlockedSignal!.Task;
-
-        public void ReleaseSweep() => _sweepGate?.TrySetResult(true);
 
         private void Record(string call)
         {
@@ -355,26 +269,13 @@ public sealed class XpcContainerRuntimeRemoveImageTests
 
         public override Task ImageDeleteAsync(string reference, bool garbageCollect, CancellationToken ct)
         {
+            if (DeleteUnavailable)
+            {
+                throw XpcException.Interrupted("simulated apiserver disconnect");
+            }
+
             Record($"ImageDeleteAsync:{reference}:{garbageCollect}");
             return Task.CompletedTask;
-        }
-
-        public override async Task<(IReadOnlyList<string> Digests, ulong ImageSize)> ImageCleanupOrphanedBlobsAsync(CancellationToken ct)
-        {
-            if (CleanupFailure is { } failure)
-            {
-                CleanupFailure = null;
-                throw failure;
-            }
-
-            if (_sweepGate is not null)
-            {
-                _sweepBlockedSignal!.TrySetResult(true);
-                await _sweepGate.Task.ConfigureAwait(false);
-            }
-
-            Record("ImageCleanupOrphanedBlobsAsync");
-            return ((IReadOnlyList<string>)[], 0UL);
         }
     }
 }

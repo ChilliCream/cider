@@ -1070,10 +1070,9 @@ public sealed class ImageManagerTests : IDisposable
         Assert.DoesNotContain("sha256:", delete, StringComparison.Ordinal);
         Assert.Contains("cider-build-", delete, StringComparison.Ordinal);
 
-        // cider-ede.31: the store-wide sweep runs from PruneAsync itself now, exactly once, never
-        // from RemoveImageAsync's own per-image delete (which is what let a sweep race a concurrent
-        // pull/load on every single `rmi` before this fix).
-        Assert.Single(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
+        // cider-ede.41: prune deletes exactly the matched images — it never triggers the store-wide
+        // sweep any more (see PruneAsync_NeverSweepsTheSharedStore_EvenWhenItDeletesNothing).
+        Assert.DoesNotContain(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -1091,51 +1090,84 @@ public sealed class ImageManagerTests : IDisposable
         Assert.DoesNotContain(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// cider-ede.41 (planner-ruled mitigation, option A): the prune path must NEVER run the
+    /// store-wide orphaned-blob sweep — not even when the user explicitly asked to reclaim space.
+    /// The shared Apple store is written by every daemon and client on the machine at once, and a
+    /// sweep in one process deletes another process's just-written, not-yet-committed pull blobs:
+    /// reproduced cross-process in ~2 seconds, with cider-ede.31's in-process gate enabled in BOTH
+    /// daemons, by a prune whose filter matched nothing at all (commit d63644b — the designated
+    /// negative control for this very test's mechanism). This mirrors that experiment at the unit
+    /// seam: a prune with a never-matching label filter deletes nothing and must invoke no runtime
+    /// call that could touch the store's blobs — no per-image delete, and no sweep.
+    /// </summary>
     [Fact]
-    public async Task PruneAsync_WhenNothingIsDeleted_StillSweepsTheStoreExactlyOnce()
+    public async Task PruneAsync_NeverSweepsTheSharedStore_EvenWhenItDeletesNothing()
     {
-        // cider-ede.31 correction: PruneImagesAsync is the *only* reclaim path in the codebase — a
-        // prune that deletes nothing (the default dangling-only prune against a fixture with no
-        // dangling images) must still sweep, or blobs orphaned by an earlier plain `rmi` (which no
-        // longer sweeps at all, fix direction §1/§2) become permanently unreclaimable. "Only where the
-        // user explicitly asked to reclaim space" means gated on the *prune request*, not on whether
-        // this particular call happened to find something dangling.
         var (manager, runtime) = CreateManager();
 
-        var response = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
+        var response = await manager.PruneAsync(
+            Filters.Parse("""{"label":["cider-ede41-never-matches"]}"""), CancellationToken.None);
 
         Assert.Empty(response.ImagesDeleted);
-        Assert.Single(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
+        Assert.Equal(0, response.SpaceReclaimed);
+        Assert.DoesNotContain(runtime.Calls, c => c.StartsWith("RemoveImageAsync:", StringComparison.Ordinal));
+        Assert.DoesNotContain(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
     }
 
     /// <summary>
-    /// cider-ehn: the XPC transport's fallback scoped reclaim needs to know exactly which images this
-    /// prune call itself just deleted, to scope a reclaim to only their blobs when the whole-store
-    /// sweep fails. <see cref="ImageManager"/> is transport-agnostic and has no candidate-digest logic
-    /// of its own — it only has to forward what it already knows (<c>RuntimeImage.IndexDigests</c>) to
-    /// the runtime seam member that does.
+    /// cider-ede.41 implementation requirement 1, the honesty rule: SpaceReclaimed reports what was
+    /// actually freed from disk, never a fabricated number. On a transport whose delete drops only
+    /// the index reference and frees no blobs (the XPC transport; this fake's default), a prune that
+    /// deleted an image still physically reclaimed nothing — the user reclaims disk with Apple's own
+    /// `container image prune` — so it must report 0.
     /// </summary>
     [Fact]
-    public async Task PruneAsync_ForwardsTheDeletedImagesIndexDigestsToPruneImagesAsync()
+    public async Task PruneAsync_ReportsZeroSpaceReclaimed_WhenTheRuntimesDeleteFreesNoBlobs()
     {
         var (manager, runtime) = CreateManager();
-        var indexDigest = "sha256:" + new string('e', 64);
+        var imageId = "sha256:" + new string('c', 64);
         runtime.SeedImage(new RuntimeImageDetail
         {
-            Id = "sha256:" + new string('c', 64),
-            IndexDigests = [indexDigest],
+            Id = imageId,
             References = [SyntheticBuildTag.New()],
-            Size = 1_000,
+            Size = 12_345,
             Created = DateTimeOffset.UtcNow,
             Config = new ImageConfig(),
             Architecture = "arm64",
             Os = "linux",
         });
 
-        await manager.PruneAsync(Filters.Empty, CancellationToken.None);
+        var response = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
 
-        var pruneCall = Assert.Single(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
-        Assert.Equal($"PruneImagesAsync:{indexDigest}", pruneCall);
+        Assert.Single(response.ImagesDeleted, i => i.Deleted == imageId);
+        Assert.Equal(0, response.SpaceReclaimed);
+    }
+
+    /// <summary>The other half of the honesty rule: a transport whose delete genuinely frees the
+    /// image's blobs (the CLI transport — Apple's `container image delete` sweeps inside its own
+    /// binary) may count the deleted images' sizes.</summary>
+    [Fact]
+    public async Task PruneAsync_CountsDeletedImageSizes_WhenTheRuntimesDeleteFreesBlobs()
+    {
+        var (manager, runtime) = CreateManager();
+        runtime.RemoveImageReclaimsBlobs = true;
+        var imageId = "sha256:" + new string('c', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = imageId,
+            References = [SyntheticBuildTag.New()],
+            Size = 12_345,
+            Created = DateTimeOffset.UtcNow,
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+
+        var response = await manager.PruneAsync(Filters.Empty, CancellationToken.None);
+
+        Assert.Single(response.ImagesDeleted, i => i.Deleted == imageId);
+        Assert.Equal(12_345, response.SpaceReclaimed);
     }
 
     [Fact]
@@ -1176,9 +1208,9 @@ public sealed class ImageManagerTests : IDisposable
         Assert.Contains(removeCalls, c => c.Contains(tagA, StringComparison.Ordinal));
         Assert.Contains(removeCalls, c => c.Contains(tagB, StringComparison.Ordinal));
 
-        // cider-ede.31: two underlying deletes from this one prune call still sweep exactly once —
-        // "exactly once per prune", not once per image it happens to remove along the way.
-        Assert.Single(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
+        // cider-ede.41: two underlying deletes from this one prune call still never sweep — the
+        // store-wide sweep is gone from the prune path entirely.
+        Assert.DoesNotContain(runtime.Calls, c => c.StartsWith("PruneImagesAsync:", StringComparison.Ordinal));
 
         var ex = await Assert.ThrowsAsync<DockerApiException>(
             () => manager.InspectAsync(imageId, CancellationToken.None));

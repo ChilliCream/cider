@@ -32,9 +32,11 @@ namespace Cider.AppleContainer.Xpc;
 /// </remarks>
 internal sealed partial class XpcContainerRuntime
 {
-    /// <summary>Gates this runtime's own pulls/loads/builds against its own store-wide sweep
-    /// (<see cref="PruneImagesAsync"/>, and the apiserver-unavailable delete fallback in
-    /// <see cref="RemoveImageAsync"/>) — see <see cref="BlobSweepGate"/>'s own doc comment
+    /// <summary>Gates this runtime's own pulls/loads/builds against the one store-wide sweep left
+    /// on this transport: the apiserver-unavailable CLI delete fallback in
+    /// <see cref="RemoveImageAsync"/> (cider-ede.41 removed the prune-path sweep entirely — see the
+    /// prevention comment where <c>PruneImagesAsync</c> used to live) — see
+    /// <see cref="BlobSweepGate"/>'s own doc comment
     /// (cider-ede.31). <c>BuildImageAsync</c> (<c>XpcContainerRuntime.cs</c>'s // FALLBACK block) enters
     /// this same instance before delegating to the CLI (cider-ede.31 correction: it was the one write
     /// path on this transport left ungated, since it does not go through <c>_imagesClient</c> like the
@@ -563,7 +565,8 @@ internal sealed partial class XpcContainerRuntime
         var ociPlatform = ParseOciPlatform(platform);
 
         // cider-ede.31: a pull writes blobs before its index entry is committed — it must never run
-        // while a store-wide sweep (PruneImagesAsync, or the delete fallback below) is in flight.
+        // while a store-wide sweep (the apiserver-unavailable CLI delete fallback below — this
+        // transport's only remaining sweep since cider-ede.41) is in flight.
         await using var write = await _blobSweepGate.EnterImageWriteAsync(ct).ConfigureAwait(false);
 
         try
@@ -692,9 +695,11 @@ internal sealed partial class XpcContainerRuntime
     /// scoped to the image just deleted — run on every single <c>rmi</c> from a daemon serving
     /// concurrent clients, it kept a race window open permanently against any pull/load that had
     /// written blobs but not yet committed its index entry (cider-ede.31: corrupted the store twice in
-    /// one day this way). The sweep now runs only from <see cref="PruneImagesAsync"/>, where the user
-    /// explicitly asked to reclaim space. Leaving this image's now-unreferenced blobs in place until
-    /// then costs disk, not correctness. <paramref name="force"/> mirrors the CLI transport's own
+    /// one day this way). Since cider-ede.41 the sweep does not run from cider at all — not even on
+    /// prune (see the prevention comment below): a sweep from any one process deletes another
+    /// process's mid-write pull blobs in the shared store. Leaving this image's now-unreferenced
+    /// blobs in place costs disk, not correctness; the user reclaims them with Apple's own
+    /// <c>container image prune</c>. <paramref name="force"/> mirrors the CLI transport's own
     /// asymmetry with Docker's <c>-f</c> (<c>AppleContainerRuntime.Images.cs</c>'s
     /// <c>RemoveImageAsync</c> comment: Apple's <c>-f</c> means "ignore images that are not found", not
     /// "remove anyway") — a <c>notFound</c> is swallowed only when <paramref name="force"/> is set.
@@ -711,12 +716,18 @@ internal sealed partial class XpcContainerRuntime
         {
             WarnFallback("imageDelete", ex);
 
-            // Apple's own `container image delete` CLI always sweeps internally, as one step of its
-            // single process invocation (ImageDelete.swift, confirmed via `container image delete
-            // --help` — no flag skips it) — unlike the primary path just above, this genuinely is a
-            // sweep from this daemon's point of view, so it takes the gate exclusively, the same as
-            // PruneImagesAsync, rather than running unguarded against this runtime's own concurrent
-            // pulls/loads.
+            // RESIDUAL SWEEP (cider-ede.41 implementation requirement 2 — documented, not silent):
+            // Apple's own `container image delete` CLI always sweeps the whole content store
+            // internally, as one step of its single-process invocation (ImageDelete.swift, confirmed
+            // via `container image delete --help` — no flag skips it). cider removed its own
+            // store-wide sweep from the prune path entirely (see the prevention comment below): a
+            // sweep is only safe under machine-wide quiescence, which no process can establish on the
+            // shared store. This fallback, though, shells to Apple's binary, whose in-binary sweep
+            // cannot be disabled from outside — so on the rare apiserver-unavailable path an rmi
+            // still carries Apple's sweep and can still race another process's mid-write pull exactly
+            // as cider-ede.41's d63644b experiment reproduced. Accepted as a residual (the
+            // alternative is no delete at all while the apiserver is down); it takes the gate
+            // exclusively so it at least cannot race THIS daemon's own concurrent pulls/loads/builds.
             await using var sweep = await _blobSweepGate.EnterSweepAsync(ct).ConfigureAwait(false);
             await _cliFallback.RemoveImageAsync(reference, force, ct).ConfigureAwait(false);
             return;
@@ -731,354 +742,26 @@ internal sealed partial class XpcContainerRuntime
         }
     });
 
-    /// <summary>
-    /// The store-wide sweep, moved here off the per-<c>rmi</c> delete path (cider-ede.31 fix direction
-    /// §2): called only from <c>ImageManager.PruneAsync</c> (<c>docker image/system prune</c>), where a
-    /// sweep is what the user explicitly asked for, and takes <see cref="_blobSweepGate"/> exclusively
-    /// so it cannot overlap this runtime's own in-flight pulls/loads (fix direction §3). Logs at
-    /// Information what it reclaimed (fix direction §4: "so the next occurrence is attributable rather
-    /// than mysterious") — <c>Debug</c> when it reclaimed nothing, so a routine prune of an
-    /// already-clean store does not spam the log.
-    ///
-    /// cider-ehn: when the sweep fails on a pre-existing dangling content reference elsewhere in the
-    /// store (the cider-bci catch below), it is tried first because it is cheaper and
-    /// Apple-authoritative, but it is all-or-nothing — that one unrelated corruption means *nothing*
-    /// gets reclaimed, including blobs <paramref name="deletedImageDigests"/> itself just orphaned a
-    /// moment ago. <see cref="TryScopedReclaimAsync"/> is the fallback for exactly that case: a scoped,
-    /// client-side <c>contentDelete</c> of only those blobs, run under this same
-    /// <see cref="_blobSweepGate"/> scope (fix direction §4) and never inferring "orphaned" from an
-    /// absence (see that method's own doc comment for the binding safety rule).
-    /// </summary>
-    public Task PruneImagesAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct) => GuardAsync(async () =>
-    {
-        await using var sweep = await _blobSweepGate.EnterSweepAsync(ct).ConfigureAwait(false);
-
-        try
-        {
-            var (digests, imageSize) = await _imagesClient.ImageCleanupOrphanedBlobsAsync(ct).ConfigureAwait(false);
-            if (digests.Count > 0)
-            {
-                _logger.LogInformation(
-                    "image prune: reclaimed {Count} orphaned blob(s), {Size} byte(s) via the whole-store sweep", digests.Count, imageSize);
-            }
-            else
-            {
-                _logger.LogDebug("image prune: no orphaned blobs to reclaim");
-            }
-        }
-        catch (XpcException ex) when (IsUnavailable(ex))
-        {
-            // No CLI-transport equivalent to fall back to here: the CLI's own `container image
-            // delete` already swept once per target inside RemoveImageAsync's own fallback branch
-            // above, whenever the apiserver was unavailable for *that* call — there is nothing left
-            // for this call to additionally reclaim over the CLI.
-            WarnFallback("imageCleanupOrphanedBlobs", ex);
-        }
-        catch (XpcException ex) when (CliErrorMapper.IsDanglingContent(ex.Message))
-        {
-            // cider-bci: unlike a per-image `imageDelete`, this sweep walks every blob in the whole
-            // store — including ones from images this daemon never touched — so one pre-existing
-            // dangling/unresolvable content reference elsewhere in the store (cider-ede.24's own class
-            // of corruption, which cider must tolerate and never repair) fails the sweep every single
-            // time, even on a store that otherwise has nothing wrong with it. Before this, that turned
-            // *every* `docker image prune` into a total failure (500), discarding the per-image
-            // deletions `ImageManager.PruneAsync` had already made above — the same "never turn a
-            // success into a failure" rule ListImagesAsync's own dangling-content tolerance follows
-            // (this file's own doc comment credits it to cider-ede.24). Reclaiming orphaned blobs is a
-            // nicety on top of those deletions, not their contract, so this degrades the same way
-            // ListImagesAsync does: log once, at the same Warning level and with the same
-            // operator-facing remedy text, and let the prune otherwise report success.
-            var digest = CliErrorMapper.ExtractDanglingDigest(ex.Message) ?? ex.Message;
-            _logger.LogWarning("{Message}", CliErrorMapper.DanglingContentRemedy(digest));
-
-            // cider-ehn fallback: try to reclaim exactly the blobs this call's own deletions just
-            // orphaned, even though the whole-store sweep above could not run at all.
-            await TryScopedReclaimAsync(deletedImageDigests, ct).ConfigureAwait(false);
-        }
-        catch (XpcException ex)
-        {
-            throw ex.ToRuntimeException("image prune");
-        }
-    });
-
-    /// <summary>
-    /// cider-ehn's scoped fallback, entered only when <see cref="PruneImagesAsync"/>'s whole-store
-    /// sweep failed on a pre-existing dangling content reference elsewhere in the store.
-    /// <paramref name="deletedImageDigests"/> are the raw index digests (<c>RuntimeImage.IndexDigests</c>)
-    /// of the images <c>ImageManager.PruneAsync</c> just finished deleting via <c>imageDelete</c> in
-    /// this same call — <c>garbageCollect: false</c> (<see cref="RemoveImageAsync"/>'s own doc comment)
-    /// leaves every blob those images' manifests named still resolvable via <c>contentGet</c>, only the
-    /// index *reference* itself is gone, so <see cref="CollectManifestDigestsAsync"/> can still walk
-    /// them here exactly as <see cref="LoadBlobsAsync"/> would for a live listing (same
-    /// <see cref="GetBlobAsync{T}"/> primitive — no second content-read path).
-    ///
-    /// <para>
-    /// <b>THE SAFETY RULE — binding, planner-ruled (task cider-ehn's own description).</b> Deleting a
-    /// blob by digest is irreversible, and the only valid proof that one is safe to delete is a
-    /// positive one: every image the store still lists was enumerated, its manifest was actually read,
-    /// and none of them names that digest. An absence of evidence — a remaining image this method
-    /// could not enumerate, or one whose index or manifest failed to resolve — is never allowed to
-    /// stand in for that proof. So: if listing the store's current images fails, or if any *remaining*
-    /// image's index or manifest cannot be resolved, this method deletes nothing at all — not even the
-    /// candidate digests it could otherwise fully account for — and makes zero
-    /// <see cref="ImagesServiceClient.ContentDeleteAsync"/> calls. This is strictly more conservative
-    /// on a corrupted store, not a limitation to work around: the corrupted-store case this whole task
-    /// exists to survive is exactly the case where a remaining image's manifest is unreadable, and that
-    /// unreadable entry is precisely the one that might reference the blobs a reclaim would otherwise
-    /// target. Do not weaken this to "prove non-reference only against readable entries" — that
-    /// narrower rule was explicitly considered and rejected: it would delete blobs belonging to the
-    /// very image whose entry is dangling.
-    /// </para>
-    /// <para>
-    /// Any other unexpected failure while gathering that proof (the images service going away
-    /// mid-walk, an XPC error unrelated to a single missing blob, a malformed reply that throws
-    /// during JSON deserialization rather than as an <see cref="XpcException"/>) is treated the same
-    /// way — caught, logged, and answered with zero deletions — rather than turning this best-effort
-    /// fallback into a second way for <c>docker image prune</c> to 500.
-    /// </para>
-    /// <para>
-    /// <b>cider-6dw MEASUREMENT: this method aborts as soon as any one *remaining* image has a
-    /// platform variant that was never fetched — true of any ordinary multi-arch registry pull.</b>
-    /// This is a direct, intended consequence of the safety rule above, not a separate bug — recorded
-    /// here because nothing about the code otherwise says so, and this method existed for a while
-    /// described only as "the fallback" with no note of how narrow its bound is.
-    /// <see cref="CollectManifestDigestsAsync"/> requires every real-platform manifest of every
-    /// *remaining* image to resolve, but a real single-platform pull only ever fetches one platform's
-    /// manifest — every other platform an ordinary multi-arch index lists (nearly every official
-    /// docker.io image) is a digest that was never fetched and so never resolves locally. One such
-    /// remaining image is enough to abort the whole method. Proven with the real, verbatim
-    /// manifest-list digests of a genuine <c>docker.io/library/alpine:3.22</c> pull on this machine —
-    /// captured from that pull and confirmed against
-    /// <c>~/Library/Application Support/com.apple.container/content/blobs/sha256</c> to see which
-    /// manifests are actually present (only arm64's) and which are not (amd64/arm-v6/arm-v7/386/
-    /// ppc64le/riscv64/s390x) — then driven through the fake <see cref="ImagesServiceClient"/> seam
-    /// the cider-ehn tests use
-    /// (<see cref="XpcContainerRuntimePruneScopedReclaimTests.PruneImagesAsync_ScopedFallback_AbortsOnARealisticMultiArchRemainingImage"/>
-    /// in Cider.Tests), which confirms this method aborts, exactly as the safety rule requires. This
-    /// was not run as a daemon-level end-to-end reclaim. In practice this method therefore reclaims
-    /// nothing on any store that still holds
-    /// an ordinary multi-arch image pulled from a registry. It can still fire when every *remaining*
-    /// image resolves fully — a store holding only single-platform images (locally built, committed, or
-    /// imported) or no remaining image at all — as
-    /// <see cref="XpcContainerRuntimePruneScopedReclaimTests.PruneImagesAsync_ScopedFallback_ExcludesADigestStillReferencedByARemainingImage"/>
-    /// demonstrates by fixture. Do not read this as license to weaken the rule; it is the accepted cost
-    /// of the rule being correct, recorded so nobody mistakes silence in the logs for the fallback
-    /// quietly doing its job, or mistakes its narrow bound for it never doing its job at all.
-    /// </para>
-    /// <para>
-    /// <b>THIS IS BY DESIGN — not a limitation, not a bug, not a knob to tune.</b> On any store
-    /// that still holds an ordinary multi-arch remaining image, this method cannot fire under normal
-    /// conditions, full stop — that is not an incidental side effect of over-conservative code
-    /// waiting for someone to loosen it, it is the correct output of the safety rule above applied to
-    /// data that genuinely does not support the positive proof the rule requires. The <em>only</em> way
-    /// to make this method fire in that situation is to relax the non-reference proof — and that
-    /// relaxed version is exactly the one <c>task cider-ehn</c>'s planner ruling already considered and
-    /// REJECTED, not an untried idea waiting for a better implementation.
-    /// </para>
-    /// <para>
-    /// <b>The rejected counter-argument, recorded so it is not re-derived.</b> "An unfetched variant's
-    /// layers were never pulled, so they cannot reference an existing blob" — this sounds like it
-    /// closes the gap, and it does not. Layers are shared between images (two multi-arch images can
-    /// pull the same base and land the identical layer digest), so a variant manifest being absent does
-    /// not bound which layer digests were ever in play. Worse: a manifest that is absent because it was
-    /// <em>lost</em> while its variant <em>was</em> pulled is, from every signal this method or
-    /// <see cref="CollectManifestDigestsAsync"/> can observe, indistinguishable from one that was never
-    /// fetched at all — there is no "we meant to have this" flag anywhere in the store. Treating
-    /// "never fetched" as safe to ignore would, on that indistinguishable lost-manifest case, delete
-    /// blobs belonging to the very image whose entry is already damaged — which is precisely the
-    /// failure this method exists to survive, because that failure is exactly the case where
-    /// non-reference cannot be proven. A missing blob is not gracefully recoverable here either: a
-    /// single dangling content reference has taken <c>container image ls</c> down machine-wide
-    /// (observed directly on this machine). The abort stands.
-    /// </para>
-    /// <para>
-    /// If you are reading this because you want the corrupted-store case actually covered — every
-    /// remaining image reliably reclaimable even when one of them is damaged — the fix is not here.
-    /// It is upstream: Apple's whole-store sweep and <c>container image ls</c> are both all-or-nothing
-    /// on a single bad entry instead of skipping it with a warning, and that is what would need to
-    /// change, in <c>apple/container</c>, not in this method.
-    /// </para>
-    /// </summary>
-    private async Task TryScopedReclaimAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct)
-    {
-        if (deletedImageDigests.Count == 0)
-        {
-            return;
-        }
-
-        try
-        {
-            var candidates = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var digest in deletedImageDigests)
-            {
-                // Best-effort: a deleted image's own index/manifest failing to resolve just means it
-                // contributes no candidates (a smaller, still-safe set) — this is not the
-                // safety-critical half of this method; the walk over *remaining* images below is.
-                await CollectManifestDigestsAsync(digest, candidates, ct).ConfigureAwait(false);
-            }
-
-            if (candidates.Count == 0)
-            {
-                _logger.LogDebug("image prune (scoped fallback): no blob digests recovered from the deleted image(s); nothing to reclaim");
-                return;
-            }
-
-            var remaining = await _imagesClient.ImageListAsync(ct).ConfigureAwait(false);
-            var keep = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var group in GroupByDigest(remaining))
-            {
-                var digest = group[0].Descriptor.Digest;
-                if (!await CollectManifestDigestsAsync(digest, keep, ct).ConfigureAwait(false))
-                {
-                    // Safety rule: one remaining image whose index/manifest cannot be read means
-                    // non-reference cannot be proven for *any* candidate, not just the ones that
-                    // particular manifest might have named. Delete nothing.
-                    _logger.LogWarning(
-                        "image prune (scoped fallback): a remaining image's manifest could not be read, so " +
-                        "non-reference cannot be proven for any candidate blob; deleting nothing (this is the " +
-                        "intended, more conservative behaviour on a store with an unresolvable reference, not a bug)");
-                    return;
-                }
-            }
-
-            candidates.ExceptWith(keep);
-            if (candidates.Count == 0)
-            {
-                _logger.LogDebug("image prune (scoped fallback): every candidate blob is still referenced by a remaining image; nothing to reclaim");
-                return;
-            }
-
-            var (reclaimedDigests, imageSize) = await _imagesClient.ContentDeleteAsync([.. candidates], ct).ConfigureAwait(false);
-            _logger.LogInformation(
-                "image prune (scoped fallback): reclaimed {Count} orphaned blob(s), {Size} byte(s) after the whole-store sweep failed",
-                reclaimedDigests.Count, imageSize);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger.LogWarning(ex, "image prune (scoped fallback): could not complete the scoped reclaim; deleting nothing");
-        }
-    }
-
-    /// <summary>
-    /// Walks one image's index → real-platform manifests (§6, the same <c>contentGet</c> + local file
-    /// read <see cref="LoadBlobsAsync"/> uses), harvesting every manifest's <c>config.digest</c> and
-    /// <c>layers[].digest</c> into <paramref name="into"/> — no need to also fetch the config blob
-    /// itself, since cider-ehn's fix direction only reclaims "the config and layer digests reachable
-    /// from the manifests", both of which are named directly in the manifest already in hand.
-    /// Returns <c>false</c> the instant the index, or any real-platform manifest, fails to resolve —
-    /// <see cref="TryScopedReclaimAsync"/> treats that as fatal to the *whole* reclaim when walking a
-    /// remaining image (the safety rule its own doc comment states), and as "this one image
-    /// contributes nothing" when walking a deleted image.
-    /// <para>
-    /// A blob that parses but yields no config/layer digest is not proof; return false. Concretely:
-    /// if the digest does not resolve to an index shape at all (<see cref="OciIndex.Manifests"/> is
-    /// null — either the blob failed to resolve, or it parsed as something else entirely), the same
-    /// digest is re-read as a bare <see cref="AppleOciManifest"/> — a legitimately single-manifest
-    /// image with no index wrapper still counts as proof as long as it names a config or layer
-    /// digest; anything else does not, and this returns false. And when the index does resolve but
-    /// every one of its entries is attestation-only (<see cref="RealVariants"/> comes back empty),
-    /// that is also not proof — nothing about the image was positively accounted for — so this
-    /// returns false rather than silently treating an attestation-only index as a fully-walked,
-    /// content-free image.
-    /// </para>
-    /// <para>
-    /// cider-6dw: "every real-platform manifest" is the reason <see cref="TryScopedReclaimAsync"/>
-    /// aborts on any store still holding an ordinary multi-arch *remaining* image — see the
-    /// measurement recorded on that method's own doc comment. A real multi-arch pull leaves every
-    /// non-pulled platform's manifest digest genuinely unresolvable, so this returns <c>false</c> for
-    /// that image, by design. But an index with only one platform manifest listed — the shape a
-    /// locally built or imported single-platform image has — returns <c>true</c> as long as that one
-    /// manifest is on disk, since every real-platform manifest the index names did resolve; this is
-    /// the case that lets <see cref="TryScopedReclaimAsync"/> still fire.
-    /// </para>
-    /// </summary>
-    private async Task<bool> CollectManifestDigestsAsync(string? digest, HashSet<string> into, CancellationToken ct)
-    {
-        var index = await GetBlobAsync<OciIndex>(digest, ct).ConfigureAwait(false);
-        if (index?.Manifests is null)
-        {
-            return await CollectBareManifestDigestsAsync(digest, into, ct).ConfigureAwait(false);
-        }
-
-        var variants = RealVariants(index);
-        if (variants.Count == 0)
-        {
-            return false;
-        }
-
-        var complete = true;
-        foreach (var variant in variants)
-        {
-            if (variant.Digest is not { Length: > 0 } variantDigest)
-            {
-                complete = false;
-                continue;
-            }
-
-            var manifest = await GetBlobAsync<AppleOciManifest>(variantDigest, ct).ConfigureAwait(false);
-            if (manifest is null)
-            {
-                complete = false;
-                continue;
-            }
-
-            if (manifest.Config?.Digest is { Length: > 0 } configDigest)
-            {
-                into.Add(configDigest);
-            }
-
-            if (manifest.Layers is { Count: > 0 } layers)
-            {
-                foreach (var layer in layers)
-                {
-                    if (layer.Digest is { Length: > 0 } layerDigest)
-                    {
-                        into.Add(layerDigest);
-                    }
-                }
-            }
-        }
-
-        return complete;
-    }
-
-    /// <summary>
-    /// The fallback half of <see cref="CollectManifestDigestsAsync"/>: <paramref name="digest"/> did
-    /// not resolve to an index shape, so re-read the same digest as a bare
-    /// <see cref="AppleOciManifest"/> directly — a legitimately single-manifest image (no index
-    /// wrapper at all) still walks and still counts as proof. Only actually harvesting a config or
-    /// layer digest counts as proof; a manifest that resolves but names neither (or a digest that
-    /// does not resolve as a manifest either) returns false the same as an unreadable index would.
-    /// </summary>
-    private async Task<bool> CollectBareManifestDigestsAsync(string? digest, HashSet<string> into, CancellationToken ct)
-    {
-        var manifest = await GetBlobAsync<AppleOciManifest>(digest, ct).ConfigureAwait(false);
-        if (manifest is null)
-        {
-            return false;
-        }
-
-        var harvested = false;
-        if (manifest.Config?.Digest is { Length: > 0 } configDigest)
-        {
-            into.Add(configDigest);
-            harvested = true;
-        }
-
-        if (manifest.Layers is { Count: > 0 } layers)
-        {
-            foreach (var layer in layers)
-            {
-                if (layer.Digest is { Length: > 0 } layerDigest)
-                {
-                    into.Add(layerDigest);
-                    harvested = true;
-                }
-            }
-        }
-
-        return harvested;
-    }
+    // cider-ede.41 — THE STORE-WIDE SWEEP IS GONE, BY DESIGN; DO NOT PUT IT BACK. This is where
+    // PruneImagesAsync (the `imageCleanupOrphanedBlobs` whole-store sweep, plus cider-ehn's scoped
+    // `contentDelete` fallback) lived until cider-ede.41's planner ruling removed the sweep from the
+    // prune path entirely (option A). The Apple content store is machine-global — shared by every
+    // cider daemon, Apple's own CLI, and any other client at once — and `imageCleanupOrphanedBlobs`
+    // treats ANOTHER process's just-written, not-yet-committed pull blobs as orphans and deletes
+    // them. The strongest counter-argument — "_blobSweepGate serializes the sweep against this
+    // daemon's writes, so the sweep is safe" — is refuted by experiment: the gate is process-local,
+    // and with it ENABLED in both daemons, a two-daemon race (one pulling redis:8.6, one looping
+    // `docker image prune -f` with a never-matching filter, so the sweep was the only store-touching
+    // verb) left a dangling index entry on the FIRST cycle, ~2 seconds in (cider-ede.41, commit
+    // d63644b) — the same end state as all three real corruptions observed on this machine.
+    // cider-ehn's scoped fallback went with it: its non-reference proof can only enumerate THIS
+    // process's view of the store, so it is exposed to the same cross-process window (and cider-6dw
+    // measured that it cannot fire on a normal store anyway). Prune still deletes matched images
+    // (ImageManager.PruneAsync → RemoveImageAsync, `imageDelete` garbageCollect:false — a reference
+    // drop, never a sweep); physical blob reclaim is delegated to the user running Apple's own
+    // `container image prune` on a quiet machine. The one sweep left on this transport is the
+    // apiserver-unavailable CLI delete fallback in RemoveImageAsync above — Apple's in-binary sweep,
+    // documented there as a residual.
 
     /// <summary>
     /// <c>imageList</c> to resolve each reference to its <see cref="ImageDescription"/>, then

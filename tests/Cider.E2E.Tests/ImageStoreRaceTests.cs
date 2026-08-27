@@ -650,12 +650,19 @@ public sealed class CrossProcessImageStoreRaceCollection
 /// image prune</c> in a loop. BOTH daemons run with the cider-ede.31 gate ENABLED, in its normal
 /// default configuration — the point is precisely that two correctly-gated daemons should still be
 /// able to corrupt the store across the process boundary if the hypothesis is right. Both daemons
-/// are pinned to the XPC transport: prune's store-wide sweep
-/// (<c>XpcContainerRuntime.PruneImagesAsync</c> → <c>imageCleanupOrphanedBlobs</c>) only exists
-/// there (the CLI transport's <c>PruneImagesAsync</c> is the interface default no-op — its sweep
-/// rides on <c>image delete</c> instead), and daemon A's per-cycle <c>rmi</c> is
-/// <c>imageDelete(garbageCollect: false)</c> on XPC — no sweep — so daemon B's prune is the ONE
-/// sweeping verb in the whole experiment and any interference is attributable to it alone.
+/// are pinned to the XPC transport: at the time of the d63644b reproduction, prune's store-wide
+/// sweep (<c>XpcContainerRuntime.PruneImagesAsync</c> → <c>imageCleanupOrphanedBlobs</c>) only
+/// existed there, and daemon A's per-cycle <c>rmi</c> is <c>imageDelete(garbageCollect: false)</c>
+/// on XPC — no sweep — so daemon B's prune was the ONE sweeping verb in the whole experiment and
+/// any interference was attributable to it alone.
+///
+/// cider-ede.41 MITIGATION SHIPPED SINCE THAT REPRODUCTION (planner ruling, option A): the prune
+/// path no longer sweeps at all, on either transport — <c>PruneImagesAsync</c> is gone (see the
+/// prevention comment in <c>XpcContainerRuntime.Images.cs</c>). d63644b IS the designated negative
+/// control (corruption on cycle 1, ~2s in, both gates enabled); the post-fix verification
+/// (ruling requirement 6) is THIS SAME experiment at the full 900s budget, expected to run 0
+/// incidents with a clean post-run index scan — sequenced, user-authorized, AFTER the operator has
+/// repaired the store d63644b deliberately left broken, on a quiet machine.
 ///
 /// FAILURE CRITERION, stated up front (the ticket's, verbatim): a dangling entry appears — an index
 /// entry in the shared store's <c>state.json</c> whose digest has no blob file under

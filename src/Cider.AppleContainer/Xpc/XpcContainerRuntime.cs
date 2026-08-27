@@ -542,7 +542,8 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     // RemoveImageAsync/SaveImagesAsync/LoadImagesAsync are ported — see XpcContainerRuntime.Images.cs
     // (task cider-ede.10). BuildImageAsync stays on the CLI (classic builder, task's non-goals) — but
     // still enters _blobSweepGate here first (cider-ede.31 correction: a build commits new content the
-    // same way a pull/load does, and was the one write path left ungated against PruneImagesAsync) —
+    // same way a pull/load does, and was the one write path left ungated against the transport's
+    // sweep) —
     // and LoginAsync stays on the CLI (registry login stores credentials the images service reads, fix
     // direction §2) — neither delegation itself is this task's job. ExecAsync is ported — see
     // XpcContainerRuntime.Process.cs/XpcContainerProcess.cs (task cider-ede.8). GetBuilderStatusAsync/
@@ -553,7 +554,8 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
     /// Delegates straight to <see cref="_cliFallback"/> (classic builder, cider-ede.5's non-goals), but
     /// must enter <see cref="_blobSweepGate"/> as a write first (cider-ede.31 correction): a build
     /// commits new content the same way a pull/load does, and this was the one XPC-transport write path
-    /// left ungated against <see cref="PruneImagesAsync"/> — the live store corruption this fixed twice
+    /// left ungated against the transport's sweep (then the prune-path sweep; since cider-ede.41 only
+    /// <see cref="RemoveImageAsync"/>'s CLI delete fallback) — the live store corruption this fixed twice
     /// (alpine:3.19, then redis:8.6) could equally have raced a build instead of a pull.
     /// </summary>
     public Task<string> BuildImageAsync(BuildSpec spec, IProgress<ProgressEvent> progress, CancellationToken ct) =>

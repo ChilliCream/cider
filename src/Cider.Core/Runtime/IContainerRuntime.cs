@@ -81,28 +81,21 @@ public interface IContainerRuntime
     Task RemoveImageAsync(string reference, bool force, CancellationToken ct);
 
     /// <summary>
-    /// Runs a store-wide reclaim of blobs no reference points at any more (cider-ede.31 fix direction
-    /// §2) — called only from <c>ImageManager.PruneAsync</c> (<c>docker image/system prune</c>), never
-    /// per-<c>rmi</c>: a sweep this broad racing a concurrent pull/load that has written blobs but not
-    /// yet committed its index entry is exactly what corrupted the store twice in one day
-    /// (cider-ede.31's own evidence). Defaults to a no-op so every implementation that has no separate
-    /// sweep step to defer — the CLI transport, test fakes — keeps today's behaviour unchanged: the CLI
-    /// transport's own <c>RemoveImageAsync</c> already reclaims a deleted image's blobs as an
-    /// unavoidable side effect of the underlying <c>container image delete</c> process (Apple's own
-    /// <c>ImageDelete.swift</c> sweeps inside that same one-shot invocation; there is no flag to skip
-    /// it), so there is nothing left for this call to additionally do there.
+    /// Whether this runtime's <see cref="RemoveImageAsync"/> physically frees the deleted image's
+    /// blobs from the content store as part of the delete itself. <c>docker image prune</c> reads it
+    /// to report an honest <c>SpaceReclaimed</c> (cider-ede.41 implementation requirement 1): the CLI
+    /// transport's delete sweeps inside Apple's own <c>container image delete</c> binary and genuinely
+    /// frees disk (<c>true</c> there); the XPC transport deletes with <c>garbageCollect:false</c> and
+    /// physically reclaims nothing (this default, <c>false</c>).
+    ///
+    /// There is deliberately NO store-wide sweep member on this interface any more (the removed
+    /// <c>PruneImagesAsync</c>): a sweep run from any one process deletes another process's
+    /// just-written, not-yet-committed pull blobs in the shared Apple store — reproduced in ~2s with
+    /// cider-ede.31's in-process gate enabled in both daemons (cider-ede.41, commit d63644b) — and was
+    /// removed by planner ruling (option A). Do not re-add one; physical blob reclaim is the user
+    /// running Apple's own <c>container image prune</c>.
     /// </summary>
-    /// <param name="deletedImageDigests">
-    /// The <c>RuntimeImage.IndexDigests</c> of every image <c>PruneAsync</c> just finished deleting in
-    /// this same call, if any (cider-ehn) — the seam a transport that has no whole-store enumeration
-    /// route at all needs to scope a fallback, narrower reclaim to exactly the blobs this call itself
-    /// may have just orphaned, when the store-wide sweep above fails on unrelated corruption elsewhere.
-    /// Empty on a prune that deleted nothing, and on every transport (the CLI transport, test fakes)
-    /// that has no such fallback to run — a default no-op ignores it, matching the empty-list caller
-    /// shape unchanged.
-    /// </param>
-    /// <param name="ct"></param>
-    Task PruneImagesAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct) => Task.CompletedTask;
+    bool RemoveImageReclaimsBlobs => false;
 
     Task SaveImagesAsync(IReadOnlyList<string> references, Stream tarOutput, CancellationToken ct);
 

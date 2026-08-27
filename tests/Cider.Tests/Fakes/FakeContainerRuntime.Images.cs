@@ -305,9 +305,37 @@ public sealed partial class FakeContainerRuntime
     /// </summary>
     public bool StrictExactReferenceMatchOnRemove { get; set; }
 
-    public Task RemoveImageAsync(string reference, bool force, CancellationToken ct)
+    /// <summary>
+    /// Test hook (cider-ede.41): lets a test hold <see cref="RemoveImageAsync"/> open mid-call, the
+    /// same shape as <see cref="ArmBuildGate"/> below — used where this fake stands in as the XPC
+    /// transport's CLI fallback, to prove the apiserver-unavailable delete fallback (the one
+    /// store-wide sweep left on that transport since cider-ede.41 removed the prune-path sweep)
+    /// genuinely holds <see cref="Cider.AppleContainer.BlobSweepGate"/> exclusively for the whole CLI
+    /// delete, blocking concurrent pulls/builds and being blocked by them. <c>null</c> (the default)
+    /// never blocks — every other test using this fake is unaffected.
+    /// </summary>
+    private TaskCompletionSource<bool>? _removeGate;
+    private TaskCompletionSource<bool>? _removeBlockedSignal;
+
+    public void ArmRemoveGate()
+    {
+        _removeGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _removeBlockedSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    public Task WaitUntilRemoveBlockedAsync() => _removeBlockedSignal!.Task;
+
+    public void ReleaseRemove() => _removeGate?.TrySetResult(true);
+
+    public async Task RemoveImageAsync(string reference, bool force, CancellationToken ct)
     {
         Record($"RemoveImageAsync:{reference}:{force}");
+
+        if (_removeGate is not null)
+        {
+            _removeBlockedSignal!.TrySetResult(true);
+            await _removeGate.Task.ConfigureAwait(false);
+        }
 
         // Apple's `container image delete` resolves a *reference* only: handed a sha256:… id it
         // fails with "image with reference sha256:… not found", which is why every caller routes
@@ -328,7 +356,7 @@ public sealed partial class FakeContainerRuntime
                     // Apple's own silent no-op (verified against the real source — see this
                     // property's doc comment): the reference did not match any key the store holds,
                     // and imageDelete neither throws nor signals that in any way.
-                    return Task.CompletedTask;
+                    return;
                 }
 
                 var exactIndex = _images.IndexOf(exact);
@@ -342,7 +370,7 @@ public sealed partial class FakeContainerRuntime
                     _images[exactIndex] = exact with { References = remaining };
                 }
 
-                return Task.CompletedTask;
+                return;
             }
 
             var image = FindImage(reference) ?? throw RuntimeException.NotFound($"no such image: {reference}");
@@ -351,20 +379,31 @@ public sealed partial class FakeContainerRuntime
             {
                 var index = _images.IndexOf(image);
                 _images[index] = image with { References = image.References.Where(r => r != normalizedTag).ToList() };
-                return Task.CompletedTask;
+                return;
             }
 
             _images.Remove(image);
         }
 
-        return Task.CompletedTask;
+        return;
     }
 
-    /// <summary>Records the call (and, cider-ehn, the deleted-image digests <c>PruneAsync</c> passed
-    /// along) so tests can assert <c>PruneAsync</c> triggers this exactly once per prune (never per
-    /// deleted image, never from a plain <c>rmi</c>) — the real XPC/CLI transports' own default no-op
-    /// behavior is irrelevant to this fake, which exists only to let a test observe when/how often
-    /// <see cref="IContainerRuntime.PruneImagesAsync"/> was called.</summary>
+    /// <summary>cider-ede.41 honesty flag (<see cref="IContainerRuntime.RemoveImageReclaimsBlobs"/>):
+    /// defaults to <c>false</c> (the XPC transport's shape — a delete drops only the index reference,
+    /// so a prune physically reclaims nothing and must report <c>SpaceReclaimed: 0</c>); a test flips
+    /// it to <c>true</c> to model the CLI transport, whose delete sweeps inside Apple's own binary
+    /// and genuinely frees the deleted image's bytes.</summary>
+    public bool RemoveImageReclaimsBlobs { get; set; }
+
+    /// <summary>
+    /// TRIPWIRE, deliberately kept although <c>IContainerRuntime</c> no longer declares this member
+    /// (cider-ede.41 removed the prune-path store-wide sweep by planner ruling — a sweep in one
+    /// process deletes another process's mid-write pull blobs in the shared store; reproduced in ~2s,
+    /// commit d63644b). If the seam is ever re-added to the interface, this method silently becomes
+    /// its implicit implementation again, records the call, and the prune tests asserting
+    /// <c>DoesNotContain("PruneImagesAsync:")</c> go red — turning a re-introduction into a test
+    /// failure instead of a silent regression.
+    /// </summary>
     public Task PruneImagesAsync(IReadOnlyList<string> deletedImageDigests, CancellationToken ct)
     {
         Record($"PruneImagesAsync:{string.Join(",", deletedImageDigests)}");

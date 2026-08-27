@@ -788,7 +788,6 @@ public sealed class ImageManager
         var containers = await _runtime.ListContainersAsync(ct).ConfigureAwait(false);
 
         var deleted = new List<ImageDeleteResponseItem>();
-        var deletedIndexDigests = new List<string>();
         long space = 0;
         foreach (var image in images)
         {
@@ -889,18 +888,21 @@ public sealed class ImageManager
             }
 
             deleted.Add(new ImageDeleteResponseItem { Deleted = image.Id });
-            deletedIndexDigests.AddRange(image.IndexDigests);
-            // cider-ehn fix direction §5, resolved: `image.Size` is already "config.size + sum of
-            // layers[].size across every real variant" (VariantSize/ToRuntimeImage), i.e. every byte
-            // this image's own manifests name — the same bytes the whole-store sweep or the scoped
-            // fallback (TryScopedReclaimAsync) may go on to actually delete from the content store for
-            // this image. Adding PruneImagesAsync's own reclaimed-byte count on top would double-count
-            // those bytes, not report a second, independent reclaim. It would also *overstate* a scoped
-            // reclaim that had to exclude a blob still shared with a surviving image: `image.Size`
-            // already, correctly, does not net that sharing out either way, so it stays the one number
-            // `SpaceReclaimed` is built from. PruneImagesAsync therefore intentionally keeps returning
-            // Task, not a byte count — see the cider-ehn task comment recording this decision.
-            space += image.Size;
+            // cider-ede.41 honesty rule (planner ruling, implementation requirement 1): SpaceReclaimed
+            // reports bytes actually freed from disk, never a fabricated number. On a transport whose
+            // per-image delete drops only the index reference and leaves every blob in place (the XPC
+            // transport's imageDelete garbageCollect:false), this prune physically reclaims nothing —
+            // the user reclaims disk with Apple's own `container image prune` (see the comment at the
+            // end of this method) — so nothing is counted. Only a transport whose delete genuinely
+            // frees the image's blobs as part of the delete itself (the CLI transport: Apple's
+            // `container image delete` sweeps inside its own single-process invocation) counts
+            // `image.Size` — "config.size + sum of layers[].size across every real variant"
+            // (VariantSize/ToRuntimeImage), which does not net out layers still shared with a
+            // surviving image, the same pre-existing caveat as before (cider-ehn fix direction §5).
+            if (_runtime.RemoveImageReclaimsBlobs)
+            {
+                space += image.Size;
+            }
             _events.Publish(DockerEvents.Image("delete", image.Id, image.Id));
         }
 
@@ -909,17 +911,22 @@ public sealed class ImageManager
             InvalidateImageCache();
         }
 
-        // cider-ede.31 fix direction §2: the store-wide sweep runs only here — the one place the user
-        // explicitly asked to reclaim space — never from RemoveAsync's own per-image delete, and exactly
-        // once per prune request regardless of how many images (if any) it just removed above, not once
-        // per image. Unconditional on `deleted.Count` (cider-ede.31 correction): a prune that found
-        // nothing dangling to delete had still already left orphaned blobs from an earlier plain `rmi`
-        // permanently unreclaimable, since PruneImagesAsync is the only reclaim path in the codebase —
-        // a no-op prune must still sweep. `deletedIndexDigests` (cider-ehn) is this call's own deleted
-        // images, for a transport whose whole-store sweep fails to scope a fallback reclaim to exactly
-        // the blobs this call may have just orphaned — empty, and inert, when nothing was deleted above.
-        await _runtime.PruneImagesAsync(deletedIndexDigests, ct).ConfigureAwait(false);
-
+        // cider-ede.41 — DO NOT put a store-wide sweep back here. BY DESIGN, per that task's planner
+        // ruling (option A: stop sweeping on the prune path). This is where the store-wide
+        // orphaned-blob sweep (`_runtime.PruneImagesAsync`, cider-ede.31 fix direction §2) used to
+        // run, and it must never come back on any transport: the Apple content store is shared by
+        // every daemon and client on the machine at once, and a sweep in ONE process deletes ANOTHER
+        // process's just-written, not-yet-committed pull blobs — the exact corruption that hit this
+        // machine's store three times in one day. The strongest counter-argument — "the in-process
+        // BlobSweepGate (cider-ede.31) serializes the sweep against this daemon's writes, so the sweep
+        // is safe" — is refuted by experiment (cider-ede.41, commit d63644b): with that gate ENABLED
+        // in both daemons, a two-daemon race (one pulling, one looping `docker image prune -f` with a
+        // filter matching NOTHING, so the sweep was the only store-touching verb) produced a dangling
+        // index entry on the FIRST cycle, ~2 seconds in. The gate is process-local; the store is
+        // machine-global; no client-side lock can close Apple's own blobs-before-index-commit window.
+        // Deleting the matched images above is safe (a reference drop, not a sweep); physical blob
+        // reclaim is delegated to the user running Apple's own `container image prune` on a quiet
+        // machine — see the README's prune/reclaim section.
         return new ImagePruneResponse { ImagesDeleted = deleted, SpaceReclaimed = space };
     }
 
