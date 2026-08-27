@@ -102,6 +102,38 @@ else
 fi
 docker rmi -f cider-compat/bk-basic:1 >/dev/null 2>&1 || true
 
+# ---------- 1b. literal `docker buildx build` verb ----------
+# cider-ger.22: the epic's Outcome names `docker buildx build`, and README.md:268 tells users to
+# type it, but under CLI 29.7.2 every other scenario in this script (and in
+# tests/Cider.E2E.Tests/BuildKitTests.cs) spells it `docker build` or `buildx bake`, which is
+# "very likely" the same command via the docker-cli's buildx alias -- exactly the kind of
+# inference this project has been bitten by before. This scenario exercises the literal verb end
+# to end so that inference is no longer load-bearing.
+ctx="$WORK/buildx-build"; mkdir -p "$ctx"
+printf 'FROM alpine:3.22\nRUN echo buildx-build-hello > /hello\nCMD ["cat", "/hello"]\n' > "$ctx/Dockerfile"
+out=$( { cd "$ctx" && docker buildx build -t cider-compat/bk-buildx-build:1 .; } 2>&1 )
+build_status=$?
+images_out=$(docker images --format '{{.Repository}}:{{.Tag}}')
+run_out=$(docker run --rm cider-compat/bk-buildx-build:1 2>&1); run_status=$?
+# Content assertion (grep), not exact-match, on run_out -- it has stderr merged in (2>&1), so a
+# stray stderr line would fail a plain `==` comparison even with the right image running (the
+# cider-e1e lesson behind scenario 3's `--secret` check above). grep -qx still requires the
+# stdout line itself to be exactly "buildx-build-hello".
+if [[ $build_status -eq 0 && $run_status -eq 0 ]] &&
+   grep -qF "cider-compat/bk-buildx-build:1" <<<"$images_out" &&
+   grep -qx 'buildx-build-hello' <<<"$run_out"; then
+  record "literal \`docker buildx build\` verb" PASS
+else
+  record "literal \`docker buildx build\` verb" FAIL "$out
+
+--- docker images (post-build) ---
+$images_out
+
+--- docker run --rm cider-compat/bk-buildx-build:1 (exit $run_status) ---
+\"$run_out\""
+fi
+docker rmi -f cider-compat/bk-buildx-build:1 >/dev/null 2>&1 || true
+
 # ---------- 2. --build-arg + --target (multi-stage) ----------
 ctx="$WORK/target"; mkdir -p "$ctx"
 cat >"$ctx/Dockerfile" <<'EOF'

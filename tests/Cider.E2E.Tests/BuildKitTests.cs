@@ -46,6 +46,38 @@ public sealed class BuildKitTests(DaemonFixture daemon, ITestOutputHelper output
         }
     }
 
+    /// <summary>
+    /// cider-ger.22: the epic's Outcome names <c>docker buildx build</c>, and README.md:268 tells
+    /// users to type it, but under CLI 29.7.2 every other scenario in this file spells it
+    /// <c>docker build</c> or <c>buildx bake</c> -- "very likely" equivalent via the docker-cli's
+    /// buildx alias is exactly the inference this project has been bitten by before. This test
+    /// exercises the literal verb end to end so that inference is no longer load-bearing.
+    /// </summary>
+    [E2EFact]
+    public async Task Literal_buildx_build_verb_builds_tags_and_runs_an_image()
+    {
+        var tag = UniqueTag("bk-buildx-build");
+        var context = await NewContextAsync("bk-buildx-build", Alpine + "RUN echo hello > /hello\nCMD [\"cat\",\"/hello\"]\n");
+
+        var build = await BuildAsync(["buildx", "build", "-t", tag, "."], context);
+        Assert.True(build.Ok, build.ToString());
+
+        try
+        {
+            var images = await daemon.DockerAsync("images", tag);
+            Assert.True(images.Ok, images.ToString());
+            Assert.Contains(tag, images.Stdout, StringComparison.Ordinal);
+
+            var run = await daemon.DockerAsync(["run", "--rm", tag], timeout: TimeSpan.FromMinutes(4));
+            Assert.True(run.Ok, run.ToString());
+            Assert.Equal("hello", run.Stdout.Trim());
+        }
+        finally
+        {
+            await daemon.DockerAsync(["rmi", "-f", tag], timeout: TimeSpan.FromMinutes(2));
+        }
+    }
+
     [E2EFact]
     public async Task Build_arg_and_target_select_the_right_stage()
     {
