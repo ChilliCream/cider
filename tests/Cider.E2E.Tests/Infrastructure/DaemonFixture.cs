@@ -129,6 +129,29 @@ public class DaemonFixture : IAsyncLifetime
     /// </summary>
     protected virtual string? RuntimeTransportOverride => null;
 
+    /// <summary>
+    /// When <c>true</c>, a pre-existing-image snapshot that fails with Apple's own dangling-content
+    /// error ("<c>content with digest sha256:…</c>" — the same marker text
+    /// <c>Cider.AppleContainer.Cli.CliErrorMapper.IsDanglingContent</c> matches in production,
+    /// matched here as a plain substring since that type is internal to <c>Cider.AppleContainer</c>
+    /// and not visible to this assembly) does not abort <see cref="InitializeAsync"/>.
+    /// Left at its <c>false</c> default, every other fixture keeps the original all-or-nothing
+    /// guarantee: "teardown must never guess at what it may safely remove" applies to images exactly
+    /// as it does to containers/networks/volumes, so an unreadable image listing refuses to start the
+    /// fixture at all. cider-ede.37 leg 1's own race fixture opts in: this machine's real, shared
+    /// Apple store carries a pre-existing dangling content reference (tracked separately as
+    /// cider-ede.41, not this fixture's to repair) that makes `container image ls --format json`
+    /// return a hard failure with EMPTY stdout — no partial rows to salvage, unlike the
+    /// enumerated-with-skips case cider-ede.24 already handles inside cider itself — so plain
+    /// <see cref="Enabled"/>-gated E2E tests could never start at all on this machine without this
+    /// escape hatch. Opting in is still safe: teardown's image sweep only ever removes ids carrying
+    /// this harness's own tag prefixes (<c>FilterOwnedImageIdsAsync</c>), never bare tags like the
+    /// alpine images this fixture's own tests pull, so leaving <see cref="_preExistingImageIds"/>
+    /// empty when the snapshot could not be read changes nothing about what teardown actually removes
+    /// for this fixture's own tests.
+    /// </summary>
+    protected virtual bool ToleratesImageSnapshotDanglingContentFailure => false;
+
     /// <inheritdoc />
     public async Task InitializeAsync()
     {
@@ -258,15 +281,36 @@ public class DaemonFixture : IAsyncLifetime
         var images = await DockerAsync(["images", "-aq", "--no-trunc"], timeout: TimeSpan.FromSeconds(60));
         if (!images.Ok)
         {
-            _log.Enqueue(images.ToString());
-            throw new InvalidOperationException(
-                "failed to snapshot pre-existing images; refusing to start the fixture, since " +
-                "teardown must never guess at what it may safely remove:\n" + images);
+            if (ToleratesImageSnapshotDanglingContentFailure &&
+                images.Stderr.Contains("content with digest", StringComparison.Ordinal))
+            {
+                // See this property's own doc comment: a pre-existing, out-of-scope dangling content
+                // reference on this machine's real shared store makes `container image ls` fail with
+                // no partial rows to salvage at all, so an unconditional throw here would refuse to
+                // start every opted-in fixture on this machine. _preExistingImageIds is left empty
+                // (nothing known to be "already there"), which is safe rather than permissive:
+                // teardown's own image sweep already only ever removes ids carrying this harness's
+                // own owned tag prefixes (FilterOwnedImageIdsAsync), so an empty pre-existing set
+                // cannot cause it to remove anything it would not already have removed with a full one.
+                _log.Enqueue(
+                    $"{DateTime.Now:HH:mm:ss.fff} Warning DaemonFixture: pre-existing image snapshot " +
+                    "unreadable (dangling content reference on the shared store, not this fixture's to " +
+                    "repair) -- proceeding with an empty pre-existing-image set:\n" + images);
+            }
+            else
+            {
+                _log.Enqueue(images.ToString());
+                throw new InvalidOperationException(
+                    "failed to snapshot pre-existing images; refusing to start the fixture, since " +
+                    "teardown must never guess at what it may safely remove:\n" + images);
+            }
         }
-
-        foreach (var id in images.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        else
         {
-            _preExistingImageIds.Add(id);
+            foreach (var id in images.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                _preExistingImageIds.Add(id);
+            }
         }
 
         // Only reached once all four lists above were captured successfully; teardown checks this
