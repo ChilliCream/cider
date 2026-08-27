@@ -101,29 +101,32 @@ public sealed partial class ContainerManager
 
         foreach (var record in _store.GetAll())
         {
-            GetHandle(record.Id);
+            var handle = GetHandle(record.Id);
 
             if (!byRuntimeId.TryGetValue(record.RuntimeId, out var runtimeContainer))
             {
                 // An older daemon adopted this before system containers were filtered (e.g. Apple's
                 // builder VM). The engine still has it, but it now classifies as system, so the
-                // stale record is dropped outright rather than marked exited.
+                // stale record is dropped outright rather than marked exited. Through the same
+                // shared teardown every other record deletion takes (cider-1ki), so this stays the
+                // record-deletion path it is instead of a hand-rolled variant that would have to
+                // remember the waiters on its own.
                 if (!record.Managed &&
                     byRawRuntimeId.TryGetValue(record.RuntimeId, out var stillPresent) &&
                     IsSystemContainer(stillPresent))
                 {
-                    _store.Delete(record.Id);
-                    _handles.TryRemove(record.Id, out _);
+                    DetachRecord(handle, record);
                     _logger.LogInformation("dropping adopted system container record {Name}", record.Name);
                     continue;
                 }
 
                 if (record.State.Running)
                 {
-                    record.State.Status = "exited";
-                    record.State.FinishedAt ??= DateTimeOffset.UtcNow;
-                    record.State.Error = "exit code unknown (daemon restarted)";
-                    Persist(record);
+                    // The shared transition, not an open-coded stamp: at startup no `docker wait`
+                    // can be pending yet, but this branch is reachable from any later
+                    // ReconcileAsync call, and exit completion belongs to the transition rather
+                    // than to whoever observed it (cider-ede.33, cider-1ki).
+                    MarkExited(record, "exit code unknown (daemon restarted)");
                 }
 
                 continue;
@@ -188,24 +191,19 @@ public sealed partial class ContainerManager
             return false;
         }
 
+        if (expected == "exited")
+        {
+            // The shared running->exited transition: stamps, persists and completes any pending
+            // `docker wait` in one place (a no-op when a held process exists, which defers to
+            // HandleExitAsync, or when no handle exists at all). Covers the `cider sync` /
+            // StateSynchronizer caller; harmless for the startup ReconcileAsync caller, where no
+            // waiter can exist yet (cider-ede.33, cider-1ki).
+            MarkExited(record, "exit code unknown (daemon restarted)");
+            return true;
+        }
+
         record.State.Status = expected;
-        if (expected == "exited")
-        {
-            record.State.FinishedAt ??= DateTimeOffset.UtcNow;
-            record.State.Error = "exit code unknown (daemon restarted)";
-        }
-
         Persist(record);
-
-        if (expected == "exited")
-        {
-            // Self-guards via the id-based wrapper: a no-op when a held process exists (defers to
-            // HandleExitAsync) or when no handle exists at all. Covers the `cider sync` /
-            // StateSynchronizer.cs:126 caller; harmless no-op for the startup ReconcileAsync caller,
-            // where no waiter can exist yet (cider-ede.33).
-            CompleteExitWait(record.Id, record.State.ExitCode);
-        }
-
         return true;
     }
 

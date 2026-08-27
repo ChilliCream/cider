@@ -52,6 +52,42 @@ public sealed class StateSynchronizerTests
     }
 
     [Fact]
+    public async Task SyncAsync_DroppingAVanishedRecord_CompletesAPendingDockerWait()
+    {
+        // cider-1ki: the third instance of the cider-ede.33 class. `cider sync`'s "drop vanished
+        // records" step (StateSynchronizer.SyncContainersAsync step 1 -> ForgetVanishedAsync) used
+        // to delete the record, complete the `removed` waiter and the attachments, and leave the
+        // record's NextExit pending -- so a `docker wait` from before the resync waited forever on
+        // a container whose record no longer exists. Adopted here on purpose (no held process): with
+        // a held process the drop is skipped entirely, and HandleExitAsync would have completed the
+        // waiter anyway.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var sync = NewSynchronizer(harness);
+
+        var container = await harness.CreateAsync("alpine", "web");
+        container.State.Status = "running";
+        harness.Store.Upsert(container.Id, container);
+        await harness.Runtime.RemoveContainerAsync("web", force: true, default);
+
+        var nextExit = harness.Containers.WaitAsync(container.Id, "next-exit", default);
+        var notRunning = harness.Containers.WaitAsync(container.Id, "not-running", default);
+        var removed = harness.Containers.WaitAsync(container.Id, "removed", default);
+
+        var report = await sync.SyncAsync(default);
+
+        Assert.Contains("web", report.Containers.Removed);
+        Assert.Null(harness.Store.Get(container.Id));
+
+        var nextExitResponse = await nextExit.WaitAsync(TimeSpan.FromSeconds(2));
+        var notRunningResponse = await notRunning.WaitAsync(TimeSpan.FromSeconds(2));
+        var removedResponse = await removed.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(container.State.ExitCode, nextExitResponse.StatusCode);
+        Assert.Equal(container.State.ExitCode, notRunningResponse.StatusCode);
+        Assert.Equal(container.State.ExitCode, removedResponse.StatusCode);
+    }
+
+    [Fact]
     public async Task SyncAsync_AdoptsUnknownRuntimeResources_AsReadOnlyRecords()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

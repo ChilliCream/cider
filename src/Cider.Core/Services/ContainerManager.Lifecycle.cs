@@ -222,16 +222,57 @@ public sealed partial class ContainerManager
             return;
         }
 
-        record.State.Status = "exited";
-        record.State.FinishedAt ??= DateTimeOffset.UtcNow;
         record.State.ExitCode = 0;
-        record.State.Error = "exit code unknown (daemon restarted)";
-        Persist(record);
+        MarkExited(record, "exit code unknown (daemon restarted)");
+    }
 
-        // `docker stop` on an adopted container: no held process means HandleExitAsync never runs,
-        // and once the record is no longer Running neither StatePoller die branch (StatePoller.cs:154,
-        // :210) can fire either, so this is the only place left that can unblock the waiter (cider-ede.33).
-        CompleteExitWait(handle, record.State.ExitCode);
+    /// <summary>
+    /// The one running-&gt;exited transition every observer that is not <see cref="HandleExitAsync"/>
+    /// goes through: <see cref="StatePoller"/> (both its missing-from-the-listing and its
+    /// runtime-says-stopped branches), <see cref="MarkStoppedWithoutHandle"/> (<c>docker stop</c> on
+    /// an adopted container), <see cref="ReconcileStatus"/> (startup reconcile and <c>cider sync</c>),
+    /// <see cref="ReconcileAsync"/>'s startup missing-record branch, and
+    /// <see cref="Restart.RestartSupervisor"/> giving up on a container. It stamps the record, persists
+    /// it and completes the pending <c>docker wait</c> in one place, because exit completion is a
+    /// property of the transition and not of who observed it (cider-ede.33, third instance cider-1ki):
+    /// a caller that only remembers the first half cannot reintroduce a record that says exited with a
+    /// <c>docker wait</c> blocked on it forever.
+    /// <para>
+    /// <paramref name="error"/> is left untouched when null (the poller's runtime-says-stopped branch
+    /// has no better story to tell than whatever is already recorded). <paramref name="refreshFinishedAt"/>
+    /// overwrites a stale <c>FinishedAt</c> from a previous run rather than keeping it; every caller
+    /// but that same poller branch wants the <c>??=</c> default.
+    /// </para>
+    /// <para>
+    /// The completion self-guards through the id-based <see cref="CompleteExitWait(string,int)"/>
+    /// wrapper: a no-op when a held process exists (that process is the source of truth for the real
+    /// exit code, so <see cref="HandleExitAsync"/> owns the completion) or when no handle exists at
+    /// all. Nothing here touches the detached post-start network follow-up, whose own exit-race guard
+    /// (cider-ede.27, <c>ApplyNetworkInfo</c>'s <c>!record.State.Running</c> early return) still sees
+    /// this transition land before it can re-register DNS names for a container that has exited.
+    /// </para>
+    /// </summary>
+    internal void MarkExited(ContainerRecord record, string? error, bool refreshFinishedAt = false)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+
+        record.State.Status = "exited";
+        if (refreshFinishedAt)
+        {
+            record.State.FinishedAt = DateTimeOffset.UtcNow;
+        }
+        else
+        {
+            record.State.FinishedAt ??= DateTimeOffset.UtcNow;
+        }
+
+        if (error is not null)
+        {
+            record.State.Error = error;
+        }
+
+        Persist(record);
+        CompleteExitWait(record.Id, record.State.ExitCode);
     }
 
     /// <summary><c>POST /containers/{id}/kill</c>; 409 when the container is not running.</summary>
@@ -345,15 +386,7 @@ public sealed partial class ContainerManager
                 handle.Process = null;
             }
 
-            _names.Unregister(record.Id);
-            UnpublishPorts(record.Id);
-            ReleasePorts(record);
-            _logs.Delete(record.Id);
-            DropStagedArchives(record.Id);
-            _store.Delete(record.Id);
-            _handles.TryRemove(record.Id, out _);
-            handle.Removed.TrySetResult(record.State.ExitCode);
-            CompleteAttachments(handle);
+            DetachRecord(handle, record);
         }
         finally
         {
@@ -407,15 +440,7 @@ public sealed partial class ContainerManager
             // would re-add it to the store).
             current.UserStopped = true;
 
-            _names.Unregister(current.Id);
-            UnpublishPorts(current.Id);
-            ReleasePorts(current);
-            _logs.Delete(current.Id);
-            DropStagedArchives(current.Id);
-            _store.Delete(current.Id);
-            _handles.TryRemove(current.Id, out _);
-            handle.Removed.TrySetResult(current.State.ExitCode);
-            CompleteAttachments(handle);
+            DetachRecord(handle, current);
 
             if (wasRunning)
             {
@@ -435,6 +460,45 @@ public sealed partial class ContainerManager
         {
             handle.Gate.Release();
         }
+    }
+
+    /// <summary>
+    /// The one teardown both paths that make a record disappear go through — <see cref="RemoveAsync"/>
+    /// (<c>docker rm</c>, including <c>--rm</c> auto-remove and prune) and
+    /// <see cref="ForgetVanishedAsync"/> (<see cref="StatePoller"/>'s second consecutive miss and
+    /// <c>cider sync</c>'s "drop vanished records" step). Both callers hold the container's gate.
+    /// <para>
+    /// A record leaving the running state by being deleted is the same transition
+    /// <see cref="MarkExited"/> covers — the record is gone, so nothing will ever transition it again
+    /// — which is why the pending <c>docker wait</c> is completed here rather than at either call
+    /// site. That gap is what cider-1ki reported for the synchronizer's drop: the record vanished
+    /// while <c>next-exit</c>/<c>not-running</c> waiters (unlike the <c>removed</c> waiter and the
+    /// attachments below) were left pending forever. A drop cannot reuse <see cref="MarkExited"/>
+    /// itself — that one stamps and persists a record this path is deleting — so the two share the
+    /// underlying <see cref="CompleteExitWait(string,int)"/> mechanism instead, and between them they
+    /// cover every way a record can stop being a running record.
+    /// </para>
+    /// <para>
+    /// Exit code semantics: the same <c>record.State.ExitCode</c> the
+    /// <c>removed</c> waiter has always been completed with. When a held process did drive
+    /// <see cref="HandleExitAsync"/>, that call already completed the waiter with the real exit code
+    /// and rotated in a fresh TaskCompletionSource, so this completes that fresh one — for a handle
+    /// that is being dropped from the handle table in the same breath and that no future
+    /// <c>docker wait</c> can reach, since resolving the removed record now 404s.
+    /// </para>
+    /// </summary>
+    private void DetachRecord(ContainerHandle handle, ContainerRecord record)
+    {
+        _names.Unregister(record.Id);
+        UnpublishPorts(record.Id);
+        ReleasePorts(record);
+        _logs.Delete(record.Id);
+        DropStagedArchives(record.Id);
+        _store.Delete(record.Id);
+        _handles.TryRemove(record.Id, out _);
+        handle.Removed.TrySetResult(record.State.ExitCode);
+        CompleteExitWait(handle, record.State.ExitCode);
+        CompleteAttachments(handle);
     }
 
     /// <summary><c>POST /containers/{id}/wait?condition=</c>.</summary>

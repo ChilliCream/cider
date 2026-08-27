@@ -558,6 +558,33 @@ public sealed class ContainerManagerLifecycleTests
     }
 
     [Fact]
+    public async Task Remove_of_an_adopted_running_container_completes_a_pending_docker_wait()
+    {
+        // cider-1ki enumeration: `docker rm -f` on a container cider only adopted is the same class
+        // as the three cider-ede.33/.40/1ki instances. RemoveAsync's teardown completed the
+        // `removed` waiter and the attachments but never NextExit, and with no held process
+        // WaitForExitHandlingAsync has nothing to wait for and HandleExitAsync never runs -- so the
+        // record disappeared with a `docker wait` still blocked on it. Both removal paths
+        // (RemoveAsync and ForgetVanishedAsync) now share one teardown that completes it.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        var record = await harness.CreateAsync("alpine", "web");
+        record.State.Status = "running";
+        harness.Store.Upsert(record.Id, record);
+
+        var nextExit = harness.Containers.WaitAsync(record.Id, "next-exit", default);
+        var notRunning = harness.Containers.WaitAsync(record.Id, "not-running", default);
+
+        await harness.Containers.RemoveAsync(record.Id, force: true, removeVolumes: false, default);
+
+        var nextExitResponse = await nextExit.WaitAsync(TimeSpan.FromSeconds(2));
+        var notRunningResponse = await notRunning.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(record.State.ExitCode, nextExitResponse.StatusCode);
+        Assert.Equal(record.State.ExitCode, notRunningResponse.StatusCode);
+        Assert.Null(harness.Store.Get(record.Id));
+    }
+
+    [Fact]
     public async Task Kill_delivers_the_signal_and_emits_kill()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

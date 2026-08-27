@@ -239,8 +239,11 @@ public sealed class RestartSupervisor : IAsyncDisposable
     {
         if (string.Equals(record.State.Status, "restarting", StringComparison.Ordinal))
         {
-            record.State.Status = "exited";
-            _containers.PersistExternal(record);
+            // The shared restarting/running->exited transition (cider-1ki): the container is not
+            // coming back, so a `docker wait` opened while it was "restarting" has to be completed
+            // here rather than left pending on a record that has settled. Error is left as it is —
+            // the failure was already logged and this path has nothing better to record.
+            _containers.MarkExited(record, error: null);
         }
     }
 
@@ -255,10 +258,9 @@ public sealed class RestartSupervisor : IAsyncDisposable
     {
         _attempts.TryRemove(record.Id, out _);
 
-        record.State.Status = "exited";
-        record.State.Error = VanishedError;
-        record.State.FinishedAt ??= DateTimeOffset.UtcNow;
-        _containers.PersistExternal(record);
+        // Same shared transition as MarkFailed: this record has settled for good, so a `docker wait`
+        // opened while it was "restarting" must be completed rather than stranded (cider-1ki).
+        _containers.MarkExited(record, VanishedError);
         _events.Publish(DockerEvents.Container("die", record, new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["exitCode"] = record.State.ExitCode.ToString(CultureInfo.InvariantCulture),

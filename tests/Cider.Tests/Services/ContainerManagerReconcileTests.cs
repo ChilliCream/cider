@@ -128,6 +128,34 @@ public sealed class ContainerManagerReconcileTests
     }
 
     [Fact]
+    public async Task Reconcile_of_a_record_whose_runtime_container_is_gone_completes_a_pending_docker_wait()
+    {
+        // cider-1ki: ReconcileAsync's startup missing-record branch is the fourth observer of a
+        // record leaving the running state and was the last one still flipping the record to exited
+        // and persisting without completing NextExit. A waiter is unlikely at startup, but the
+        // branch is reachable from any later ReconcileAsync call, and the point of cider-ede.33 is
+        // that exit completion belongs to the transition rather than to whoever observed it.
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        var record = await harness.CreateAsync("alpine", "web");
+        record.State.Status = "running";
+        harness.Store.Upsert(record.Id, record);
+        harness.Runtime.VanishContainer("web");
+
+        var nextExit = harness.Containers.WaitAsync(record.Id, "next-exit", default);
+        var notRunning = harness.Containers.WaitAsync(record.Id, "not-running", default);
+
+        await harness.Containers.ReconcileAsync(default);
+
+        Assert.Equal("exited", record.State.Status);
+        var nextExitResponse = await nextExit.WaitAsync(TimeSpan.FromSeconds(2));
+        var notRunningResponse = await notRunning.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(record.State.ExitCode, nextExitResponse.StatusCode);
+        Assert.Equal(record.State.ExitCode, notRunningResponse.StatusCode);
+    }
+
+    [Fact]
     public async Task Reconcile_still_adopts_an_unrelated_unmanaged_container()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();
