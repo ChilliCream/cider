@@ -55,20 +55,36 @@ public sealed class TokenBucketPacerTests
         using var scope = tracker.BeginCall();
 
         var before = tracker.LastProgress;
-        // 500ms pre-delay (vs. a 200ms staleness bound) gives ~20x margin over the queued-dispatch
-        // gap between RecordProgress and this read (the await above resumes via
-        // Xunit.Sdk.AsyncTestSyncContext.Post, not inline, because AcquireAsync's internal
-        // Task.Delay uses ConfigureAwait(false) while this await does not; observed gap is
-        // single-digit ms, ~10ms worst case under heavy load). A pacer that never calls
-        // RecordProgress would report ~500ms stale here and fail hard.
-        await Task.Delay(TimeSpan.FromMilliseconds(500));
+        await Task.Delay(TimeSpan.FromMilliseconds(50));
         await pacer.AcquireAsync(4096, CancellationToken.None);
-        var sinceProgress = Stopwatch.GetElapsedTime(tracker.LastProgress);
 
-        Assert.True(tracker.LastProgress > before);
-        Assert.False(
-            tracker.IsStalled(TimeSpan.FromMilliseconds(200)),
-            $"expected RecordProgress to have run within the last 200ms, measured {sinceProgress}");
+        // Both sides of this assertion are timestamps captured in this test (before/after), never a
+        // fresh 'now' read -- so there is no wall-clock race with dispatch or scheduler latency to
+        // widen a margin against. A pacer that never calls RecordProgress leaves after == before and
+        // fails the first assertion outright.
+        var after = tracker.LastProgress;
+        Assert.True(after > before, $"expected AcquireAsync to bump LastProgress; before={before}, after={after}");
+        var recordedAfterTheWait = Stopwatch.GetElapsedTime(before, after);
+        Assert.True(
+            recordedAfterTheWait >= TimeSpan.FromMilliseconds(40),
+            $"expected RecordProgress to run after the ~50ms wait, measured {recordedAfterTheWait}");
+    }
+
+    [Fact]
+    public void IsStalled_reflects_only_open_calls_and_elapsed_time_against_fixed_bounds()
+    {
+        var withOpenCall = new BuilderLinkTracker();
+        using (withOpenCall.BeginCall())
+        {
+            // A huge threshold can never have elapsed yet -- this cannot flake.
+            Assert.False(withOpenCall.IsStalled(TimeSpan.FromHours(1)));
+            // Any measurable elapsed time exceeds a zero threshold -- this cannot flake either.
+            Assert.True(withOpenCall.IsStalled(TimeSpan.Zero));
+        }
+
+        // A link nothing is using (no open call) is never stalled, regardless of threshold.
+        var withNoOpenCall = new BuilderLinkTracker();
+        Assert.False(withNoOpenCall.IsStalled(TimeSpan.Zero));
     }
 
     [Fact]
