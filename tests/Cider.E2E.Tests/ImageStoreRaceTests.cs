@@ -687,13 +687,20 @@ public sealed class CrossProcessImageStoreRaceCollection
 /// carries <c>--filter label=cider-ede41-xproc-never-matches</c>, a label no image on this machine
 /// carries, so <c>ImageManager.PruneAsync</c> deletes NO images (in particular not the developer's
 /// dangling <c>cider-build-*</c> build records, which an unfiltered dangling-only prune would sweep
-/// up) — and then, per cider-ede.31's own "a no-op prune must still sweep" rule, unconditionally runs
-/// the one store-wide orphaned-blob sweep this experiment is about. The sweep itself only ever
-/// reclaims blobs no index entry references (that is the sanctioned, user-invocable reclaim path);
-/// the only orphans this run manufactures are the churn image's own, and the only index entries at
-/// risk mid-pull are for the image this test itself pulls. Corruption is only ever constructed
-/// through normal pull/prune/rmi verbs from the two throwaway daemons — never by touching store
-/// files directly, never through the user's installed daemon.
+/// up). At d63644b that no-op prune then still ran the unconditional store-wide orphaned-blob sweep
+/// (cider-ede.31's "a no-op prune must still sweep" rule) — the sweep this experiment reproduced the
+/// corruption through. Since fdc9c38 that sweep is GONE: daemon B's prune now touches the store not
+/// at all, which is precisely what the fix leg verifies (see the per-cycle survival check in the pull
+/// loop). Because nothing in cider reclaims orphaned blobs any more, the fix leg restores each
+/// cycle's uncached-pull precondition the one sanctioned way left: the TEST RUNNER runs Apple's own
+/// <c>container image prune</c> BETWEEN cycles, strictly quiescently — never while a pull is in
+/// flight (the pull loop is sequential and runs it itself), and daemon B's concurrent prune deletes
+/// nothing and sweeps nothing, so Apple's machine-wide sweep can never catch a write window this
+/// experiment opened. That is the exact quiet-machine usage the README's reclaim section now
+/// prescribes to users. The only orphans this run manufactures are the churn image's own, and the
+/// only index entries at risk mid-pull are for the image this test itself pulls. Corruption is only
+/// ever constructed through normal pull/prune/rmi verbs — never by touching store files directly,
+/// never through the user's installed daemon.
 /// </summary>
 [Collection(CrossProcessImageStoreRaceCollection.Name)]
 [Trait("Category", "E2E")]
@@ -926,6 +933,9 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
         var otherPullFailures = new ConcurrentQueue<string>();
         var pruneAttempts = 0;
         var pruneFailures = new ConcurrentQueue<string>();
+        var survivedSweepChecks = 0;
+        var applePruneRuns = 0;
+        var unexpectedReclaims = new ConcurrentQueue<string>();
         var danglingSeen = new ConcurrentQueue<string>();
         var cycleLog = new ConcurrentQueue<string>();
         string? lastChurnDigest = null;
@@ -955,11 +965,17 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
 
                 // ABSENCE ASSERTED FROM THE STORE INDEX BEFORE EACH PULL, recorded per cycle. After a
                 // previous cycle's rmi (garbageCollect: false) the index entry is gone but the blobs
-                // are orphans until daemon B's next sweep reclaims them -- wait for the previous
-                // cycle's own index digest blob to actually disappear too, so every pull is a real,
-                // full network pull with a real write window (a pull over still-present orphaned
-                // content would be the warm-cycle confound avery's #149 warned about). This wait is
-                // itself evidence: the blob vanishing here is daemon B's cross-process sweep working.
+                // are orphans -- and since fdc9c38 (cider-ede.41 mitigation, option A) daemon B's
+                // prune performs NO sweep at all, so nothing in cider will ever reclaim them. The
+                // d63644b version of this loop waited here for daemon B's sweep to delete the previous
+                // cycle's blob; on the mitigated code that wait can only go vacuous. The fix leg
+                // instead (a) POSITIVELY asserts the previous blob SURVIVED at least one whole prune
+                // that ran after the rmi -- per-cycle evidence the sweep is really gone -- then
+                // (b) reclaims it quiescently with Apple's own `container image prune` (the sanctioned
+                // user-run reclaim path, run by the test runner while no pull is in flight), so every
+                // pull is still a real, full network pull with a real write window (a pull over
+                // still-present orphaned content would be the warm-cycle confound avery's #149 warned
+                // about).
                 var indexEntryPresent = ImageStoreRaceTests.ScanAppleStoreState() is { } s &&
                     s.References.Any(r => ImageStoreRaceTests.ReferenceMatches(r, ChurnImage));
                 if (indexEntryPresent)
@@ -968,24 +984,75 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
                 }
 
                 var previousDigest = lastChurnDigest;
-                var blobGone = previousDigest is null || await DaemonFixture.EventuallyAsync(
-                    () => Task.FromResult(!File.Exists(Path.Combine(
-                        ImageStoreRaceTests.AppleStoreRoot, "content", "blobs", "sha256",
-                        previousDigest["sha256:".Length..]))),
-                    ReclaimWaitTimeout);
-                if (!blobGone)
+                if (previousDigest is not null)
                 {
-                    cycleLog.Enqueue(
-                        $"cycle {cycle}: previous cycle's index blob {lastChurnDigest} still on disk " +
-                        $"after {ReclaimWaitTimeout} of continuous prune sweeps -- daemon B's sweep is " +
-                        "not reclaiming, run is going vacuous");
-                    Volatile.Write(ref stop, true);
-                    break;
+                    var previousBlobPath = Path.Combine(
+                        ImageStoreRaceTests.AppleStoreRoot, "content", "blobs", "sha256",
+                        previousDigest["sha256:".Length..]);
+
+                    // Wait for two more prune completions: the first may have started before the rmi
+                    // above, the second necessarily started after it, so at least one WHOLE prune ran
+                    // against a store holding the orphaned blob.
+                    var prunesAtRmi = Volatile.Read(ref pruneAttempts);
+                    var prunesRanAfterRmi = await DaemonFixture.EventuallyAsync(
+                        () => Task.FromResult(Volatile.Read(ref pruneAttempts) >= prunesAtRmi + 2),
+                        ReclaimWaitTimeout);
+                    if (!prunesRanAfterRmi)
+                    {
+                        cycleLog.Enqueue(
+                            $"cycle {cycle}: daemon B completed fewer than 2 prunes in {ReclaimWaitTimeout} " +
+                            "-- prune loop stalled, run is going vacuous");
+                        Volatile.Write(ref stop, true);
+                        break;
+                    }
+
+                    if (!File.Exists(previousBlobPath))
+                    {
+                        // The mitigated prune must never reclaim: cider no longer sweeps anywhere.
+                        // The blob vanishing here means SOMETHING swept the store mid-run -- a
+                        // mitigation regression or a foreign sweeper -- and either way the run stops
+                        // and reports it as a major finding.
+                        unexpectedReclaims.Enqueue(
+                            $"cycle {cycle} ({clock.Elapsed.TotalSeconds:F0}s in): orphaned blob " +
+                            $"{previousDigest} DISAPPEARED while only mitigated (sweep-free) cider " +
+                            $"prunes were running ({Volatile.Read(ref pruneAttempts)} prunes so far)");
+                        Volatile.Write(ref stop, true);
+                        break;
+                    }
+
+                    Interlocked.Increment(ref survivedSweepChecks);
+
+                    // Quiescent reclaim so the next pull is genuinely uncached: Apple's own prune,
+                    // run by the test runner between cycles (no pull in flight; daemon B's mitigated
+                    // prune neither deletes nor sweeps, so nothing races this).
+                    var applePrune = await Cmd.RunAsync("container", ["image", "prune"], timeout: PruneTimeout);
+                    Interlocked.Increment(ref applePruneRuns);
+                    if (!applePrune.Ok)
+                    {
+                        cycleLog.Enqueue($"cycle {cycle}: Apple `container image prune` failed, stopping:\n{applePrune}");
+                        Volatile.Write(ref stop, true);
+                        break;
+                    }
+
+                    var blobGone = await DaemonFixture.EventuallyAsync(
+                        () => Task.FromResult(!File.Exists(previousBlobPath)),
+                        TimeSpan.FromSeconds(30));
+                    if (!blobGone)
+                    {
+                        cycleLog.Enqueue(
+                            $"cycle {cycle}: previous cycle's index blob {previousDigest} still on disk " +
+                            "after Apple's own `container image prune` -- cannot restore the uncached " +
+                            "precondition, run is going vacuous");
+                        Volatile.Write(ref stop, true);
+                        break;
+                    }
                 }
 
                 cycleLog.Enqueue(
                     $"cycle {cycle} @ {cycleStart.TotalSeconds:F0}s: {ChurnImage} absent from index" +
-                    (lastChurnDigest is null ? "" : $", previous blob {lastChurnDigest[..19]}... reclaimed by daemon B's sweep") +
+                    (previousDigest is null
+                        ? ""
+                        : $", previous blob {previousDigest[..19]}... SURVIVED daemon B's mitigated prunes, then reclaimed by Apple's own prune") +
                     " -- pulling (uncached, real network write window)");
 
                 var pull = await pullDaemon.DockerAsync(["pull", ChurnImage], PullTimeout);
@@ -1049,10 +1116,13 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
         }
 
         // RESTORE the shared store toward its recorded clean baseline through normal verbs only:
-        // remove the one image this run pulled, let one final quiescent prune reclaim its orphans.
+        // remove the one image this run pulled, then (fdc9c38 fix leg: cider's prune reclaims
+        // nothing any more, by design) one final quiescent Apple `container image prune` to reclaim
+        // its orphaned blobs.
         var restoreRmi = await pullDaemon.DockerAsync(["rmi", "-f", ChurnImage], PullTimeout);
         var restorePrune = await pruneDaemon.DockerAsync(
             ["image", "prune", "-f", "--filter", "label=" + NeverMatchingPruneLabel], PruneTimeout);
+        var restoreApplePrune = await Cmd.RunAsync("container", ["image", "prune"], timeout: PruneTimeout);
         var finalScan = ImageStoreRaceTests.ScanAppleStoreState();
         var finalLs = await Cmd.RunAsync("container", ["image", "ls"], timeout: TimeSpan.FromSeconds(60));
 
@@ -1070,9 +1140,13 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
             $"({pullSuccesses} completed, {sweepInterferenceFailures} failed with the mid-write sweep " +
             $"signature, {otherPullFailures.Count} failed otherwise) in daemon A (pid {pullDaemon.Process.Pid}); " +
             $"{pruneAttempts} prune sweep(s) ({pruneFailures.Count} failed) in daemon B (pid {pruneDaemon.Process.Pid}), " +
-            $"{daemonBReclaims} logged reclaim line(s); {fallbackWarnings} XPC->CLI fallback warning(s) " +
+            $"{daemonBReclaims} logged reclaim line(s) (fix leg expects 0: the mitigated prune never " +
+            $"sweeps); {survivedSweepChecks} per-cycle orphaned-blob survival check(s) passed, " +
+            $"{applePruneRuns} quiescent Apple `container image prune` reclaim(s) by the test runner; " +
+            $"{fallbackWarnings} XPC->CLI fallback warning(s) " +
             "(nonzero would mean a verb left the pinned XPC path); " +
-            $"restore: rmi ok={restoreRmi.Ok}, final prune ok={restorePrune.Ok}");
+            $"restore: rmi ok={restoreRmi.Ok}, final cider prune ok={restorePrune.Ok}, " +
+            $"final Apple prune ok={restoreApplePrune.Ok}");
         output.WriteLine(
             "final state: index scan " +
             (finalScan is null
@@ -1084,6 +1158,15 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
         {
             output.WriteLine("prune failure (recorded, not itself the criterion):\n" + failure);
         }
+
+        // fdc9c38 fix leg: an orphaned blob vanishing while only mitigated (sweep-free) cider prunes
+        // ran means something DID sweep -- a mitigation regression or a foreign sweeper. Major
+        // finding either way; reported with full identity, never repaired here.
+        Assert.True(
+            unexpectedReclaims.IsEmpty,
+            "MITIGATION VIOLATION SIGNAL -- an orphaned blob was reclaimed mid-run although the " +
+            "fdc9c38 prune path performs no sweep at all; identity and timing:\n" +
+            string.Join('\n', unexpectedReclaims));
 
         // OUTCOME A -- the ticket's failure criterion met: a dangling entry appeared (or resurfaced).
         // Reported with its exact identity and NOT repaired here: repairing the live shared store is
@@ -1135,9 +1218,12 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
                   $"the cross-process interference MECHANISM fired {sweepInterferenceFailures} time(s) " +
                   "with both gates enabled -- report both numbers to the ticket verbatim"
                 : $"OUTCOME B: no dangling entry and no cross-process interference in {pullCycles} " +
-                  $"uncached pull cycle(s) against {pruneAttempts} store-wide prune sweep(s) over " +
-                  $"{raceClock.Elapsed} -- per the ticket, the leading explanation shifts to Apple's " +
-                  "own non-atomic pull");
+                  $"uncached pull cycle(s) against {pruneAttempts} prune invocation(s) over " +
+                  $"{raceClock.Elapsed}. On the fdc9c38 fix leg this is the EXPECTED outcome (ruling " +
+                  "requirement 6): the mitigated prune performs no sweep, so the d63644b interleaving " +
+                  "can no longer delete a mid-write blob -- 0 incidents and a clean post-run scan " +
+                  "verify the mitigation under the same two-daemon load that corrupted the store in " +
+                  "2s pre-fix");
     }
 
     /// <summary>The digest recorded in the store index for <paramref name="reference"/>, or null.</summary>
