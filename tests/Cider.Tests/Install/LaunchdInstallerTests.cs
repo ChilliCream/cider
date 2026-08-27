@@ -403,4 +403,168 @@ public class LaunchdInstallerTests
             DeleteTempRoot(root);
         }
     }
+
+    private const string Uid = "501";
+    private const string TestPlistPath = "/Users/testuser/Library/LaunchAgents/com.chillicream.cider.daemon.plist";
+    private const string EioStdErr = "Bootstrap failed: 5: Input/output error\n";
+
+    private static ProcessRunner.Result Ok(string stdout = "") => new(0, stdout, string.Empty, TimedOut: false);
+
+    private static ProcessRunner.Result Fail(int exitCode, string stderr = "") => new(exitCode, string.Empty, stderr, TimedOut: false);
+
+    /// <summary>No-op delay so settle-poll and backoff tests run instantly.</summary>
+    private static Task InstantDelay(TimeSpan _, CancellationToken __) => Task.CompletedTask;
+
+    /// <summary>
+    /// Scripted launchctl stub: records every command; answers `print` from a queue of results
+    /// (last entry repeats) and `bootstrap` from its own queue (last entry repeats). `bootout`
+    /// always exits with <paramref name="bootoutExit"/>.
+    /// </summary>
+    private static LaunchdInstaller.ExternalCommandRunner ScriptedLaunchctl(
+        List<string> commands,
+        int bootoutExit,
+        Queue<ProcessRunner.Result> printResults,
+        Queue<ProcessRunner.Result> bootstrapResults)
+    {
+        ProcessRunner.Result lastPrint = Fail(113, "Could not find service");
+        ProcessRunner.Result lastBootstrap = Ok();
+        return (file, args, timeout, ct) =>
+        {
+            commands.Add($"{file} {string.Join(' ', args)}");
+            Assert.Equal("launchctl", file);
+            switch (args[0])
+            {
+                case "bootout":
+                    return Task.FromResult(bootoutExit == 0 ? Ok() : Fail(bootoutExit, "Boot-out failed: 3: No such process"));
+                case "print":
+                    if (printResults.Count > 0)
+                    {
+                        lastPrint = printResults.Dequeue();
+                    }
+
+                    return Task.FromResult(lastPrint);
+                case "bootstrap":
+                    if (bootstrapResults.Count > 0)
+                    {
+                        lastBootstrap = bootstrapResults.Dequeue();
+                    }
+
+                    return Task.FromResult(lastBootstrap);
+                default:
+                    throw new InvalidOperationException($"unexpected launchctl subcommand: {args[0]}");
+            }
+        };
+    }
+
+    [Fact]
+    public async Task BootoutThenBootstrap_RetriesEioBootstrap_AndSucceeds()
+    {
+        var commands = new List<string>();
+        var steps = new List<string>();
+        var run = ScriptedLaunchctl(
+            commands,
+            bootoutExit: 0,
+            printResults: new Queue<ProcessRunner.Result>([Fail(113, "Could not find service")]),
+            bootstrapResults: new Queue<ProcessRunner.Result>([Fail(5, EioStdErr), Ok()]));
+
+        var (bootstrap, failureMessage) = await LaunchdInstaller.BootoutThenBootstrapAsync(
+            run, Uid, "com.chillicream.cider.daemon", TestPlistPath, steps, new StringWriter(), CancellationToken.None, InstantDelay);
+
+        Assert.True(bootstrap.Succeeded);
+        Assert.Null(failureMessage);
+        // The step log shows the failed first attempt and the successful retry.
+        Assert.Contains(steps, s => s.Contains("(exit 5, attempt 1/3)", StringComparison.Ordinal));
+        Assert.Contains(steps, s => s.Contains("(exit 0, attempt 2/3)", StringComparison.Ordinal));
+        Assert.Equal(2, commands.Count(c => c.Contains(" bootstrap ", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task BootoutThenBootstrap_PollsPrintUntilNotFound_BeforeBootstrapping()
+    {
+        var commands = new List<string>();
+        var steps = new List<string>();
+        // launchd still reports the service twice mid-teardown, then it is gone.
+        var run = ScriptedLaunchctl(
+            commands,
+            bootoutExit: 0,
+            printResults: new Queue<ProcessRunner.Result>([Ok("state = running"), Ok("state = running"), Fail(113, "Could not find service")]),
+            bootstrapResults: new Queue<ProcessRunner.Result>([Ok()]));
+
+        var (bootstrap, failureMessage) = await LaunchdInstaller.BootoutThenBootstrapAsync(
+            run, Uid, "com.chillicream.cider.daemon", TestPlistPath, steps, new StringWriter(), CancellationToken.None, InstantDelay);
+
+        Assert.True(bootstrap.Succeeded);
+        Assert.Null(failureMessage);
+        // The poll consumed the not-found transition: exactly three prints, all before the bootstrap.
+        Assert.Equal(3, commands.Count(c => c.Contains(" print ", StringComparison.Ordinal)));
+        var lastPrint = commands.FindLastIndex(c => c.Contains(" print ", StringComparison.Ordinal));
+        var firstBootstrap = commands.FindIndex(c => c.Contains(" bootstrap ", StringComparison.Ordinal));
+        Assert.True(lastPrint < firstBootstrap, $"expected all prints before bootstrap; commands: {string.Join(" | ", commands)}");
+        Assert.Contains(steps, s => s.Contains("Waited for launchd to finish removing", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task BootoutThenBootstrap_SkipsSettlePoll_WhenBootoutRemovedNothing()
+    {
+        var commands = new List<string>();
+        var steps = new List<string>();
+        // Fresh install: bootout exits 3 ("No such process"); no service existed, nothing to wait for.
+        var run = ScriptedLaunchctl(
+            commands,
+            bootoutExit: 3,
+            printResults: new Queue<ProcessRunner.Result>(),
+            bootstrapResults: new Queue<ProcessRunner.Result>([Ok()]));
+
+        var (bootstrap, failureMessage) = await LaunchdInstaller.BootoutThenBootstrapAsync(
+            run, Uid, "com.chillicream.cider.daemon", TestPlistPath, steps, new StringWriter(), CancellationToken.None, InstantDelay);
+
+        Assert.True(bootstrap.Succeeded);
+        Assert.Null(failureMessage);
+        Assert.DoesNotContain(commands, c => c.Contains(" print ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task BootoutThenBootstrap_PersistentEio_FailsWithMachineStateAndRemediation()
+    {
+        var commands = new List<string>();
+        var steps = new List<string>();
+        var run = ScriptedLaunchctl(
+            commands,
+            bootoutExit: 0,
+            printResults: new Queue<ProcessRunner.Result>([Fail(113, "Could not find service")]),
+            bootstrapResults: new Queue<ProcessRunner.Result>([Fail(5, EioStdErr)])); // repeats forever
+
+        var (bootstrap, failureMessage) = await LaunchdInstaller.BootoutThenBootstrapAsync(
+            run, Uid, "com.chillicream.cider.daemon", TestPlistPath, steps, new StringWriter(), CancellationToken.None, InstantDelay);
+
+        Assert.False(bootstrap.Succeeded);
+        Assert.Equal(3, commands.Count(c => c.Contains(" bootstrap ", StringComparison.Ordinal))); // bounded, not infinite
+        Assert.NotNull(failureMessage);
+        // The message states the machine state and the remediation.
+        Assert.Contains("The previous daemon was stopped and the new one did not start", failureMessage, StringComparison.Ordinal);
+        Assert.Contains("Re-run `cider install`", failureMessage, StringComparison.Ordinal);
+        Assert.Contains("Input/output error", failureMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BootoutThenBootstrap_GivesUpBoundedly_WhenServiceNeverDisappears()
+    {
+        var commands = new List<string>();
+        var steps = new List<string>();
+        // Pathological launchd: print keeps finding the service forever. The settle poll must be
+        // bounded and install must still attempt the bootstrap.
+        var run = ScriptedLaunchctl(
+            commands,
+            bootoutExit: 0,
+            printResults: new Queue<ProcessRunner.Result>([Ok("state = running")]), // repeats forever
+            bootstrapResults: new Queue<ProcessRunner.Result>([Ok()]));
+
+        var (bootstrap, failureMessage) = await LaunchdInstaller.BootoutThenBootstrapAsync(
+            run, Uid, "com.chillicream.cider.daemon", TestPlistPath, steps, new StringWriter(), CancellationToken.None, InstantDelay);
+
+        Assert.True(bootstrap.Succeeded);
+        Assert.Null(failureMessage);
+        Assert.Equal(20, commands.Count(c => c.Contains(" print ", StringComparison.Ordinal)));
+        Assert.Contains(steps, s => s.Contains("attempting bootstrap anyway", StringComparison.Ordinal));
+    }
 }

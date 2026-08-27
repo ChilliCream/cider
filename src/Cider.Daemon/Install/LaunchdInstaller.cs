@@ -139,18 +139,12 @@ public static class LaunchdInstaller
             var uid = await GetUidAsync(RunExternalAsync, ct).ConfigureAwait(false);
             var target = $"gui/{uid}/{options.Label}";
 
-            var bootout = await ProcessRunner.RunAsync("launchctl", ["bootout", target], TimeSpan.FromSeconds(10), ct: ct).ConfigureAwait(false);
-            steps.Add($"launchctl bootout {target} (exit {bootout.ExitCode})");
-            Log(log, steps[^1]);
-
-            var bootstrap = await ProcessRunner.RunAsync("launchctl", ["bootstrap", $"gui/{uid}", plistPath], TimeSpan.FromSeconds(15), ct: ct).ConfigureAwait(false);
-            steps.Add($"launchctl bootstrap gui/{uid} {plistPath} (exit {bootstrap.ExitCode})");
-            Log(log, steps[^1]);
-            if (!bootstrap.Succeeded)
+            var (_, bootstrapFailure) = await BootoutThenBootstrapAsync(
+                RunExternalAsync, uid, options.Label, plistPath, steps, log, ct).ConfigureAwait(false);
+            if (bootstrapFailure is not null)
             {
-                var failMessage = $"launchctl bootstrap failed: {bootstrap.StdErr.Trim()}";
-                steps.Add(failMessage);
-                return new InstallResult(false, failMessage, steps);
+                steps.Add(bootstrapFailure);
+                return new InstallResult(false, bootstrapFailure, steps);
             }
 
             var kickstart = await ProcessRunner.RunAsync("launchctl", ["kickstart", "-k", target], TimeSpan.FromSeconds(15), ct: ct).ConfigureAwait(false);
@@ -202,6 +196,101 @@ public static class LaunchdInstaller
             steps.Add($"Error: {ex.Message}");
             return new InstallResult(false, $"Install failed: {ex.Message}", steps);
         }
+    }
+
+    /// <summary>Bounded number of <c>launchctl bootstrap</c> attempts before install gives up.</summary>
+    internal const int BootstrapAttempts = 3;
+
+    /// <summary>
+    /// Settle-poll bound after a successful bootout: <see cref="SettleMaxPolls"/> x
+    /// <see cref="SettlePollInterval"/> = ~5s. A poll count (not a wall-clock deadline) so tests
+    /// that inject an instant delay still terminate deterministically.
+    /// </summary>
+    private const int SettleMaxPolls = 20;
+
+    private static readonly TimeSpan SettlePollInterval = TimeSpan.FromMilliseconds(250);
+
+    private static readonly TimeSpan BootstrapRetryDelay = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// The bootout -&gt; settle-wait -&gt; bootstrap-with-retry sequence of <see cref="InstallAsync"/>,
+    /// with the process runner and delays injectable so tests can drive it without launchd.
+    ///
+    /// launchctl's <c>bootout</c> returns before launchd has finished tearing the service down, and
+    /// bootstrapping the same label mid-teardown fails with EIO ("Bootstrap failed: 5: Input/output
+    /// error") — which left a real upgrade with the old daemon stopped and no new one installed
+    /// (cider-gu1). So: after a bootout that removed a service (exit 0), poll
+    /// <c>launchctl print gui/&lt;uid&gt;/&lt;label&gt;</c> until it reports not-found (bounded ~5s),
+    /// then bootstrap, retrying up to <see cref="BootstrapAttempts"/> times with a short backoff.
+    /// </summary>
+    /// <returns>
+    /// The last bootstrap result, plus — when every attempt failed — the user-facing failure
+    /// message stating the machine state and the remediation; <c>null</c> on success.
+    /// </returns>
+    internal static async Task<(ProcessRunner.Result Bootstrap, string? FailureMessage)> BootoutThenBootstrapAsync(
+        ExternalCommandRunner run,
+        string uid,
+        string label,
+        string plistPath,
+        List<string> steps,
+        TextWriter log,
+        CancellationToken ct,
+        Func<TimeSpan, CancellationToken, Task>? delay = null)
+    {
+        delay ??= Task.Delay;
+        var target = $"gui/{uid}/{label}";
+
+        var bootout = await run("launchctl", ["bootout", target], TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+        steps.Add($"launchctl bootout {target} (exit {bootout.ExitCode})");
+        Log(log, steps[^1]);
+
+        if (bootout.ExitCode == 0)
+        {
+            // A service was actually removed; wait for launchd to finish the teardown before
+            // bootstrapping the same label. `launchctl print` failing means the service is gone.
+            var settled = false;
+            for (var poll = 0; poll < SettleMaxPolls; poll++)
+            {
+                var print = await run("launchctl", ["print", target], TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
+                if (!print.Succeeded)
+                {
+                    settled = true;
+                    break;
+                }
+
+                await delay(SettlePollInterval, ct).ConfigureAwait(false);
+            }
+
+            steps.Add(settled
+                ? $"Waited for launchd to finish removing {target}"
+                : $"launchd still reports {target} after ~{SettleMaxPolls * SettlePollInterval.TotalSeconds:0}s; attempting bootstrap anyway");
+            Log(log, steps[^1]);
+        }
+
+        ProcessRunner.Result bootstrap = default;
+        for (var attempt = 1; attempt <= BootstrapAttempts; attempt++)
+        {
+            bootstrap = await run("launchctl", ["bootstrap", $"gui/{uid}", plistPath], TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
+            steps.Add($"launchctl bootstrap gui/{uid} {plistPath} (exit {bootstrap.ExitCode}, attempt {attempt}/{BootstrapAttempts})");
+            Log(log, steps[^1]);
+            if (bootstrap.Succeeded)
+            {
+                return (bootstrap, null);
+            }
+
+            if (attempt < BootstrapAttempts)
+            {
+                await delay(BootstrapRetryDelay * attempt, ct).ConfigureAwait(false);
+            }
+        }
+
+        var state = bootout.ExitCode == 0
+            ? "The previous daemon was stopped and the new one did not start, so no cider daemon is running right now."
+            : "The new daemon did not start.";
+        var failureMessage =
+            $"launchctl bootstrap failed after {BootstrapAttempts} attempts: {bootstrap.StdErr.Trim()}\n" +
+            $"{state} Re-run `cider install` to try again.";
+        return (bootstrap, failureMessage);
     }
 
     /// <summary>
