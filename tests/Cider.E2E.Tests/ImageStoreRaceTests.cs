@@ -1,4 +1,8 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Globalization;
+using System.Reflection;
+using System.Text.Json;
 using Cider.Core.Configuration;
 using Cider.E2E.Tests.Infrastructure;
 using Xunit;
@@ -148,18 +152,55 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
     // NOT alpine:3.19 either (cider-ede.37 leg 4 correction): cider-ede.31's own report recorded
     // alpine:3.19 as the OTHER tag its incident corrupted (alongside redis:8.6), so seeding it here
     // risks a seed pull failing for a reason that has nothing to do with this race.
-    private static readonly string[] LoadImages = ["alpine:3.14", "alpine:3.20", "alpine:3.21"];
-    private const string ChurnImage = "alpine:3.16";
+    // CIDER_E2E_RACE_LOAD_IMAGES (comma-separated) overrides the concurrent-pull load tags for a
+    // control run. Needed because registry choice is load-bearing (cider-ede.37 control re-run
+    // finding): Docker Hub 429s an unauthenticated IP after ~100 pulls/6h, and this race makes
+    // hundreds of registry hits in minutes -- a control run against docker.io collapses into
+    // instant-429 cycles that never open a write window, which is the same "cycles that do no real
+    // work" confound the re-run existed to remove. mirror.gcr.io serves the same library images
+    // (same digests) without that limit.
+    private static readonly string[] LoadImages =
+        Environment.GetEnvironmentVariable("CIDER_E2E_RACE_LOAD_IMAGES") is { Length: > 0 } load
+            ? load.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            : ["alpine:3.14", "alpine:3.20", "alpine:3.21"];
+
+    // cider-ede.37 control re-run condition (task comments #148/#151): the write window this race
+    // needs open is "blobs written, index entry not yet committed", and its width is proportional to
+    // how much there is to write. The default churn tag (alpine:3.16, small and usually warm) has a
+    // window of milliseconds; the three real corruptions this machine suffered were alpine:3.19,
+    // redis:8.6 and alpine:3.18 -- redis being a large multi-layer network pull with a window of
+    // seconds. CIDER_E2E_RACE_CHURN_IMAGE overrides the churn tag for such a control run (e.g.
+    // redis:8.6). When it is set, the run is a deliberate cold-image control, so the test ALSO
+    // asserts, from the Apple store's own state.json, that the image is genuinely absent before the
+    // seed pull (absence asserted, not assumed -- recorded in the run's own output) and that the
+    // baseline store is clean (no state entry lacking its blob); a dirty baseline stops the run as
+    // INCONCLUSIVE rather than confounding it. The default (unset) keeps the small warm tag and the
+    // three-way delta outcomes so the suite-run test never goes red on a machine whose store already
+    // carries unrelated damage.
+    private static readonly string ChurnImage =
+        Environment.GetEnvironmentVariable("CIDER_E2E_RACE_CHURN_IMAGE") is { Length: > 0 } churn
+            ? churn
+            : "alpine:3.16";
+
+    private static readonly bool ColdChurnControl =
+        Environment.GetEnvironmentVariable("CIDER_E2E_RACE_CHURN_IMAGE") is { Length: > 0 };
 
     // cider-ede.37 leg 4 correction: the full minute this test was written with burns a minute of
     // Docker Hub traffic against four tags on every default `dotnet test` run on this shared machine.
     // Set CIDER_E2E_RACE_FULL=1 to run the full budget cider-ede.31's Verification section asked for;
     // left unset (the default), a much shorter budget still exercises the same race loops, just with
     // fewer iterations.
+    // CIDER_E2E_RACE_BUDGET_SECONDS (cider-ede.37 control re-run) takes precedence over both so a
+    // sustained control run (10+ minutes with a large churn image whose cycle time is seconds) can be
+    // driven without touching the suite defaults.
     private static readonly TimeSpan RaceBudget =
-        string.Equals(Environment.GetEnvironmentVariable("CIDER_E2E_RACE_FULL"), "1", StringComparison.Ordinal)
-            ? TimeSpan.FromMinutes(1)
-            : TimeSpan.FromSeconds(15);
+        int.TryParse(
+            Environment.GetEnvironmentVariable("CIDER_E2E_RACE_BUDGET_SECONDS"),
+            NumberStyles.None, CultureInfo.InvariantCulture, out var budgetSeconds) && budgetSeconds > 0
+            ? TimeSpan.FromSeconds(budgetSeconds)
+            : string.Equals(Environment.GetEnvironmentVariable("CIDER_E2E_RACE_FULL"), "1", StringComparison.Ordinal)
+                ? TimeSpan.FromMinutes(1)
+                : TimeSpan.FromSeconds(15);
 
     private static readonly TimeSpan PullTimeout = TimeSpan.FromMinutes(3);
 
@@ -218,9 +259,131 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
         text.Contains(PreExistingDanglingContentMarker, StringComparison.Ordinal) &&
         text.Contains(TrackedDanglingContentDigest, StringComparison.Ordinal);
 
+    // Apple's machine-wide shared image store -- the store every cider daemon on this machine
+    // (including this test's throwaway one) actually writes through. The scan below reads its index
+    // (state.json: reference -> {digest,...}) and checks each entry's blob file exists, which is the
+    // literal definition of the corruption cider-ede.31 fixed: a state entry whose digest has no file
+    // under content/blobs/sha256.
+    private static readonly string AppleStoreRoot = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        "Library", "Application Support", "com.apple.container");
+
+    /// <summary>
+    /// Reads the Apple store's own index and returns every reference it holds plus every entry whose
+    /// blob file is missing (<c>"reference -> digest"</c>). <c>null</c> when the index cannot be read
+    /// (missing or, transiently, mid-write -- retried a few times before giving up). Only called when
+    /// the race loops are quiescent (before seeding, after the race), never mid-race.
+    /// </summary>
+    private static (IReadOnlyList<string> References, IReadOnlyList<string> MissingBlobEntries)? ScanAppleStoreState()
+    {
+        var statePath = Path.Combine(AppleStoreRoot, "state.json");
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                if (!File.Exists(statePath))
+                {
+                    return null;
+                }
+
+                using var doc = JsonDocument.Parse(File.ReadAllText(statePath));
+                var references = new List<string>();
+                var missing = new List<string>();
+                foreach (var entry in doc.RootElement.EnumerateObject())
+                {
+                    references.Add(entry.Name);
+                    var digest = entry.Value.GetProperty("digest").GetString()!;
+                    var blobPath = Path.Combine(
+                        AppleStoreRoot, "content", "blobs", "sha256", digest["sha256:".Length..]);
+                    if (!File.Exists(blobPath))
+                    {
+                        missing.Add($"{entry.Name} -> {digest}");
+                    }
+                }
+
+                return (references, missing);
+            }
+            catch (Exception e) when (e is IOException or JsonException)
+            {
+                Thread.Sleep(500);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Whether an Apple-store index key (fully qualified, e.g. <c>docker.io/library/redis:8.6</c>)
+    /// names the short image reference this test uses (e.g. <c>redis:8.6</c>).
+    /// </summary>
+    private static bool ReferenceMatches(string stateKey, string image) =>
+        string.Equals(stateKey, image, StringComparison.Ordinal) ||
+        stateKey.EndsWith("/" + image, StringComparison.Ordinal);
+
     [E2EFact]
     public async Task Concurrent_pulls_survive_a_minute_of_rmi_churn_without_corrupting_the_store()
     {
+        // Negative-control integrity check (cider-ede.37, kept in the harness rather than as a
+        // throwaway probe): CIDER_TEST_SKIP_BLOB_SWEEP_GATE must genuinely flip
+        // AppleContainerRuntime.SkipBlobSweepGateForTest in THIS process (the daemon under test is
+        // in-process, so this reflected value is the exact flag the racing RemoveImageAsync reads).
+        // Without this, a "control" run could silently be a no-op with the gate still engaged.
+        var skipGateRequested = string.Equals(
+            Environment.GetEnvironmentVariable("CIDER_TEST_SKIP_BLOB_SWEEP_GATE"), "1", StringComparison.Ordinal);
+        var gateField = typeof(Cider.AppleContainer.AppleContainerRuntime).GetField(
+            "SkipBlobSweepGateForTest", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.True(gateField is not null, "AppleContainerRuntime.SkipBlobSweepGateForTest no longer exists -- the negative-control seam was removed or renamed");
+        var gateSkipped = (bool)gateField!.GetValue(null)!;
+        Assert.True(
+            skipGateRequested == gateSkipped,
+            $"CIDER_TEST_SKIP_BLOB_SWEEP_GATE requested skip={skipGateRequested} but the reflected " +
+            $"AppleContainerRuntime.SkipBlobSweepGateForTest is {gateSkipped} -- the control seam did not engage");
+        output.WriteLine(
+            $"blob-sweep gate: skip requested={skipGateRequested}, reflected SkipBlobSweepGateForTest={gateSkipped} " +
+            (gateSkipped
+                ? "(NEGATIVE CONTROL: cider-ede.31's fix DISABLED, pre-fix unguarded sweep window restored)"
+                : "(fix enabled: sweeps serialized against this daemon's writes, cider-ede.31 default)"));
+
+        // Baseline store health, recorded from the store's own index BEFORE anything is pulled: a
+        // pre-existing entry lacking its blob would confound the entire run (any dangling entry found
+        // afterwards could not be attributed to the race). Recorded always; enforced when this run is
+        // a deliberate cold-image control (see ChurnImage's doc comment).
+        var preSeedLs = await Cmd.RunAsync("container", ["image", "ls"], timeout: TimeSpan.FromSeconds(60));
+        var preScan = ScanAppleStoreState();
+        output.WriteLine(
+            $"pre-seed baseline: `container image ls` ok={preSeedLs.Ok}; state.json scan: " +
+            (preScan is null
+                ? "unavailable"
+                : $"{preScan.Value.References.Count} entries, {preScan.Value.MissingBlobEntries.Count} missing blob(s)" +
+                  (preScan.Value.MissingBlobEntries.Count > 0
+                      ? ":\n" + string.Join('\n', preScan.Value.MissingBlobEntries)
+                      : "")));
+
+        var churnPresentBeforeSeed = preScan?.References.Any(r => ReferenceMatches(r, ChurnImage));
+        output.WriteLine(
+            $"churn image {ChurnImage}: cold-control mode={ColdChurnControl}; present in store before seed pull: " +
+            $"{(churnPresentBeforeSeed is null ? "unknown (scan unavailable)" : churnPresentBeforeSeed.Value ? "YES (warm)" : "NO (cold -- absence asserted from the store's own index, not assumed)")}");
+
+        if (ColdChurnControl)
+        {
+            if (!preSeedLs.Ok || preScan is null || preScan.Value.MissingBlobEntries.Count > 0)
+            {
+                Assert.Fail(
+                    "INCONCLUSIVE -- baseline store not clean before the cold-image control run, so the " +
+                    "experiment is stopped rather than confounded (a pre-existing dangling entry makes " +
+                    "'did the race produce a NEW one?' unanswerable):\n" +
+                    $"container image ls ok={preSeedLs.Ok}\n{preSeedLs}\n" +
+                    $"state.json scan: {(preScan is null ? "unavailable" : string.Join('\n', preScan.Value.MissingBlobEntries))}");
+            }
+
+            Assert.True(
+                churnPresentBeforeSeed == false,
+                $"cold-image control requires {ChurnImage} to be genuinely ABSENT from the Apple store " +
+                "before the seed pull (the write window this control needs is a real multi-layer network " +
+                $"pull, not a warm no-op), but the store's own index already holds it -- remove it or " +
+                "choose a genuinely uncached image");
+        }
+
         // Self-pulled: every image this race touches is pulled by this test before the race starts,
         // so what follows races re-pulls and re-deletes of known-present, this-run images, not first
         // pulls that happen to interleave with an rmi for something else.
@@ -284,7 +447,9 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
         // Two independent rmi/re-pull loops on the same churn tag, plus the four-image pull loop,
         // all racing for the whole minute -- more concurrent writers hitting the daemon's
         // BlobSweepGate at once than a single pair of loops would.
+        var raceClock = Stopwatch.StartNew();
         await Task.WhenAll(PullLoopAsync(), RmiLoopAsync(), RmiLoopAsync());
+        raceClock.Stop();
 
         // Separate the pre-existing, out-of-scope confound this class's remarks and
         // PreExistingDanglingContentMarker's own doc comment document (a deterministic, non-racy
@@ -298,9 +463,12 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
         // fails -- the task's own close condition requires reporting the negative control and the
         // post-fix run at the SAME count and concurrency, which is unverifiable without this.
         output.WriteLine(
-            $"race budget {RaceBudget}, concurrency 3 (1 pull loop + 2 rmi loops): " +
+            $"race budget {RaceBudget} (wall {raceClock.Elapsed}), concurrency 3 (1 pull loop + 2 rmi loops), " +
+            $"churn image {ChurnImage}: " +
             $"{pullAttempts} pull attempts ({pullFailures} failed), " +
-            $"{rmiAttempts} rmi/re-pull attempts ({rePullFailures} failed); " +
+            $"{rmiAttempts} rmi/re-pull attempts ({rePullFailures} failed, " +
+            $"avg cycle {(rmiAttempts > 0 ? (raceClock.Elapsed.TotalSeconds * 2 / rmiAttempts).ToString("F1", CultureInfo.InvariantCulture) : "n/a")}s " +
+            "per rmi loop); " +
             $"of {pullFailures + rePullFailures} total failures, {confoundFailures} carry the " +
             "pre-existing dangling-content marker (known, out-of-scope confound -- see " +
             "PreExistingDanglingContentMarker's doc comment) and " +
@@ -350,6 +518,29 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
         // above (cider-ede.37 leg 1 correction, finding 2) so a new dangling digest that restore itself
         // might produce also shows up in the baseline-vs-post-race delta below.
         var appleList = await Cmd.RunAsync("container", ["image", "ls"], timeout: TimeSpan.FromSeconds(60));
+
+        // Direct, filesystem-level form of the failure criterion, from the store's own index rather
+        // than inferred from `container image ls`'s exit code: after the race (loops quiescent), no
+        // state entry may lack its blob file EXCEPT the one pre-existing tracked confound
+        // (TrackedDanglingContentDigest, cider-ede.41). Any OTHER missing-blob entry is a dangling
+        // entry this run produced -- the exact corruption cider-ede.31 exists to prevent -- and fails
+        // loudly regardless of what `image ls` happens to report.
+        var postScan = ScanAppleStoreState();
+        var newDangling = postScan?.MissingBlobEntries
+            .Where(e => !e.Contains(TrackedDanglingContentDigest, StringComparison.Ordinal))
+            .ToArray() ?? [];
+        output.WriteLine(
+            "post-race state.json scan: " +
+            (postScan is null
+                ? "unavailable"
+                : $"{postScan.Value.References.Count} entries, {postScan.Value.MissingBlobEntries.Count} missing blob(s), " +
+                  $"{newDangling.Length} NEW (not the tracked cider-ede.41 confound)"));
+        Assert.True(
+            newDangling.Length == 0,
+            "CORRUPTION REPRODUCED -- after the race, the Apple store's own index holds entr(ies) whose " +
+            "blob file is missing under content/blobs/sha256, and the digest is NOT the tracked " +
+            "cider-ede.41 confound, so this is a dangling entry this run itself produced:\n" +
+            string.Join('\n', newDangling));
 
         // No state entry this race actually touched lacks its blob: every LoadImages tag (pulled
         // repeatedly by the race, never deleted by it) is still inspectable and actually runnable
