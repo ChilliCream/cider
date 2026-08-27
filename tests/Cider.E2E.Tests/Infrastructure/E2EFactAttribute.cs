@@ -16,6 +16,31 @@ public sealed class E2EFactAttribute : FactAttribute
 }
 
 /// <summary>
+/// An E2E fact that also needs <c>CIDER_E2E_XPROC_RACE=1</c>: cider-ede.41's cross-process
+/// store-corruption experiment. It spawns two throwaway daemon <em>processes</em> and runs a
+/// sustained (default 15-minute) pull-vs-prune race whose prune side sweeps the one machine-wide
+/// shared Apple store — deliberate, clean-baseline-verified store-wide prunes that the rest of the
+/// suite's own environment rules forbid running casually (see <see cref="ImageStoreRaceFixture"/>'s
+/// remarks on why the intra-daemon race rejected the prune path). Never part of a default suite run.
+/// </summary>
+public sealed class CrossProcessRaceFactAttribute : FactAttribute
+{
+    /// <summary>Applies the skip reason unless the cross-process race experiment is opted into.</summary>
+    public CrossProcessRaceFactAttribute()
+    {
+        if (DaemonFixture.SkipReason is { } reason)
+        {
+            Skip = reason;
+        }
+        else if (!string.Equals(Environment.GetEnvironmentVariable("CIDER_E2E_XPROC_RACE"), "1", StringComparison.Ordinal))
+        {
+            Skip = "set CIDER_E2E_XPROC_RACE=1 to run cider-ede.41's cross-process store race " +
+                "(sustained; prunes the shared machine-wide Apple store from a throwaway daemon)";
+        }
+    }
+}
+
+/// <summary>
 /// An E2E fact that also needs <c>CIDER_PORT_PUBLISHING=apple</c>: it characterizes what
 /// Apple <c>container</c>'s own published-port forwarder does, which the default <c>proxy</c> mode
 /// deliberately bypasses.

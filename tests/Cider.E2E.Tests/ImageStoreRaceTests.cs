@@ -264,7 +264,7 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
     // (state.json: reference -> {digest,...}) and checks each entry's blob file exists, which is the
     // literal definition of the corruption cider-ede.31 fixed: a state entry whose digest has no file
     // under content/blobs/sha256.
-    private static readonly string AppleStoreRoot = Path.Combine(
+    internal static readonly string AppleStoreRoot = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         "Library", "Application Support", "com.apple.container");
 
@@ -274,7 +274,7 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
     /// (missing or, transiently, mid-write -- retried a few times before giving up). Only called when
     /// the race loops are quiescent (before seeding, after the race), never mid-race.
     /// </summary>
-    private static (IReadOnlyList<string> References, IReadOnlyList<string> MissingBlobEntries)? ScanAppleStoreState()
+    internal static (IReadOnlyList<string> References, IReadOnlyList<string> MissingBlobEntries)? ScanAppleStoreState()
     {
         var statePath = Path.Combine(AppleStoreRoot, "state.json");
         for (var attempt = 0; attempt < 3; attempt++)
@@ -316,7 +316,7 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
     /// Whether an Apple-store index key (fully qualified, e.g. <c>docker.io/library/redis:8.6</c>)
     /// names the short image reference this test uses (e.g. <c>redis:8.6</c>).
     /// </summary>
-    private static bool ReferenceMatches(string stateKey, string image) =>
+    internal static bool ReferenceMatches(string stateKey, string image) =>
         string.Equals(stateKey, image, StringComparison.Ordinal) ||
         stateKey.EndsWith("/" + image, StringComparison.Ordinal);
 
@@ -620,6 +620,534 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
                 "and runnable). The literal 'container image ls exits 0' outcome cider-ede.31's " +
                 "Verification section named cannot be demonstrated on this machine until that " +
                 "pre-existing entry is repaired by an operator:\n" + appleList);
+        }
+    }
+}
+
+/// <summary>The collection <see cref="CrossProcessImageStoreRaceTests"/> uses so nothing else runs beside it.</summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class CrossProcessImageStoreRaceCollection
+{
+    /// <summary>The xunit collection name.</summary>
+    public const string Name = "cider-e2e-xproc-image-store-race";
+}
+
+/// <summary>
+/// E2E — cider-ede.41 Fix direction step 1: the CROSS-process store-corruption experiment the
+/// intra-daemon race above structurally cannot run. cider-ede.31's blob-sweep gate is an in-process
+/// lock, documented as such (task cider-ede.31 comment #85): it serializes THIS daemon's sweeps
+/// against THIS daemon's image writes and can never see another process's. This machine routinely
+/// runs several cider daemons against the ONE machine-wide Apple store, and cider-ede.41's hypothesis
+/// is that the three real corruptions came through exactly that blind spot: a <c>docker image
+/// prune</c> in one daemon sweeping the whole shared store while another daemon is midway through a
+/// pull whose blobs are written but whose index entry is not yet committed.
+///
+/// So, unlike every other test in this suite, this one spawns TWO throwaway daemons as separate OS
+/// processes (the built <c>cider</c> apphost sitting next to this test assembly, <c>serve</c> on
+/// /tmp sockets and data dirs, <c>--no-dns</c> so no forwarder containers are minted) — daemon A
+/// pulling a large, genuinely-uncached image in a loop (absence asserted from the store's own index
+/// before every pull, per cider-ede.37's control-re-run conditions), daemon B running <c>docker
+/// image prune</c> in a loop. BOTH daemons run with the cider-ede.31 gate ENABLED, in its normal
+/// default configuration — the point is precisely that two correctly-gated daemons should still be
+/// able to corrupt the store across the process boundary if the hypothesis is right. Both daemons
+/// are pinned to the XPC transport: prune's store-wide sweep
+/// (<c>XpcContainerRuntime.PruneImagesAsync</c> → <c>imageCleanupOrphanedBlobs</c>) only exists
+/// there (the CLI transport's <c>PruneImagesAsync</c> is the interface default no-op — its sweep
+/// rides on <c>image delete</c> instead), and daemon A's per-cycle <c>rmi</c> is
+/// <c>imageDelete(garbageCollect: false)</c> on XPC — no sweep — so daemon B's prune is the ONE
+/// sweeping verb in the whole experiment and any interference is attributable to it alone.
+///
+/// FAILURE CRITERION, stated up front (the ticket's, verbatim): a dangling entry appears — an index
+/// entry in the shared store's <c>state.json</c> whose digest has no blob file under
+/// <c>content/blobs/sha256</c> — or Apple's own <c>container image ls</c> exits non-zero after the
+/// run. The 13ea1d0 digest-specific classifier semantics are kept: a dangling entry is reported with
+/// its exact reference and digest, and one matching the historically-tracked cider-ede.41 confound
+/// digest is labelled as that entry RESURFACING rather than misattributed as new — though this
+/// experiment additionally requires (and asserts) a CLEAN baseline before running at all, per the
+/// planner's #160 correction: a pre-existing dangling entry is a confound, not a fixture, and a
+/// dirty or non-listing baseline stops the run as INCONCLUSIVE rather than confounding it.
+///
+/// Secondary signal, recorded but deliberately NOT a test failure: a pull in daemon A failing with
+/// the mid-write sweep signature (blob deleted out from under the in-flight pull — NSCocoaErrorDomain
+/// "No such file or directory" under content/blobs/sha256, the exact signature cider-ede.37's
+/// gate-disabled intra-daemon control produced 6/74 cycles) while daemon B was pruning. That proves
+/// the cross-process interference MECHANISM with both gates enabled — the in-process gate demonstrably
+/// not covering the other process's sweep — even if the committed-index-entry sub-case (the literal
+/// dangling end-state) does not land within the budget. It is reported prominently either way; the
+/// ticket's Outcome A/B split stays keyed to the dangling-entry criterion above.
+///
+/// Deliberate safety choices, because daemon B's prune runs against the real shared store: the prune
+/// carries <c>--filter label=cider-ede41-xproc-never-matches</c>, a label no image on this machine
+/// carries, so <c>ImageManager.PruneAsync</c> deletes NO images (in particular not the developer's
+/// dangling <c>cider-build-*</c> build records, which an unfiltered dangling-only prune would sweep
+/// up) — and then, per cider-ede.31's own "a no-op prune must still sweep" rule, unconditionally runs
+/// the one store-wide orphaned-blob sweep this experiment is about. The sweep itself only ever
+/// reclaims blobs no index entry references (that is the sanctioned, user-invocable reclaim path);
+/// the only orphans this run manufactures are the churn image's own, and the only index entries at
+/// risk mid-pull are for the image this test itself pulls. Corruption is only ever constructed
+/// through normal pull/prune/rmi verbs from the two throwaway daemons — never by touching store
+/// files directly, never through the user's installed daemon.
+/// </summary>
+[Collection(CrossProcessImageStoreRaceCollection.Name)]
+[Trait("Category", "E2E")]
+public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
+{
+    // Large, genuinely-uncached churn image from the mirror. NEVER docker.io: Docker Hub 429s an
+    // unauthenticated IP after ~100 pulls/6h, and cider-ede.37's first control run collapsed into
+    // instant-429 cycles that never opened a write window -- the exact vacuous-cycle confound this
+    // experiment must not repeat. mirror.gcr.io serves the same library images (same digests) without
+    // that limit; redis:8.6 is the multi-layer ~seconds-wide-window image the corrected leg-1 control
+    // measured at ~25s per real network pull on this machine.
+    private static readonly string ChurnImage =
+        Environment.GetEnvironmentVariable("CIDER_E2E_XPROC_CHURN_IMAGE") is { Length: > 0 } churn
+            ? churn
+            : "mirror.gcr.io/library/redis:8.6";
+
+    // Sustained-run budget for the racing loops. Default 900s of real cycles -- the same budget as
+    // cider-ede.37's corrected leg-1 control (74 cycles / ~25s each at 900s), so the two experiments'
+    // negative results are comparable if this one also fails to reproduce.
+    private static readonly TimeSpan RaceBudget = TimeSpan.FromSeconds(
+        int.TryParse(
+            Environment.GetEnvironmentVariable("CIDER_E2E_XPROC_BUDGET_SECONDS"),
+            NumberStyles.None, CultureInfo.InvariantCulture, out var seconds) && seconds > 0
+            ? seconds
+            : 900);
+
+    // A label no image on this machine carries: makes daemon B's prune delete nothing while still
+    // running the unconditional store-wide sweep (see class remarks).
+    private const string NeverMatchingPruneLabel = "cider-ede41-xproc-never-matches";
+
+    // The historically-tracked cider-ede.41 dangling digest (alpine:3.18's), kept from 13ea1d0's
+    // classifier so a post-race dangling entry matching it is reported as that entry RESURFACING
+    // (store repaired before this run) rather than silently counted as brand-new corruption.
+    private const string HistoricalTrackedDanglingDigest =
+        "sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979713c2d4f";
+
+    // The mid-write sweep interference signatures: a pull's freshly-written blob deleted out from
+    // under it by the concurrent sweep. Two shapes observed live: the filesystem-level one the
+    // gate-disabled intra-daemon control produced (cider-ede.37 leg-1 re-run, 6/74 cycles --
+    // NSCocoaErrorDomain "No such file or directory" mid-unpack), and the content-resolution one this
+    // experiment's own first run produced (2026-08-27, cycle 1: `pull <ref>: content with digest
+    // sha256:...` -- Apple's generic dangling-content error text, here naming the digest of the very
+    // image being pulled, whose just-written blob the other process's sweep had deleted). The store
+    // index is scanned right after every failed pull regardless, so whether a given interference hit
+    // also committed a persistent dangling entry (the ticket's Outcome A criterion) is always decided
+    // from the store itself, never from this text.
+    private static bool IsSweepInterferenceSignature(string text) =>
+        text.Contains("No such file or directory", StringComparison.Ordinal) ||
+        text.Contains("NSCocoaErrorDomain", StringComparison.Ordinal) ||
+        text.Contains("content with digest", StringComparison.Ordinal);
+
+    private static readonly TimeSpan PullTimeout = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan PruneTimeout = TimeSpan.FromMinutes(3);
+    private static readonly TimeSpan DaemonReadyTimeout = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan ReclaimWaitTimeout = TimeSpan.FromMinutes(3);
+
+    /// <summary>One spawned throwaway daemon process (the real built <c>cider</c> apphost), plus the
+    /// docker-CLI environment that talks to it and the teardown that removes every trace of it.</summary>
+    private sealed class SpawnedDaemon : IAsyncDisposable
+    {
+        public required string Name { get; init; }
+
+        public required BackgroundProcess Process { get; init; }
+
+        public required string SocketPath { get; init; }
+
+        public required string DataDir { get; init; }
+
+        public required string DockerConfigDir { get; init; }
+
+        public Task<CommandResult> DockerAsync(IEnumerable<string> arguments, TimeSpan? timeout = null) =>
+            Cmd.RunAsync(
+                "docker",
+                arguments,
+                new Dictionary<string, string?>(StringComparer.Ordinal)
+                {
+                    ["DOCKER_HOST"] = "unix://" + SocketPath,
+                    ["DOCKER_CONTEXT"] = null,
+                    ["DOCKER_CONFIG"] = DockerConfigDir,
+                    ["DOCKER_TLS_VERIFY"] = null,
+                    ["DOCKER_CERT_PATH"] = null,
+                },
+                timeout: timeout);
+
+        public async ValueTask DisposeAsync()
+        {
+            await Process.DisposeAsync();
+            try
+            {
+                if (Directory.Exists(DataDir))
+                {
+                    Directory.Delete(DataDir, recursive: true);
+                }
+
+                if (Directory.Exists(DockerConfigDir))
+                {
+                    Directory.Delete(DockerConfigDir, recursive: true);
+                }
+
+                if (File.Exists(SocketPath))
+                {
+                    File.Delete(SocketPath);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    private async Task<SpawnedDaemon> SpawnDaemonAsync(string name)
+    {
+        var id = Guid.NewGuid().ToString("n")[..8];
+        var dataDir = $"/tmp/cider-e2e-xp{name}-{id}";
+        var socketPath = $"/tmp/cider-e2e-xp{name}-{id}.sock";
+        var dockerConfigDir = dataDir + "-docker-config";
+        Directory.CreateDirectory(dataDir);
+        Directory.CreateDirectory(dockerConfigDir);
+
+        // The real daemon executable, built alongside this test assembly by the project reference.
+        var apphost = Path.Combine(AppContext.BaseDirectory, "cider");
+        Assert.True(File.Exists(apphost), $"daemon apphost not found at {apphost}");
+
+        var process = Cmd.Start(
+            apphost,
+            ["serve", "--socket", socketPath, "--data-dir", dataDir, "--log-level", "Debug", "--no-dns"],
+            new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                // XPC pinned: prune's store-wide sweep only exists on this transport, and rmi here is
+                // imageDelete(garbageCollect: false) -- no sweep -- so daemon B's prune stays the one
+                // sweeping verb in the experiment (see class remarks).
+                ["CIDER_RUNTIME_TRANSPORT"] = "xpc",
+
+                // The gate stays ENABLED in both daemons -- the ticket's hypothesis is that a normal,
+                // correctly-gated daemon still cannot see the other process's sweep. Nulled explicitly
+                // so an ambient control-run leftover can never silently disable it here.
+                ["CIDER_TEST_SKIP_BLOB_SWEEP_GATE"] = null,
+                ["CIDER_DATA_DIR"] = null,
+                ["CIDER_SOCKET"] = null,
+                ["CIDER_LOG_LEVEL"] = null,
+            });
+
+        var daemon = new SpawnedDaemon
+        {
+            Name = name,
+            Process = process,
+            SocketPath = socketPath,
+            DataDir = dataDir,
+            DockerConfigDir = dockerConfigDir,
+        };
+
+        var ready = await DaemonFixture.EventuallyAsync(
+            async () => !process.HasExited &&
+                (await daemon.DockerAsync(["version", "--format", "{{.Server.Version}}"], TimeSpan.FromSeconds(10))).Ok,
+            DaemonReadyTimeout);
+        if (!ready)
+        {
+            var tail = process.Stdout + "\n" + process.Stderr;
+            await daemon.DisposeAsync();
+            Assert.Fail($"throwaway daemon {name} never became ready on {socketPath}:\n{tail}");
+        }
+
+        output.WriteLine($"daemon {name}: pid {process.Pid}, socket {socketPath}, data dir {dataDir}, transport xpc, gate ENABLED (default)");
+        return daemon;
+    }
+
+    /// <summary>Post-race dangling entries from the store's own index, as "reference -> digest" lines.</summary>
+    private static string[] DanglingEntries() =>
+        ImageStoreRaceTests.ScanAppleStoreState() is { } scan ? [.. scan.MissingBlobEntries] : [];
+
+    [CrossProcessRaceFact]
+    public async Task Two_gated_daemons_pull_vs_prune_across_processes_against_the_shared_store()
+    {
+        // The gate must be ENABLED in this experiment, in every process involved: assert the control
+        // env var is not ambiently set (the spawned daemons additionally null it in their own env).
+        Assert.True(
+            Environment.GetEnvironmentVariable("CIDER_TEST_SKIP_BLOB_SWEEP_GATE") is null or "",
+            "CIDER_TEST_SKIP_BLOB_SWEEP_GATE is set in the ambient environment -- this experiment " +
+            "requires the cider-ede.31 gate ENABLED (normal config) in both daemons; unset it");
+
+        // CLEAN BASELINE, required and recorded (cider-ede.41 comment #160): `container image ls`
+        // exit 0 AND an index scan showing 0 entries missing blobs, before anything else runs. A
+        // dirty baseline is a confound ("did we produce a NEW dangling entry?" becomes unanswerable)
+        // and stops the run as INCONCLUSIVE.
+        var baselineLs = await Cmd.RunAsync("container", ["image", "ls"], timeout: TimeSpan.FromSeconds(60));
+        var baselineScan = ImageStoreRaceTests.ScanAppleStoreState();
+        output.WriteLine(
+            $"CLEAN BASELINE: `container image ls` ok={baselineLs.Ok}; index scan: " +
+            (baselineScan is null
+                ? "unavailable"
+                : $"{baselineScan.Value.References.Count} entries, {baselineScan.Value.MissingBlobEntries.Count} missing blob(s)"));
+        if (!baselineLs.Ok || baselineScan is null || baselineScan.Value.MissingBlobEntries.Count > 0)
+        {
+            Assert.Fail(
+                "INCONCLUSIVE -- baseline store not clean before the cross-process race, stopping " +
+                "rather than confounding the experiment:\n" +
+                $"container image ls ok={baselineLs.Ok}\n{baselineLs}\n" +
+                "index scan: " + (baselineScan is null
+                    ? "unavailable"
+                    : string.Join('\n', baselineScan.Value.MissingBlobEntries)));
+        }
+
+        var baselineReferences = new HashSet<string>(baselineScan.Value.References, StringComparer.Ordinal);
+
+        // The churn image must be genuinely uncached before the experiment starts.
+        Assert.True(
+            !baselineReferences.Any(r => ImageStoreRaceTests.ReferenceMatches(r, ChurnImage)),
+            $"churn image {ChurnImage} is already present in the shared store's index -- this " +
+            "experiment needs a genuinely uncached image so every pull opens a real seconds-wide " +
+            "write window; choose another image or remove it first");
+        output.WriteLine($"churn image {ChurnImage}: ABSENT from the store index at baseline (asserted, not assumed)");
+
+        await using var pullDaemon = await SpawnDaemonAsync("a");
+        await using var pruneDaemon = await SpawnDaemonAsync("b");
+        Assert.True(
+            pullDaemon.Process.Pid != pruneDaemon.Process.Pid &&
+            pullDaemon.Process.Pid != Environment.ProcessId &&
+            pruneDaemon.Process.Pid != Environment.ProcessId,
+            "the two daemons and the test runner must be three distinct OS processes");
+        output.WriteLine(
+            $"cross-process topology: test pid {Environment.ProcessId}, pull daemon A pid " +
+            $"{pullDaemon.Process.Pid}, prune daemon B pid {pruneDaemon.Process.Pid} -- the ede.31 " +
+            "gate instance in each daemon is process-local and cannot see the other's operations");
+
+        var deadline = DateTime.UtcNow + RaceBudget;
+        var stop = false;
+        var pullCycles = 0;
+        var pullSuccesses = 0;
+        var sweepInterferenceFailures = 0;
+        var otherPullFailures = new ConcurrentQueue<string>();
+        var pruneAttempts = 0;
+        var pruneFailures = new ConcurrentQueue<string>();
+        var danglingSeen = new ConcurrentQueue<string>();
+        var cycleLog = new ConcurrentQueue<string>();
+        string? lastChurnDigest = null;
+
+        async Task PruneLoopAsync()
+        {
+            while (!Volatile.Read(ref stop) && DateTime.UtcNow < deadline)
+            {
+                var prune = await pruneDaemon.DockerAsync(
+                    ["image", "prune", "-f", "--filter", "label=" + NeverMatchingPruneLabel],
+                    PruneTimeout);
+                Interlocked.Increment(ref pruneAttempts);
+                if (!prune.Ok)
+                {
+                    pruneFailures.Enqueue(prune.ToString());
+                }
+            }
+        }
+
+        async Task PullLoopAsync()
+        {
+            var clock = Stopwatch.StartNew();
+            while (!Volatile.Read(ref stop) && DateTime.UtcNow < deadline)
+            {
+                var cycle = Interlocked.Increment(ref pullCycles);
+                var cycleStart = clock.Elapsed;
+
+                // ABSENCE ASSERTED FROM THE STORE INDEX BEFORE EACH PULL, recorded per cycle. After a
+                // previous cycle's rmi (garbageCollect: false) the index entry is gone but the blobs
+                // are orphans until daemon B's next sweep reclaims them -- wait for the previous
+                // cycle's own index digest blob to actually disappear too, so every pull is a real,
+                // full network pull with a real write window (a pull over still-present orphaned
+                // content would be the warm-cycle confound avery's #149 warned about). This wait is
+                // itself evidence: the blob vanishing here is daemon B's cross-process sweep working.
+                var indexEntryPresent = ImageStoreRaceTests.ScanAppleStoreState() is { } s &&
+                    s.References.Any(r => ImageStoreRaceTests.ReferenceMatches(r, ChurnImage));
+                if (indexEntryPresent)
+                {
+                    await pullDaemon.DockerAsync(["rmi", "-f", ChurnImage], PullTimeout);
+                }
+
+                var previousDigest = lastChurnDigest;
+                var blobGone = previousDigest is null || await DaemonFixture.EventuallyAsync(
+                    () => Task.FromResult(!File.Exists(Path.Combine(
+                        ImageStoreRaceTests.AppleStoreRoot, "content", "blobs", "sha256",
+                        previousDigest["sha256:".Length..]))),
+                    ReclaimWaitTimeout);
+                if (!blobGone)
+                {
+                    cycleLog.Enqueue(
+                        $"cycle {cycle}: previous cycle's index blob {lastChurnDigest} still on disk " +
+                        $"after {ReclaimWaitTimeout} of continuous prune sweeps -- daemon B's sweep is " +
+                        "not reclaiming, run is going vacuous");
+                    Volatile.Write(ref stop, true);
+                    break;
+                }
+
+                cycleLog.Enqueue(
+                    $"cycle {cycle} @ {cycleStart.TotalSeconds:F0}s: {ChurnImage} absent from index" +
+                    (lastChurnDigest is null ? "" : $", previous blob {lastChurnDigest[..19]}... reclaimed by daemon B's sweep") +
+                    " -- pulling (uncached, real network write window)");
+
+                var pull = await pullDaemon.DockerAsync(["pull", ChurnImage], PullTimeout);
+                if (pull.Ok)
+                {
+                    Interlocked.Increment(ref pullSuccesses);
+                    lastChurnDigest = ImageStoreRaceTests.ScanAppleStoreState() is { } post
+                        ? post.References
+                            .Where(r => ImageStoreRaceTests.ReferenceMatches(r, ChurnImage))
+                            .Select(ChurnDigestOf)
+                            .FirstOrDefault(d => d is not null)
+                        : null;
+                    await pullDaemon.DockerAsync(["rmi", "-f", ChurnImage], PullTimeout);
+                }
+                else
+                {
+                    var text = pull.ToString();
+                    if (IsSweepInterferenceSignature(text))
+                    {
+                        Interlocked.Increment(ref sweepInterferenceFailures);
+                        cycleLog.Enqueue(
+                            $"cycle {cycle}: PULL FAILED WITH THE MID-WRITE SWEEP SIGNATURE while " +
+                            "daemon B was pruning -- cross-process interference, both gates enabled:\n" + text);
+                    }
+                    else
+                    {
+                        otherPullFailures.Enqueue(text);
+                        cycleLog.Enqueue($"cycle {cycle}: pull failed WITHOUT the sweep signature (foreign confound?):\n" + text);
+                    }
+
+                    lastChurnDigest = null;
+                }
+
+                // The ticket's failure criterion, checked from the store's own index after every
+                // cycle so a reproduction stops the run at the iteration it happened on.
+                foreach (var entry in DanglingEntries())
+                {
+                    danglingSeen.Enqueue($"after cycle {cycle} ({clock.Elapsed.TotalSeconds:F0}s in): {entry}");
+                }
+
+                if (!danglingSeen.IsEmpty)
+                {
+                    Volatile.Write(ref stop, true);
+                }
+
+                if (pullDaemon.Process.HasExited || pruneDaemon.Process.HasExited)
+                {
+                    cycleLog.Enqueue($"cycle {cycle}: a throwaway daemon EXITED mid-race (A exited={pullDaemon.Process.HasExited}, B exited={pruneDaemon.Process.HasExited})");
+                    Volatile.Write(ref stop, true);
+                }
+            }
+        }
+
+        var raceClock = Stopwatch.StartNew();
+        await Task.WhenAll(PullLoopAsync(), PruneLoopAsync());
+        raceClock.Stop();
+
+        foreach (var line in cycleLog)
+        {
+            output.WriteLine(line);
+        }
+
+        // RESTORE the shared store toward its recorded clean baseline through normal verbs only:
+        // remove the one image this run pulled, let one final quiescent prune reclaim its orphans.
+        var restoreRmi = await pullDaemon.DockerAsync(["rmi", "-f", ChurnImage], PullTimeout);
+        var restorePrune = await pruneDaemon.DockerAsync(
+            ["image", "prune", "-f", "--filter", "label=" + NeverMatchingPruneLabel], PruneTimeout);
+        var finalScan = ImageStoreRaceTests.ScanAppleStoreState();
+        var finalLs = await Cmd.RunAsync("container", ["image", "ls"], timeout: TimeSpan.FromSeconds(60));
+
+        var daemonBReclaims = pruneDaemon.Process.Stdout
+            .Split('\n')
+            .Count(l => l.Contains("image prune: reclaimed", StringComparison.Ordinal));
+        var fallbackWarnings =
+            (pullDaemon.Process.Stdout + pullDaemon.Process.Stderr).Split('\n')
+                .Count(l => l.Contains("falling back to the CLI", StringComparison.Ordinal)) +
+            (pruneDaemon.Process.Stdout + pruneDaemon.Process.Stderr).Split('\n')
+                .Count(l => l.Contains("falling back to the CLI", StringComparison.Ordinal));
+
+        output.WriteLine(
+            $"race budget {RaceBudget} (wall {raceClock.Elapsed}): {pullCycles} pull cycle(s) " +
+            $"({pullSuccesses} completed, {sweepInterferenceFailures} failed with the mid-write sweep " +
+            $"signature, {otherPullFailures.Count} failed otherwise) in daemon A (pid {pullDaemon.Process.Pid}); " +
+            $"{pruneAttempts} prune sweep(s) ({pruneFailures.Count} failed) in daemon B (pid {pruneDaemon.Process.Pid}), " +
+            $"{daemonBReclaims} logged reclaim line(s); {fallbackWarnings} XPC->CLI fallback warning(s) " +
+            "(nonzero would mean a verb left the pinned XPC path); " +
+            $"restore: rmi ok={restoreRmi.Ok}, final prune ok={restorePrune.Ok}");
+        output.WriteLine(
+            "final state: index scan " +
+            (finalScan is null
+                ? "unavailable"
+                : $"{finalScan.Value.References.Count} entries, {finalScan.Value.MissingBlobEntries.Count} missing blob(s)") +
+            $"; container image ls ok={finalLs.Ok}");
+
+        foreach (var failure in pruneFailures.Take(5))
+        {
+            output.WriteLine("prune failure (recorded, not itself the criterion):\n" + failure);
+        }
+
+        // OUTCOME A -- the ticket's failure criterion met: a dangling entry appeared (or resurfaced).
+        // Reported with its exact identity and NOT repaired here: repairing the live shared store is
+        // an operator step (cider-ede.41's own rule), and `container image ls` may now be broken
+        // machine-wide (the known Apple failure mode).
+        var midRaceDangling = danglingSeen.ToArray();
+        var finalDangling = finalScan?.MissingBlobEntries ?? [];
+        if (midRaceDangling.Length > 0 || finalDangling.Count > 0)
+        {
+            var annotated = midRaceDangling
+                .Concat(finalDangling.Select(e => "at final scan: " + e))
+                .Select(e => e.Contains(HistoricalTrackedDanglingDigest, StringComparison.Ordinal)
+                    ? e + "  [matches the HISTORICAL tracked cider-ede.41 digest -- resurfaced, not new]"
+                    : e + "  [NEW digest]")
+                .ToArray();
+            Assert.Fail(
+                "OUTCOME A -- CROSS-PROCESS CORRUPTION REPRODUCED with the cider-ede.31 gate ENABLED " +
+                "in both daemons: the shared store's index holds entr(ies) whose blob file is missing, " +
+                "produced by a prune sweep in one process racing a pull mid-write in another -- the " +
+                "in-process gate is demonstrably insufficient across processes. DO NOT repair from " +
+                "code; record for the operator:\n" + string.Join('\n', annotated) +
+                $"\n(after {pullCycles} pull cycle(s) / {pruneAttempts} prune sweep(s) over {raceClock.Elapsed})");
+        }
+
+        // Any pull failure WITHOUT the sweep signature is a foreign confound (registry throttling,
+        // daemon death, ...) that silently narrows the write windows -- the run must not report a
+        // negative result built on cycles that never raced (avery's #149).
+        Assert.True(
+            otherPullFailures.IsEmpty,
+            $"{otherPullFailures.Count} pull failure(s) did not carry the mid-write sweep signature -- " +
+            "foreign confound, the sustained run's negative result would be uninterpretable:\n" +
+            string.Join('\n', otherPullFailures.Take(3)));
+
+        // OUTCOME B path: the criterion did not fire. The store must be back at its clean baseline.
+        Assert.True(
+            finalLs.Ok,
+            "`container image ls` exited non-zero after the race although the index scan found no " +
+            "dangling entry -- still the ticket's failure criterion:\n" + finalLs);
+        Assert.True(
+            finalScan is not null &&
+            baselineReferences.SetEquals(finalScan.Value.References),
+            "the shared store's index does not match the recorded clean baseline after restoration:\n" +
+            $"baseline ({baselineReferences.Count}): {string.Join(", ", baselineReferences.Order(StringComparer.Ordinal))}\n" +
+            $"final ({finalScan?.References.Count ?? 0}): {string.Join(", ", (finalScan?.References ?? []).Order(StringComparer.Ordinal))}");
+
+        output.WriteLine(
+            sweepInterferenceFailures > 0
+                ? $"OUTCOME B on the ticket's criterion (no dangling entry in {pullCycles} cycles), BUT " +
+                  $"the cross-process interference MECHANISM fired {sweepInterferenceFailures} time(s) " +
+                  "with both gates enabled -- report both numbers to the ticket verbatim"
+                : $"OUTCOME B: no dangling entry and no cross-process interference in {pullCycles} " +
+                  $"uncached pull cycle(s) against {pruneAttempts} store-wide prune sweep(s) over " +
+                  $"{raceClock.Elapsed} -- per the ticket, the leading explanation shifts to Apple's " +
+                  "own non-atomic pull");
+    }
+
+    /// <summary>The digest recorded in the store index for <paramref name="reference"/>, or null.</summary>
+    private static string? ChurnDigestOf(string reference)
+    {
+        try
+        {
+            var statePath = Path.Combine(ImageStoreRaceTests.AppleStoreRoot, "state.json");
+            using var doc = JsonDocument.Parse(File.ReadAllText(statePath));
+            return doc.RootElement.TryGetProperty(reference, out var entry) &&
+                entry.TryGetProperty("digest", out var digest)
+                ? digest.GetString()
+                : null;
+        }
+        catch (Exception e) when (e is IOException or JsonException)
+        {
+            return null;
         }
     }
 }

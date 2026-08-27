@@ -193,6 +193,27 @@ public sealed class BackgroundProcess : IAsyncDisposable
             PumpAsync(_process.StandardError, _stderr));
     }
 
+    /// <summary>The child's OS process id (cider-ede.41: lets the cross-process race harness prove
+    /// its two daemons really are distinct processes, distinct from the test process itself).</summary>
+    public int Pid => _process.Id;
+
+    /// <summary>Whether the child has exited (cider-ede.41: a spawned daemon dying mid-race must be
+    /// detected and reported rather than silently turning the rest of the run into no-ops).</summary>
+    public bool HasExited
+    {
+        get
+        {
+            try
+            {
+                return _process.HasExited;
+            }
+            catch (InvalidOperationException)
+            {
+                return true;
+            }
+        }
+    }
+
     /// <summary>Everything written to stdout so far.</summary>
     public string Stdout
     {
