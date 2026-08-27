@@ -61,15 +61,18 @@ namespace Cider.E2E.Tests;
 /// tightening all the way to the epic's literal promise once those outliers are counted, so the
 /// budgets are restated instead. The median budget is restored to 40 ms (unchanged from before
 /// cider-ede.36, ~1.4x over the worst observed 28.4 ms median) and the 8-parallel budget is set to
-/// 600 ms (~1.6x over the worst observed 373.9 ms wall — still a 2x tightening from the
+/// 900 ms (~1.6x over the worst observed 561.6 ms wall — the 19-run post-cider-ede.30 dataset's own
+/// maximum, cited above, not just the 373.9 ms reviewer outlier — still a 1.33x tightening from the
 /// pre-cider-ede.36 1200 ms, the largest the combined data supports). The epic's 25 ms figure
 /// remains the achieved *typical* median (13.0-20.2 ms comfortably clears it); per the cider-ede.36
 /// fixer correction (2026-08-27) that gap is recorded here rather than by amending the epic's
 /// Outcome. p99 (no epic target) is a different story: 9 of 10 sampled runs put it at 23.6-29.8 ms,
 /// one run spiked to 82.0 ms, and a separate reviewer run sampled 134.2 ms — real, occasional
 /// tail-latency events under this box's contention rather than measurement noise to be averaged
-/// away — so p99's budget stands at 150 ms, which produced no failure across the 17 combined runs
-/// behind this doc.
+/// away. An intervening tightening to 150 ms left only 1.12x headroom over that already-observed
+/// 134.2 ms sample — the same flakiness profile this doc rejects for the 8-parallel wall budget
+/// above — so a cider-ede.36 fixer re-correction (2026-08-27) restored p99's budget to 300 ms
+/// (~2.2x over the worst observed 134.2 ms sample).
 /// </summary>
 [Collection(DaemonCollection.Name)]
 [Trait("Category", "E2E")]
@@ -116,8 +119,8 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
             $"median containerCreate-over-XPC latency was {median:F1} ms (budget 40 ms) over " +
             $"{SequentialIterations} runs: " + string.Join(", ", samples.Select(s => s.ToString("F1"))));
         Assert.True(
-            p99 <= 150,
-            $"p99 containerCreate-over-XPC latency was {p99:F1} ms (budget 150 ms) over " +
+            p99 <= 300,
+            $"p99 containerCreate-over-XPC latency was {p99:F1} ms (budget 300 ms) over " +
             $"{SequentialIterations} runs: " + string.Join(", ", samples.Select(s => s.ToString("F1"))));
     }
 
@@ -146,7 +149,8 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
     /// 71.4-93.5 ms, and a 13-run verification pass under load average 15-21 produced one wall time of
     /// 207.2 ms (that run's own containerBootstrap contention, not a regression) alongside the
     /// reviewer's separately reproduced 373.9 ms wall. The budget below keeps headroom over the worst
-    /// of ALL of these (373.9 ms), not just the most favorable subset.
+    /// of ALL of these (561.6 ms, the 19-run dataset's own maximum), not just the most favorable
+    /// subset.
     /// </summary>
     [XpcOnlyFact]
     public async Task Eight_parallel_creates_of_a_cached_image_finish_within_budget()
@@ -166,9 +170,9 @@ public sealed class PerfSmokeTests(DaemonFixture daemon)
             stopwatch.Stop();
 
             Assert.True(
-                stopwatch.Elapsed <= TimeSpan.FromMilliseconds(600),
+                stopwatch.Elapsed <= TimeSpan.FromMilliseconds(900),
                 $"{parallelism} parallel containerCreate-over-XPC calls took " +
-                $"{stopwatch.Elapsed.TotalMilliseconds:F1} ms wall (budget 600 ms)");
+                $"{stopwatch.Elapsed.TotalMilliseconds:F1} ms wall (budget 900 ms)");
         }
         finally
         {

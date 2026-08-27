@@ -87,10 +87,11 @@ jobs:
 
       # PerfSmokeTests (cider-ede.15) asserts latency budgets calibrated against a local developer
       # machine under real contention (see the class doc on PerfSmokeTests for the numbers and
-      # conditions). As of the cider-ede.36 fixer correction (2026-08-27) that headroom is tighter
-      # than it once was — roughly 1.1-1.6x over the worst outliers actually reproduced (28.4 ms
-      # median, 373.9 ms 8-parallel wall, 134.2 ms p99), not the 2.5-8x this comment previously
-      # claimed — still enough margin that this step gates the build like any other functional step.
+      # conditions). As of the cider-ede.36 fixer re-correction (2026-08-27) that headroom is
+      # roughly 1.4-2.2x over the worst outliers actually reproduced (28.4 ms median, 561.6 ms
+      # 8-parallel wall, 134.2 ms p99 — the 8-parallel figure is the 19-run dataset's own maximum,
+      # not just the 373.9 ms reviewer outlier), not the 2.5-8x this comment originally claimed —
+      # still enough margin that this step gates the build like any other functional step.
       # It stays a separate step (its own
       # timeout) purely so a perf failure is distinguishable from a functional one in the job log. If
       # the first real macos-15 run can't meet a budget, widen that one number in PerfSmokeTests.cs
