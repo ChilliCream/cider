@@ -475,6 +475,29 @@ public sealed class NetworkManagerTests
         Assert.Equal("endpoint with name c1 already exists in network extra", ex.Message);
     }
 
+    /// <summary>
+    /// cider-qj4: Aspire's DCP re-POSTs <c>/networks/{id}/connect</c> for a container it already
+    /// created on that very network. dockerd answers 403 "endpoint with name ... already exists in
+    /// network ..." (moby daemon/libnetwork/network.go createEndpoint, types.ForbiddenErrorf), which
+    /// DCP treats as terminal; a 501 is treated as transient and retried every ~8s forever. The
+    /// already-attached check therefore has to win over the running-container 501.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_RunningContainerAlreadyAttached_Throws403NotA501()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await harness.Networks.CreateAsync(new NetworkCreateRequest { Name = "extra" }, CancellationToken.None);
+        await harness.CreateAsync(name: "c1");
+        await harness.Networks.ConnectAsync("extra", new NetworkConnectRequest { Container = "c1" }, CancellationToken.None);
+        await harness.Containers.StartAsync("c1", CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<DockerApiException>(
+            () => harness.Networks.ConnectAsync("extra", new NetworkConnectRequest { Container = "c1" }, CancellationToken.None));
+
+        Assert.Equal(System.Net.HttpStatusCode.Forbidden, ex.Status);
+        Assert.Equal("endpoint with name c1 already exists in network extra", ex.Message);
+    }
+
     [Fact]
     public async Task ConnectAsync_RunningContainer_Throws501()
     {

@@ -42,10 +42,53 @@ public sealed class NetworkConnectRoutesTests
         Assert.Equal(501, disconnectStatus);
         Assert.Contains("disconnecting a running container", disconnectBody, StringComparison.Ordinal);
 
+        Assert.Equal(201, (await host.PostJsonAsync("/networks/create", """{"Name":"nc-net1b"}""")).Status);
         var (connectStatus, connectBody) = await host.PostJsonAsync(
-            "/networks/bridge/connect", """{"Container":"nc-c1"}""");
+            "/networks/nc-net1b/connect", """{"Container":"nc-c1"}""");
         Assert.Equal(501, connectStatus);
         Assert.Contains("connecting a running container", connectBody, StringComparison.Ordinal);
+
+        // ... but a network it is ALREADY attached to answers dockerd's terminal 403, never the
+        // retryable-looking 501 (cider-qj4: Aspire's DCP re-POSTs connect for the container it
+        // created on that very network and retries a 501 forever).
+        var (attachedStatus, attachedBody) = await host.PostJsonAsync(
+            "/networks/bridge/connect", """{"Container":"nc-c1"}""");
+        Assert.Equal(403, attachedStatus);
+        Assert.Contains(
+            "endpoint with name nc-c1 already exists in network bridge",
+            attachedBody,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// cider-qj4: Aspire's DCP POSTs <c>/networks/{id}/connect</c> for a container it already created
+    /// through cider on that very network. dockerd answers 403 "endpoint with name ... already exists
+    /// in network ..." (moby daemon/libnetwork/network.go createEndpoint, types.ForbiddenErrorf),
+    /// which DCP treats as terminal; the old 501 looked transient and was retried every ~8s forever.
+    /// </summary>
+    [Fact]
+    public async Task Connect_of_an_attached_running_container_answers_dockerds_403()
+    {
+        await using var host = await DaemonTestHost.StartAsync();
+        Assert.Equal(201, (await host.PostJsonAsync("/networks/create", """{"Name":"nc-net5"}""")).Status);
+        Assert.Equal(201, (await host.PostJsonAsync("/networks/create", """{"Name":"nc-net5b"}""")).Status);
+        var id = await CreateContainerAsync(host, "nc-c5");
+        Assert.Equal(200, (await host.PostJsonAsync("/networks/nc-net5/connect", """{"Container":"nc-c5"}""")).Status);
+        Assert.Equal(204, (await host.PostJsonAsync($"/containers/{id}/start")).Status);
+
+        var (attachedStatus, attachedBody) = await host.PostJsonAsync(
+            "/networks/nc-net5/connect", """{"Container":"nc-c5"}""");
+        Assert.Equal(403, attachedStatus);
+        Assert.Contains(
+            "endpoint with name nc-c5 already exists in network nc-net5",
+            attachedBody,
+            StringComparison.Ordinal);
+
+        // A network the running container is NOT attached to still hits the Apple limitation.
+        var (notAttachedStatus, notAttachedBody) = await host.PostJsonAsync(
+            "/networks/nc-net5b/connect", """{"Container":"nc-c5"}""");
+        Assert.Equal(501, notAttachedStatus);
+        Assert.Contains("connecting a running container", notAttachedBody, StringComparison.Ordinal);
     }
 
     [Fact]

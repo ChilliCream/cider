@@ -14,7 +14,8 @@ public sealed partial class ContainerManager : IContainerNetworkAttachments
     /// to a container that was created but never started, and re-creates it on the engine with the
     /// extended network list. Apple <c>container</c> fixes a container's networks at create time and
     /// the daemon runs <c>container create</c> already at Docker-create time, so the record update
-    /// alone would not reach the engine.
+    /// alone would not reach the engine. A container already attached to the network answers
+    /// dockerd's 403 in every state; only a genuinely new attachment is gated on never-started.
     /// </summary>
     public async Task<ContainerRecord> AttachToNetworkAsync(
         string containerIdOrName,
@@ -29,14 +30,21 @@ public sealed partial class ContainerManager : IContainerNetworkAttachments
         await handle.Gate.WaitAsync(ct);
         try
         {
-            RequireNeverStarted(record, NetworkManager.ConnectNotSupported);
-
+            // Already attached wins over every state check (cider-qj4): dockerd answers this with
+            // 403 "endpoint with name <container> already exists in network <network>" regardless of
+            // the container's state (moby daemon/libnetwork/network.go createEndpoint:
+            // `types.ForbiddenErrorf("endpoint with name %s already exists in network %s", ...)`,
+            // where the endpoint name is the container name without its leading slash). Aspire's DCP
+            // POSTs connect for a container it created through us on that very network and treats a
+            // 403 as terminal — the 501 below looked transient and was retried every ~8s forever.
             if (record.Networks.ContainsKey(dockerNetworkName))
             {
                 throw new DockerApiException(
                     HttpStatusCode.Forbidden,
                     $"endpoint with name {record.Name} already exists in network {dockerNetworkName}");
             }
+
+            RequireNeverStarted(record, NetworkManager.ConnectNotSupported);
 
             EndpointIpam.Validate(
                 dockerNetworkName,

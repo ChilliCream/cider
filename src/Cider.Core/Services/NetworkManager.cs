@@ -153,7 +153,9 @@ public sealed class NetworkManager
     /// <c>POST /networks/{id}/connect</c>. Apple <c>container</c> fixes a container's networks when
     /// the container is created, so this only works for a container that has never been started:
     /// <see cref="IContainerNetworkAttachments"/> updates the record and re-creates the engine
-    /// container with the extended network list. Anything else answers 501.
+    /// container with the extended network list. A container already attached to the network answers
+    /// dockerd's terminal 403 "endpoint with name ... already exists in network ..." regardless of
+    /// its state (cider-qj4 — Aspire's DCP retries the old 501 forever); anything else answers 501.
     /// </summary>
     public async Task ConnectAsync(string idOrName, NetworkConnectRequest request, CancellationToken ct)
     {
