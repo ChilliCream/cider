@@ -31,10 +31,14 @@ namespace Cider.E2E.Tests;
 /// Thresholds below were re-derived from repeated local runs against the real Apple runtime
 /// (2026-08-26) after switching to the socket, originally set with roughly 2.5-3x headroom over the
 /// observed medians/typical values; the cider-ede.36 fixer correction (2026-08-27, below) tightened
-/// the two create-timing budgets to smaller multiples of the worst wall/median actually
-/// reproduced — roughly 1.4x on the median, roughly 1.6x on the 8-parallel wall time — trading the
-/// 2.5-3x convention for headroom over outliers instead of over the typical case. Those local runs
-/// were NOT on an idle machine — this box carried several
+/// only the 8-parallel wall budget, from 1200 ms to 900 ms — ~1.6x headroom over the worst 561.6 ms
+/// wall actually reproduced, a 1.33x tightening from 1200 ms. The median (40 ms) and p99 (300 ms)
+/// budgets are unchanged from before cider-ede.36: the reproduced 28.4 ms median excursion and
+/// 134.2 ms p99 sample left the tighter values that were tried (see below) too flaky to keep, so
+/// those two stayed at their pre-cider-ede.36 numbers, retained rather than tightened — the ~1.4x
+/// and ~2.2x figures below describe the headroom those retained budgets already have over their
+/// worst observed samples, not a tightening applied to them. Those local runs were NOT on an idle
+/// machine — this box carried several
 /// other concurrently-running agent processes at the time (load average ranging ~35-70 on 16
 /// cores), so the numbers below already bake in a fair amount of real contention rather than
 /// characterizing a best case; the task's original literal 30/80/300/10 ms figures were never
@@ -63,10 +67,17 @@ namespace Cider.E2E.Tests;
 /// cider-ede.36, ~1.4x over the worst observed 28.4 ms median) and the 8-parallel budget is set to
 /// 900 ms (~1.6x over the worst observed 561.6 ms wall — the 19-run post-cider-ede.30 dataset's own
 /// maximum, cited above, not just the 373.9 ms reviewer outlier — still a 1.33x tightening from the
-/// pre-cider-ede.36 1200 ms, the largest the combined data supports). The epic's 25 ms figure
-/// remains the achieved *typical* median (13.0-20.2 ms comfortably clears it); per the cider-ede.36
-/// fixer correction (2026-08-27) that gap is recorded here rather than by amending the epic's
-/// Outcome. p99 (no epic target) is a different story: 9 of 10 sampled runs put it at 23.6-29.8 ms,
+/// pre-cider-ede.36 1200 ms, the largest the combined data supports). The epic's 25 ms figure is a
+/// docker-CLI, end-to-end target; what is measured here is containerCreate over the XPC transport at
+/// the daemon's own unix socket (see the class doc's opening paragraph above), not through the
+/// docker CLI, and the two are not the same number — the CLI client alone medians 11.4 ms
+/// (<c>docker --version</c>, cited above), so an end-to-end <c>docker create</c> carries that fixed
+/// floor on top of whatever is measured here. The socket-side typical median (13.0-20.2 ms)
+/// comfortably clears 25 ms on its own, but that is not evidence an end-to-end CLI median does; a
+/// cider-ede.36 fixer re-correction (2026-08-27) amended the epic's Outcome to attribute these
+/// numbers to their real measurement point and state that caveat explicitly, rather than leaving the
+/// gap recorded only here as an earlier revision of this doc did. p99 (no epic target) is a
+/// different story: 9 of 10 sampled runs put it at 23.6-29.8 ms,
 /// one run spiked to 82.0 ms, and a separate reviewer run sampled 134.2 ms — real, occasional
 /// tail-latency events under this box's contention rather than measurement noise to be averaged
 /// away. An intervening tightening to 150 ms left only 1.12x headroom over that already-observed
