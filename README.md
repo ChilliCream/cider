@@ -84,7 +84,17 @@ cider runs is a child `container` CLI process, and macOS applies background CPU/
 job's whole process tree, not just the job itself — an interactive-class job is the only one launchd
 never throttles. Re-running `cider install` rewrites the plist and restarts the job, so it also fixes
 an older install that was still on the throttled class.
-<!-- LaunchdInstaller.cs:36 plist path, :68-75 RunAtLoad/KeepAlive, :172 setCurrent:false; Models.cs:11 Label "com.chillicream.cider.daemon", :12 ContextName "cider" -->
+
+Two details exist because the first real upgrade on a live machine hit them. When the binary comes
+from Homebrew, the plist's program path is the stable `$(brew --prefix)/opt/cider/bin/cider` symlink,
+not the versioned Cellar directory `brew cleanup` deletes on the next upgrade — so the launchd job
+keeps a valid binary to respawn across upgrades. And the restart itself no longer races launchd:
+after booting the old job out, install waits (up to ~5 s) for launchd to finish tearing it down
+before bootstrapping the new one, and retries the bootstrap up to 3 times — an immediate re-bootstrap
+of the same label can fail with `Input/output error` and previously left the machine with no daemon
+at all. If every attempt still fails, the message says exactly that and the remediation is to re-run
+`cider install`.
+<!-- LaunchdInstaller.cs:36 plist path, :68-75 RunAtLoad/KeepAlive, :172 setCurrent:false; Models.cs:11 Label "com.chillicream.cider.daemon", :12 ContextName "cider"; StabilizeHomebrewExecutablePath, BootoutThenBootstrapAsync (SettleMaxPolls/BootstrapAttempts) -->
 
 The other verbs:
 
@@ -98,9 +108,10 @@ cider version
 ```
 
 > `install`, `uninstall` and `status` are implemented and covered by unit tests (plist generation,
-> the backup record, the restore decision table), but the whole flow has **never been run end to end
-> on a real machine** — it touches launchd and `/var/run/docker.sock`, which is the machine owner's
-> call to make. Treat your first run as untested and check `cider status` afterwards.
+> the backup record, the restore decision table). The install flow has been run for real exactly once
+> (a Homebrew upgrade, 2026-08-27) — that run is what exposed the bootout/bootstrap race and the
+> Cellar-path staleness fixed above, and neither fix has itself been proven against a live launchd
+> yet. Treat an install as lightly tested and check `cider status` afterwards.
 
 ### Taking over `/var/run/docker.sock`
 
@@ -306,7 +317,12 @@ honoured (`-p 127.0.0.1:8080:80` binds loopback only; an empty or `0.0.0.0` host
 address families), `-p 0:80` and `--publish-all` allocate an ephemeral host port and report it back
 through `docker ps`/`inspect`, and TCP half-closes propagate the way dockerd's userland proxy does.
 Publications are set up after start, refreshed by the state poller, and torn down on stop, die and
-remove.
+remove. Apple assigns a container a *new* VM address on every start, so on a stop the daemon drops
+the recorded runtime addresses and on the restart the still-bound TCP forwarders retarget the new
+address in place — clients reconnect and reach the container rather than getting resets against the
+previous boot's dead IP. A connection accepted while the new target is still unknown is held briefly;
+if the target never resolves the drop is logged as a warning naming the container and port, not
+discarded silently.
 
 Setting `portPublishing` to `apple` hands `-p` to Apple `container` instead and keeps the daemon out
 of the data path. That mode depends on Apple's own forwarder, which on some Macs is refused by macOS
@@ -391,7 +407,7 @@ turn it back off, and:
 | No pause/unpause | `POST /containers/{id}/pause` and `/unpause` return 501 — there is no apiserver route for it, and no cgroup-freezer equivalent inside Apple's guest init (`vminitd`); the closest approximation, `SIGSTOP`/`SIGCONT` to just the container's init process, freezes PID 1 but not its whole process tree for most images, so it is not offered as a substitute |
 | No `--privileged` | Mapped to `--cap-add ALL` plus empty masked/read-only path lists — `--masked-path NONE --read-only-path NONE` over the CLI fallback, typed empty `maskedPaths`/`readonlyPaths` arrays over XPC, same semantics either way — which is not a true privileged mode; Docker-in-Docker and some device access will not behave |
 | No `--network host` / `container:*`; `none` only on the XPC transport | `host` and `container:<id>` are rejected with 400 on both transports. `network_mode: none` works on `runtime.transport: xpc` (the container is created with zero attachments and has no eth0) and is still rejected with 400 on `runtime.transport: cli`, which has no way to ask `container create` for zero attachments. A compose service using `network_mode: host` does not come up. If a `network_mode: none` create on the XPC transport has to fall back to the CLI mid-request (no merged entrypoint, or the apiserver reports itself unavailable) — the CLI has no flag for zero attachments either, so silently attaching the default network is not an option — the create is refused instead, with 501 (`RuntimeErrorKind.NotSupported`, `GuardNoNetworkFallback` in `XpcContainerRuntime.Create.cs`), not the 400 a `none` request gets everywhere else |
-| `network connect`/`disconnect` only before the first start | Apple fixes a container's networks at create time, so both work on a container that was created and never started (the daemon deletes and re-creates it with the new network list — over XPC that is a `containerDelete` + `containerCreate` pair with the config already in hand, no CLI arg round-trip) and return 501 with an explanatory message afterwards. `disconnect` will not drop a container to zero networks; use `network_mode: none` at create time on the XPC transport instead |
+| `network connect`/`disconnect` only before the first start | Apple fixes a container's networks at create time, so both work on a container that was created and never started (the daemon deletes and re-creates it with the new network list — over XPC that is a `containerDelete` + `containerCreate` pair with the config already in hand, no CLI arg round-trip) and return 501 with an explanatory message afterwards. One dockerd-compatible exception, in every container state: `connect` for a container *already attached* to that network answers 403 `endpoint with name <container> already exists in network <network>` — the same terminal answer dockerd gives — never the 501, so clients that poll connect until it stops looking transient (Aspire's DCP does) settle instead of retrying forever. `disconnect` will not drop a container to zero networks; use `network_mode: none` at create time on the XPC transport instead |
 | Every container is a VM | Each container gets its own lightweight VM. Apple's own default is 4 CPUs / 1 GiB plus one extra `cpuOverhead` core per VM; Cider passes its own, more conservative default of 2 CPUs / 2 GiB unless the container asks for something else (`defaultCpus`/`defaultMemoryBytes`, see [Configuration](#configuration)). Many services at once cost real RAM either way, and it only grows: memory a guest frees internally is never returned to macOS while its VM lives (Apple's own `docs/technical-overview.md`), so a long-lived service's VM accumulates RSS until it restarts |
 | Exit codes can be lost | On the XPC transport the daemon captures a container's exit code with `containerWait`, which is not tied to who started the container — if the daemon restarts while the container is still running, it simply re-issues `containerWait` for it and recovers the real exit code once the container actually exits (see [How it works](#how-it-works)). Only a container that exited *during* the daemon's downtime is unrecoverable — Apple stores no post-mortem exit code anywhere once the runtime helper for it has shut down. On `runtime.transport: cli` the older, blunter loss still applies: the exit code comes from a held `container start -a` child, so any daemon restart while that container is running loses it outright |
 | Foreign containers' logs are one merged stdout+stderr stream, with no history | `docker logs` now works for containers the daemon did not start too, via the apiserver's own `containerLogs` fd — but that fd is one file Apple's runtime always tees stdout *and* stderr into together, so the streams cannot be told apart, and the file is truncated on every container start, so nothing survives a restart. Cider's own log store still keeps stdout/stderr separated with history, for containers it started itself |

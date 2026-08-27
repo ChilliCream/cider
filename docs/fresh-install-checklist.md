@@ -1,23 +1,26 @@
-# Fresh-install checklist (cider-5jm)
+# Fresh-install checklist (cider-5jm; updated for 0.3.0 by cider-rvl)
 
-Preparation for cider-fpt, the user-owned task that merges `mst/v-0-2`, tags a release, and
-walks this checklist for real. This document is that preparation: a version decision with its
-rationale, a read-only audit of `.github/workflows/release.yml`, a README accuracy check, and —
-the actual deliverable — the exact command sequence below with expected output, expected failure
-shapes, and what each would mean.
+Preparation for the user-owned release walk: merge the release branch, tag, and walk this
+checklist for real. Originally written (cider-5jm) for the 0.2.0 tag from `mst/v-0-2`; §1–§3
+below are that release's record and are kept as history. **The steps in §4 have been updated for
+0.3.0** (branch `mst/0.3.0`): the machine state, the expected `cider install` output (the
+bootout-settle/bootstrap-retry lines from cider-gu1, the stable brew `opt` program path from
+cider-4mx) and the version strings all reflect the 0.3.0 code.
 
 **Read this whole section before running anything.**
 
-- **This path has never been walked end to end.** `cider install`, `uninstall` and `status` are
-  covered by unit tests, but nobody has run `brew install` → `cider install` →
-  `docker context use cider` → a real container → a real build against a binary built from this
-  branch. README.md:100–103 says the same thing about the install flow in general, and
-  cider-8ok's close reason records that even the narrower `ProcessType: Interactive` fix inside it
-  was never verified live — only unit-tested — because doing so would have restarted this
-  machine's real daemon. **You are the first person to run this sequence.** A failure at any step
-  below is a finding to file as a task, not evidence you did something wrong.
-- **This machine is not actually clean.** It already has Cider 0.1.4 installed via Homebrew
-  (`88c4d66`, 2026-08-24), with a launchd agent and a `cider` docker context already in place.
+- **This path has now been walked exactly once — and Step 2 failed.** The 2026-08-27 upgrade
+  (0.1.4 → 0.2.0) succeeded through Step 1, then `cider install` hit
+  `launchctl bootstrap` exit 5 (`Input/output error`) racing launchd's teardown of the old job,
+  leaving the machine with **no running daemon** (cider-gu1). The 0.3.0 binary carries the fix
+  (settle-wait after bootout, bounded bootstrap retries) — but that fix has itself never been
+  proven against a live launchd. The 0.3.0 walk is that proof, which is why Step 2 now says to
+  run `cider install` twice. A failure at any step below is a finding to file as a task, not
+  evidence you did something wrong.
+- **This machine is not actually clean.** It has Cider 0.2.0 installed via Homebrew
+  (2026-08-27), a `cider` docker context, and a launchd plist in place — but whether a daemon is
+  actually *running* depends on whether `cider install` was re-run after the failed 0.2.0
+  bootstrap above; check `cider status` first and do not be surprised by `daemon: not responding`.
   "Fresh install" in the title is what a new user would experience; on *this* machine the correct
   first command is an upgrade, not `brew install` — see Step 1.
 - **Every "expected output" below is either a literal string read out of the current source, or
@@ -29,6 +32,17 @@ shapes, and what each would mean.
 ---
 
 ## 1. Version decision
+
+> **0.3.0 (cider-rvl):** the mechanics below are unchanged — still nothing in the repository to
+> bump. `Directory.Build.props`, every `.csproj` and `global.json` were re-checked on `mst/0.3.0`:
+> none sets `Version`/`VersionPrefix`/`PackageVersion`; the binary's version comes entirely from
+> `-p:Version="${VERSION}"` in `release.yml`, taken from the pushed git tag. **Pushing the `0.3.0`
+> tag IS the version bump.** `0.3.0` rather than `0.2.1` because this release changes observable
+> behaviour, not just fixes: prune no longer sweeps the shared store and reports `SpaceReclaimed`
+> honestly (0 on XPC), already-attached `network connect` answers dockerd's 403 instead of 501,
+> published-port forwarders retarget across a container restart, and XPC `docker pull` actually
+> downloads (`maxConcurrentDownloads`) instead of corrupting the store. The rest of this section is
+> the 0.2.0 record, kept as written.
 
 **Recommendation: tag `0.2.0`, not a patch release.**
 
@@ -60,6 +74,18 @@ to bump in this repository. The version decision is entirely which string to use
 in cider-fpt** — `0.2.0`.
 
 ## 2. `release.yml` wiring — read end to end, not run
+
+> **0.3.0 (cider-rvl):** re-checked on `mst/0.3.0` — `.github/workflows/release.yml`,
+> `.github/actions/` and `scripts/build-pkg.sh` are still **byte-identical to `main`'s** (empty
+> `git diff main`), and that exact wiring has now published successfully twice (0.1.4 and 0.2.0 —
+> the 0.2.0 run also updated the tap: `ChilliCream/homebrew-tools` commit `d8668c7`, "🍎 Update
+> cider to 0.2.0"). The tag pattern `[0-9]*.[0-9]*.[0-9]*` matches `0.3.0` and `is_stable`
+> computes `true` for it. Release notes are `gh release create --generate-notes` — the workflow
+> reads **no CHANGELOG file from the repo** (none exists); edit the generated notes on the draft
+> release page if you want curated ones. The `.pkg`-skip gap below is unchanged and still
+> non-fatal. **One new prerequisite: merge the cider-f20 `remove-cider-preview` branch in
+> `ChilliCream/homebrew-tools` BEFORE pushing the tag**, or the regenerated `cider.rb` will
+> re-introduce the `cider-preview` warning — see Step 0.
 
 Verdict: **sound**, with one known, non-fatal gap. This was not just re-read as YAML; it was cross-checked against real history — `mst/v-0-2`'s copy of `.github/workflows/release.yml` and `.github/actions/` is **byte-identical to `main`'s** (`git diff main mst/v-0-2 -- .github/workflows/release.yml .github/actions/` is empty), and the exact file on `main` published tag `0.1.4` successfully two days ago (run `32773684955`, `2026-08-24T20:29:40Z`): draft release created, binary published/signed/notarized, zip attached, draft published, and the Homebrew tap updated (`ChilliCream/homebrew-tools` commit "🍎 Update cider to 0.1.4", `2026-08-24T20:30:03Z`). Pushing the next tag runs the same file.
 
@@ -122,6 +148,15 @@ What was checked and what it means:
 
 ## 3. README accuracy check
 
+> **0.3.0 (cider-rvl):** re-audited against the 0.3.0 changes; this time edits WERE needed and were
+> made — the `cider install` section now documents the stable brew `opt` plist path and the
+> bootout-settle/bootstrap-retry behaviour (and its "never been run end to end" claim, made stale by
+> the 2026-08-27 live run, is corrected); the Port publishing section documents forwarder
+> retargeting across a container restart (cider-bum); the `network connect`/`disconnect` limitation
+> row documents the dockerd-compatible 403 for an already-attached container (cider-qj4). The
+> prune/`SpaceReclaimed` row was already rewritten by fdc9c38 itself and needed nothing. The rest of
+> this section is the 0.2.0 record, kept as written.
+
 Audited section by section — Requirements, Install, `cider install`, Configuration table, What
 works, Building images, How it works, Troubleshooting — against the current source
 (`Program.cs`, `CiderOptions.cs`, `LaunchdInstaller.cs`, `ApiServerVersion.cs`, `FallbackMatrix.cs`)
@@ -156,21 +191,32 @@ No product-change follow-up task is needed from this audit.
 
 ## 4. The checklist
 
-Run these in order, on the machine that owns cider-fpt. Each step: the command, what a *success*
+Run these in order, on the user's machine. Each step: the command, what a *success*
 looks like, and what a *failure* looks like and would mean. Anything not literally sourced from
 code is marked UNCONFIRMED.
 
-### Step 0 — before any of this: cider-fpt's own prerequisites
+### Step 0 — before any of this: the user-owned release prerequisites
 
-Not part of this checklist's steps (they are cider-fpt's, not cider-5jm's), but nothing below makes
-sense before they've happened: `mst/v-0-2` merged to `main` and pushed, tag `0.2.0` created and
-pushed, and the `Release` workflow run for that tag finished (`gh run list --repo ChilliCream/cider
---workflow=release.yml` shows it `completed`/`success`, per §2 above with the `.pkg` job expected to
-show as skipped, not failed).
+Not part of this checklist's steps, but nothing below makes sense before they've happened, **in
+this order**:
+
+1. **Merge the homebrew-tools fix first** (cider-f20): branch `remove-cider-preview`, commit
+   `f8d2f83` (based on `origin/main` `d8668c7`), sitting unpushed in the scratch clone this run
+   left behind — push that branch and merge it into `ChilliCream/homebrew-tools`'s `main` (or
+   cherry-pick `f8d2f83`). If the tag's `update-homebrew` dispatch runs against the *old*
+   generator, the regenerated `cider.rb` re-introduces the `cider-preview` warning this fix kills.
+2. `mst/0.3.0` merged to `main` and pushed.
+3. Tag `0.3.0` created on that merge commit and pushed — **this is what publishes** (and, per §1,
+   the tag IS the version bump; nothing in-repo carries the number).
+4. The `Release` workflow run for that tag finished (`gh run list --repo ChilliCream/cider
+   --workflow=release.yml` shows it `completed`/`success`, per §2 above with the `.pkg` job
+   expected to show as skipped, not failed) and `ChilliCream/homebrew-tools` has a new
+   "Update cider to 0.3.0" commit whose `Formula/cider.rb` contains **no** `conflicts_with
+   "cider-preview"` line.
 
 ### Step 1 — install or upgrade the binary
 
-This machine already has `cider` 0.1.4 from Homebrew, so use the upgrade path, not a plain install:
+This machine already has `cider` 0.2.0 from Homebrew, so use the upgrade path, not a plain install:
 
 ```bash
 brew update
@@ -180,17 +226,20 @@ brew upgrade cider
 (On an actually clean machine with no prior install, the equivalent is `brew install
 chillicream/tools/cider` — README's documented command, still correct for that case.)
 
-- **Success looks like:** brew reports upgrading `chillicream/tools/cider` from `0.1.4` to `0.2.0`
+- **Success looks like:** brew reports upgrading `chillicream/tools/cider` from `0.2.0` to `0.3.0`
   (or whatever tag was pushed), downloads `cider-osx-arm64.zip`, and installs it under
   `$(brew --prefix)/bin/cider`. `docker`/`docker-compose` are formula dependencies, so if either is
   missing brew installs them too — if they're already present (they are, on this machine) brew
-  leaves them alone.
+  leaves them alone. **New for 0.3.0:** no `Warning: cider: No available formula with the name
+  "cider-preview"` line — the 0.1.4 → 0.2.0 upgrade printed it on the first line of output; its
+  absence is the proof cider-f20's formula fix landed (Step 0.1). If it still prints, the
+  homebrew-tools merge either didn't happen or happened after the tap regenerated `cider.rb`.
 - **Verify:** `cider version` — first line is `cider <version>` where `<version>` is exactly what
   `Program.InformationalVersion()` (`Program.cs:504–507`, printed at `Program.cs:451`) reads back
   from `AssemblyInformationalVersionAttribute`, verbatim. UNCONFIRMED what that string will actually
   contain: it is whatever `-p:Version=` produced when this build was made, plus a `+<sha>` suffix
   *only if* the SDK/SourceLink stamped one onto it — nothing in `Directory.Build.props`, the
-  `.csproj` files, or `release.yml` forces a `SourceRevisionId`, so a bare `cider 0.2.0` with no
+  `.csproj` files, or `release.yml` forces a `SourceRevisionId`, so a bare `cider 0.3.0` with no
   `+<sha>` at all is not a failure, just an unstamped build. (`ResolveGitCommit`, at
   `src/Cider.Core/Services/SystemManager.cs:184`, is a different thing entirely — it feeds the
   Docker `/version` API's `GitCommit` field, with a documented `unknown` fallback, and has no bearing
@@ -198,7 +247,7 @@ chillicream/tools/cider` — README's documented command, still correct for that
   `which -a cider` to confirm the resolved binary is brew's, not a leftover copy elsewhere on
   `PATH`.
 - **Failure looks like, and means:**
-  - `brew upgrade` says `cider` is already up to date, but `cider version` still prints `0.1.4`:
+  - `brew upgrade` says `cider` is already up to date, but `cider version` still prints `0.2.0`:
     the tap wasn't refreshed (`brew update` didn't run, or the tap needs re-adding) or brew resolved
     a different `cider` on `PATH` than the one it just built — check `which -a cider` and `brew
     --prefix`.
@@ -210,22 +259,31 @@ chillicream/tools/cider` — README's documented command, still correct for that
     this would mean the `update-homebrew` job in §2 did not actually leave a working formula behind,
     which is itself the finding to file.
 
-### Step 2 — `cider install`
+### Step 2 — `cider install`, run TWICE (the second run is cider-gu1's live leg)
 
 ```bash
 cider install
+cider install   # again, deliberately — see below
 ```
+
+Run it twice, back to back. The 0.2.0 binary's single live run is what raced launchd and left no
+daemon (cider-gu1); the 0.3.0 binary carries the settle-wait + bootstrap-retry fix, and only a run
+**over an already-running daemon** exercises it (bootout of a live service → settle poll →
+bootstrap). Depending on this machine's current state the *first* run may find no service to boot
+out (nonzero `bootout` exit, no settle line — fine); the *second* run always finds the daemon the
+first one started, so it is the proving run. Both must end `cider daemon installed and running.`
 
 Prints each step live as it happens (from `LaunchdInstaller.InstallAsync`/`DockerContextInstaller`,
 quoted verbatim from source — exit codes/paths/timings will match this host, the literal wording
-will not vary):
+will not vary). Expected output of the **second** run (0.3.0 shape — the bootstrap line now carries
+an `attempt n/3` suffix, and a new settle line follows a successful bootout):
 
 ```
 Ensured data directory: /Users/<you>/.cider
 Wrote plist: /Users/<you>/Library/LaunchAgents/com.chillicream.cider.daemon.plist
-ProcessType changed: Background -> Interactive (restarting the daemon so the new resource class takes effect)
 launchctl bootout gui/<uid>/com.chillicream.cider.daemon (exit 0)
-launchctl bootstrap gui/<uid> /Users/<you>/Library/LaunchAgents/com.chillicream.cider.daemon.plist (exit 0)
+Waited for launchd to finish removing gui/<uid>/com.chillicream.cider.daemon
+launchctl bootstrap gui/<uid> /Users/<you>/Library/LaunchAgents/com.chillicream.cider.daemon.plist (exit 0, attempt 1/3)
 launchctl kickstart -k gui/<uid>/com.chillicream.cider.daemon (exit 0)
 Socket ready: /Users/<you>/.cider/docker.sock
 docker context update cider --docker host=unix:///Users/<you>/.cider/docker.sock (exit 0)
@@ -258,12 +316,19 @@ passed (the default used above). `Program.cs` owns that emission; `LaunchdInstal
 same text into `result.Message` as well, which printed it twice — that was fixed in cider-xij. If you
 see it twice, that is a regression worth filing, not expected output.
 
-- **The `ProcessType changed: Background -> Interactive` line is expected and is itself a proof
-  point** — this machine's existing 0.1.4 install used `ProcessType: Background` (cider-8ok), so
-  this line confirms that fix is present in the installed binary. Its absence (no such line at all)
-  would mean either the fix regressed or this run somehow re-installed with the old plist template.
+- **No `ProcessType changed:` line this time.** The 0.2.0 install already wrote an
+  `Interactive` plist (the plist write happened even though its bootstrap failed), so the
+  ProcessType is unchanged and the line — which only prints on an actual change
+  (`LaunchdInstaller.InstallAsync`) — should NOT appear. *Seeing* it would mean the plist on disk
+  had somehow reverted to `Background`.
+- **The plist's program path silently changes to brew's stable `opt` symlink** (cider-4mx): no
+  console line reports it, but after the run
+  `grep -A2 ProgramArguments ~/Library/LaunchAgents/com.chillicream.cider.daemon.plist` should show
+  `/opt/homebrew/opt/cider/bin/cider`, not a versioned `/opt/homebrew/Cellar/cider/<version>/...`
+  path. This is what keeps launchd's `KeepAlive` pointing at a binary that still exists after the
+  *next* `brew upgrade` + `brew cleanup`.
 - **`docker context update` (not `create`)** is expected here specifically because this machine
-  already has a `cider` context from the 0.1.4 install; a genuinely clean machine would instead see
+  already has a `cider` context from the earlier installs; a genuinely clean machine would instead see
   `docker context create cider --docker ... (exit 0)`. Either is correct for its situation — seeing
   `create` here, on this machine, would be the surprising one (it would mean the old context was
   somehow lost).
@@ -274,10 +339,15 @@ see it twice, that is a regression worth filing, not expected output.
   that the context step ran and succeeded is the `docker context update cider ... (exit 0)` (or
   `create`) line above.
 - **Failure looks like, and means:**
-  - `launchctl bootstrap ... (exit <nonzero>)` followed by `launchctl bootstrap failed: ...`: the
-    plist itself is malformed, or something else (SIP, a stale service definition) is refusing the
-    load — the stderr text captured after "failed:" names the real reason, read it rather than
-    retrying blind.
+  - `launchctl bootstrap ... (exit <nonzero>, attempt 3/3)` followed by
+    `launchctl bootstrap failed after 3 attempts: <stderr>` and
+    `The previous daemon was stopped and the new one did not start, so no cider daemon is running
+    right now. Re-run ``cider install`` to try again.`: all three bootstrap attempts failed even
+    after the settle wait. A lone `exit 5` (`Input/output error`) recovered by a later attempt
+    (`attempt 2/3` showing exit 0) is the cider-gu1 race being absorbed as designed and is a
+    *success*, not a failure. A persistent failure means the plist is malformed or something else
+    (SIP, a stale service definition) is refusing the load — the captured stderr names the real
+    reason; the stated remediation (re-run `cider install`) is safe to follow.
   - `Timed out waiting for socket: ...` instead of `Socket ready: ...`: the daemon process started
     under launchd but never opened its socket within 10s — check
     `~/.cider/daemon.log` for what it did on startup; this is a real daemon-startup defect if the
@@ -306,7 +376,10 @@ docker run --rm alpine:3.22 echo hello
 ```
 
 - **Success:** the daemon pulls `alpine:3.22` (first run only), the VM boots, and `hello` prints to
-  stdout before the process exits 0. Apple's own boot-spinner text ("Starting container [0s]" plus
+  stdout before the process exits 0. The pull itself is a 0.3.0 proof point: the 0.2.0 binary's XPC
+  `imagePull` omitted `maxConcurrentDownloads`, so a real (not-already-cached) download failed and
+  left a dangling index entry in the shared store (cider-ede.43, fixed by 540c493) — a clean pull
+  of an image not already on the machine is the fix working. Apple's own boot-spinner text ("Starting container [0s]" plus
   ANSI cursor codes) may appear ahead of the container's own output — README already documents this
   as expected, not a bug.
 - **Failure looks like, and means:**
