@@ -89,7 +89,11 @@ public sealed class ImageStoreRaceCollection : ICollectionFixture<ImageStoreRace
 /// (1) FAILURE CRITERION, stated before the run: Apple's own <c>container image ls</c> exits non-zero
 /// for a NEW reason (a digest not already named by the pre-existing alpine:3.18 entry above), OR any
 /// <c>LoadImages</c> tag (pulled repeatedly, never deleted, by this race) stops inspecting/running
-/// through cider after the race — the two assertions this test already makes below.
+/// through cider after the race — the two assertions this test already makes below. cider-ede.37 leg 1
+/// correction (finding 1): the confound classifier (<c>IsPreExistingDanglingContentConfound</c>) keys
+/// on that exact tracked digest (<c>TrackedDanglingContentDigest</c>), not on the generic dangling-
+/// content marker text alone, so this stated criterion and the code now agree — a dangling-content
+/// failure naming any OTHER digest is real signal, never the tracked confound.
 ///
 /// (2) NEGATIVE CONTROL: <c>CIDER_TEST_SKIP_BLOB_SWEEP_GATE=1</c> (restores the exact pre-cider-ede.31
 /// unguarded window on the CLI transport's <c>RemoveImageAsync</c> — see that env var's own doc
@@ -181,22 +185,38 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
     // Consequence for this test's own design: the rmi/re-pull loop's per-call success/failure count is
     // NOT a valid signal for whether cider-ede.31's fix holds under the race, because on this machine
     // every single cycle fails this way regardless of the fix or the race. Failures whose message
-    // carries this exact marker are counted and reported separately from any OTHER failure text, which
-    // remains a real regression signal (a message that does NOT carry this marker cannot be this
-    // confound, and fails the test loudly). The decisive signal this test still answers cleanly despite
-    // the confound is unchanged: whether `container image ls`'s own error digest changes across the
-    // race (see the baseline/appleList comparison below) -- Apple's own delete/pull subprocesses still
-    // physically run and race each other underneath cider's bookkeeping even when that bookkeeping
-    // itself throws, so that comparison still exercises the real race cider-ede.31 fixed.
+    // carries this exact marker AND the tracked digest below (TrackedDanglingContentDigest) are counted
+    // and reported separately from any OTHER failure text, which remains a real regression signal (a
+    // message that does NOT carry both the marker and that exact digest cannot be this confound, and
+    // fails the test loudly -- in particular a dangling-content failure naming a DIFFERENT digest, which
+    // is exactly what this race would produce if it corrupted a blob, is never misclassified as this
+    // confound). The decisive signal this test still answers cleanly despite the confound is unchanged:
+    // whether `container image ls`'s own error digest changes across the race (see the
+    // baseline/appleList comparison below) -- Apple's own delete/pull subprocesses still physically run
+    // and race each other underneath cider's bookkeeping even when that bookkeeping itself throws, so
+    // that comparison still exercises the real race cider-ede.31 fixed.
     private const string PreExistingDanglingContentMarker = "content with digest";
 
+    // The exact digest of the ONE pre-existing dangling content entry documented above and in this
+    // class's own remarks (docker.io/library/alpine:3.18 -> this digest, no blob file on disk).
+    // cider-ede.37 leg 1 correction (finding 1): the marker text alone is Apple's generic dangling-blob
+    // error text (identical to CliErrorMapper.DanglingContentMarker) shared by ANY dangling entry, so
+    // matching on the marker alone would also swallow a genuinely NEW dangling entry this race itself
+    // produced. The classifier below requires this exact digest too, so it keys on the tracked entry
+    // specifically, not on the generic error shape.
+    private const string TrackedDanglingContentDigest =
+        "sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979713c2d4f";
+
     /// <summary>
-    /// True when <paramref name="text"/> carries the exact marker text of the pre-existing, out-of-
-    /// scope store confound documented above -- never true for any other failure, so a caller can
-    /// separate "the known confound, already accounted for" from "something new".
+    /// True when <paramref name="text"/> carries BOTH the marker text of Apple's generic dangling-
+    /// content error AND the exact digest of the ONE pre-existing, out-of-scope confound tracked as
+    /// cider-ede.41 (<see cref="TrackedDanglingContentDigest"/>) -- never true for a dangling-content
+    /// failure naming any OTHER digest, so a NEW dangling entry this race itself produces is classified
+    /// as real signal, not silently folded into the known confound.
     /// </summary>
     private static bool IsPreExistingDanglingContentConfound(string text) =>
-        text.Contains(PreExistingDanglingContentMarker, StringComparison.Ordinal);
+        text.Contains(PreExistingDanglingContentMarker, StringComparison.Ordinal) &&
+        text.Contains(TrackedDanglingContentDigest, StringComparison.Ordinal);
 
     [E2EFact]
     public async Task Concurrent_pulls_survive_a_minute_of_rmi_churn_without_corrupting_the_store()
@@ -288,15 +308,47 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
 
         Assert.True(
             otherFailures.Length == 0,
-            $"{otherFailures.Length} pull/rmi failure(s) during the race carried NEITHER the known " +
-            "pre-existing dangling-content confound NOR any expected marker -- this is new signal, " +
-            "not the tracked cider-ede.41 confound:\n" + string.Join('\n', otherFailures));
+            $"{otherFailures.Length} pull/rmi failure(s) during the race did not match the tracked " +
+            $"cider-ede.41 confound (the classifier keys on marker text \"{PreExistingDanglingContentMarker}\" " +
+            $"AND digest {TrackedDanglingContentDigest} together, not the marker alone) -- this is new " +
+            "signal, including any dangling-content failure naming a DIFFERENT digest than the tracked " +
+            "one, which is new corruption this race itself introduced:\n" + string.Join('\n', otherFailures));
+
+        // ChurnImage, the one tag this race actually deletes, is checked here -- directly through
+        // Apple's own CLI, not through cider's ImageManager.FindImageDetailAsync path -- rather than in
+        // the LoadImages inspect/run loop below (cider-ede.37 leg 1 correction, finding 2): every
+        // re-pull attempt on ChurnImage inside RmiLoopAsync above races against the
+        // PreExistingDanglingContentMarker confound (FindImageDetailAsync's existedBefore check throws
+        // before cider's own PullImageAsync ever invokes the real Apple `image pull` subprocess), so a
+        // post-race inspect/run through cider would fail on every run on this machine for a reason
+        // unrelated to this race -- the "red for a reason it doesn't test" failure mode the orchestrator
+        // already corrected the appleList assertion for. The churn check moved off that confounded path
+        // onto Apple's own CLI instead, and IS asserted here (not merely logged): a failure that does
+        // NOT carry the tracked cider-ede.41 confound means Apple's own CLI cannot restore the churn tag
+        // after the race, which is real corruption signal, not "never re-pulled through cider by
+        // design". Run BEFORE appleList is captured below (cider-ede.37 leg 1 correction) so a NEW
+        // dangling digest this restore itself might produce also registers in the baseline-vs-post-race
+        // `container image ls` delta, rather than being invisible to it.
+        var churnRestore = await Cmd.RunAsync("container", ["image", "pull", ChurnImage], timeout: PullTimeout);
+        Assert.True(
+            churnRestore.Ok || IsPreExistingDanglingContentConfound(churnRestore.Stderr),
+            $"Apple's own CLI could not restore {ChurnImage} after the race, and the failure did not " +
+            $"carry the tracked cider-ede.41 confound (marker \"{PreExistingDanglingContentMarker}\" AND " +
+            $"digest {TrackedDanglingContentDigest}) -- Apple's own CLI cannot restore the churn tag " +
+            "after the race, real signal, not the tracked confound:\n" + churnRestore);
+        output.WriteLine(
+            churnRestore.Ok
+                ? $"{ChurnImage}: restored via Apple's own CLI after the race, store content intact"
+                : $"{ChurnImage}: Apple's own CLI hit the tracked cider-ede.41 confound while restoring " +
+                  $"it after the race (tolerated, not a race failure):\n{churnRestore}");
 
         // The decisive assertion cider-ede.31's own Verification section named: Apple's own CLI, not
         // cider, must still list the store cleanly after the race. Before the fix this is exactly the
         // command that started exiting 1 on a dangling content reference following this same
         // pull/rmi pattern (task cider-ede.31's evidence: state.json held a digest with no blob file
-        // on disk, and `container image ls` exited 1 on it).
+        // on disk, and `container image ls` exited 1 on it). Captured AFTER the churnRestore assertion
+        // above (cider-ede.37 leg 1 correction, finding 2) so a new dangling digest that restore itself
+        // might produce also shows up in the baseline-vs-post-race delta below.
         var appleList = await Cmd.RunAsync("container", ["image", "ls"], timeout: TimeSpan.FromSeconds(60));
 
         // No state entry this race actually touched lacks its blob: every LoadImages tag (pulled
@@ -306,20 +358,8 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
         // still parse with no file backing its digest); running the image forces the content to be
         // read. This is real signal even when `appleList` above stays red on the pre-existing,
         // unrelated alpine:3.18 entry (see class remarks): it directly answers whether THIS race
-        // damaged anything THIS race's own code touched.
-        //
-        // ChurnImage is deliberately NOT included here (cider-ede.37 leg 1 correction): the
-        // PreExistingDanglingContentMarker confound above means every single re-pull attempt in
-        // RmiLoopAsync aborts in FindImageDetailAsync's existedBefore check BEFORE cider's own
-        // PullImageAsync ever invokes the real Apple `image pull` subprocess, so by design the churn
-        // image is left genuinely deleted at the end of the race on this machine -- not "damaged", just
-        // never actually re-pulled through cider at all in the confound's presence. Asserting its
-        // post-race inspectability through cider would fail on every run on this machine for that
-        // reason alone, which is exactly the "red for a reason it doesn't test" failure mode the
-        // orchestrator already corrected the appleList assertion for. What still matters for the churn
-        // image is whether its underlying STORE CONTENT survived the 56 real, concurrent `image
-        // delete` sweeps this race actually issued against it -- checked directly through Apple's own
-        // CLI below (bypassing cider's confounded pull path entirely), informational only.
+        // damaged anything THIS race's own code touched. ChurnImage itself is checked above, through
+        // Apple's own CLI, not here -- see the comment on churnRestore.
         var ownedImageFailures = new List<string>();
         foreach (var image in LoadImages)
         {
@@ -342,17 +382,6 @@ public sealed class ImageStoreRaceTests(ImageStoreRaceFixture daemon, ITestOutpu
             "the race damaged one or more of the LoadImages tags THIS test itself pulled repeatedly " +
             "and never deleted -- this is new corruption this race caused, not the pre-existing " +
             "alpine:3.18 confound:\n" + string.Join('\n', ownedImageFailures));
-
-        // ChurnImage, informational: re-pull it directly through Apple's own CLI (not cider's
-        // confounded path) and confirm it inspects/runs, so the store's actual content for the tag
-        // this race deleted 56 times is checked, and so the churn image is left in a working state for
-        // whoever/whatever touches this shared machine next. Not asserted -- see the comment above.
-        var churnRestore = await Cmd.RunAsync("container", ["image", "pull", ChurnImage], timeout: PullTimeout);
-        var churnRestoreNote = churnRestore.Ok
-            ? $"{ChurnImage}: restored via Apple's own CLI after the race, store content intact"
-            : $"{ChurnImage}: Apple's own CLI could not restore it after the race (informational, not " +
-              $"asserted -- see comment above):\n{churnRestore}";
-        output.WriteLine(churnRestoreNote);
 
         // Attribute appleList's own result against the baseline taken before the race started, rather
         // than asserting appleList.Ok in isolation: a baseline that was already red (the pre-existing,

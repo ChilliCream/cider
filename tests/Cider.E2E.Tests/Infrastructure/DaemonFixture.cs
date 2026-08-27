@@ -131,10 +131,13 @@ public class DaemonFixture : IAsyncLifetime
 
     /// <summary>
     /// When <c>true</c>, a pre-existing-image snapshot that fails with Apple's own dangling-content
-    /// error ("<c>content with digest sha256:…</c>" — the same marker text
-    /// <c>Cider.AppleContainer.Cli.CliErrorMapper.IsDanglingContent</c> matches in production,
-    /// matched here as a plain substring since that type is internal to <c>Cider.AppleContainer</c>
-    /// and not visible to this assembly) does not abort <see cref="InitializeAsync"/>.
+    /// error naming the ONE tracked digest (<see cref="TrackedDanglingContentDigest"/> — "<c>content
+    /// with digest sha256:…</c>" is the same generic marker text
+    /// <c>Cider.AppleContainer.Cli.CliErrorMapper.IsDanglingContent</c> matches in production, matched
+    /// here as a plain substring since that type is internal to <c>Cider.AppleContainer</c> and not
+    /// visible to this assembly, but the marker alone is shared by ANY dangling entry — cider-ede.37
+    /// leg 1 correction, dismissed-as-minor finding 4 — so this only tolerates the one already-tracked
+    /// digest, not a future self-inflicted one) does not abort <see cref="InitializeAsync"/>.
     /// Left at its <c>false</c> default, every other fixture keeps the original all-or-nothing
     /// guarantee: "teardown must never guess at what it may safely remove" applies to images exactly
     /// as it does to containers/networks/volumes, so an unreadable image listing refuses to start the
@@ -151,6 +154,18 @@ public class DaemonFixture : IAsyncLifetime
     /// for this fixture's own tests.
     /// </summary>
     protected virtual bool ToleratesImageSnapshotDanglingContentFailure => false;
+
+    // The exact digest of the ONE pre-existing dangling content entry this machine's real shared store
+    // carries right now (docker.io/library/alpine:3.18 -> this digest, no blob file on disk -- see
+    // ImageStoreRaceTests' own TrackedDanglingContentDigest and class remarks for the full account).
+    // cider-ede.37 leg 1 correction (dismissed-as-minor finding 4): the tolerance check below used to
+    // match on the generic "content with digest" marker text alone, which is Apple's generic dangling-
+    // blob error shared by ANY dangling entry, so a future SELF-INFLICTED snapshot failure (a NEW
+    // dangling entry this fixture's own test run produced) would silently start the fixture with an
+    // empty pre-existing-image set instead of surfacing. Requiring this exact digest too means only the
+    // one already-tracked, already-understood entry is tolerated.
+    private const string TrackedDanglingContentDigest =
+        "sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979713c2d4f";
 
     /// <inheritdoc />
     public async Task InitializeAsync()
@@ -282,7 +297,8 @@ public class DaemonFixture : IAsyncLifetime
         if (!images.Ok)
         {
             if (ToleratesImageSnapshotDanglingContentFailure &&
-                images.Stderr.Contains("content with digest", StringComparison.Ordinal))
+                images.Stderr.Contains("content with digest", StringComparison.Ordinal) &&
+                images.Stderr.Contains(TrackedDanglingContentDigest, StringComparison.Ordinal))
             {
                 // See this property's own doc comment: a pre-existing, out-of-scope dangling content
                 // reference on this machine's real shared store makes `container image ls` fail with
