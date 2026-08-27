@@ -1,6 +1,7 @@
 using Cider.AppleContainer;
 using Cider.AppleContainer.Xpc;
 using Cider.Core.Runtime;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -44,20 +45,53 @@ public class XpcContainerRuntimeE2ETests
     /// <summary>One CLI-backed runtime and one XPC runtime wrapping that very same CLI runtime as its
     /// own fallback — mirrors exactly what <c>RuntimeTransportSelector</c> wires up in production.
     /// Caller disposes the returned <see cref="XpcContainerRuntime"/> (which owns and disposes its two
-    /// <see cref="XpcClient"/>s); the CLI runtime holds no disposable resources of its own.</summary>
-    private static (XpcContainerRuntime Xpc, AppleContainerRuntime Cli) NewRuntimes()
+    /// <see cref="XpcClient"/>s); the CLI runtime holds no disposable resources of its own. The
+    /// <see cref="RecordingLogger{T}"/> backs <see cref="AssertNoCreateFallback"/> — the drift guard
+    /// (task cider-f8v) that keeps a future spec literal without a merged <c>Entrypoint</c> from
+    /// silently exercising the CLI fallback under this XPC-named suite's nose again.</summary>
+    private static (XpcContainerRuntime Xpc, AppleContainerRuntime Cli, RecordingLogger<XpcContainerRuntime> Logger) NewRuntimes()
     {
         var options = new AppleContainerOptions { CliPath = ResolveCliPath() };
         var cli = new AppleContainerRuntime(options, NullLogger<AppleContainerRuntime>.Instance);
         var apiserver = new XpcClient(RuntimeTransportSelector.ApiServerService, NullLogger.Instance);
         var images = new XpcClient(RuntimeTransportSelector.ImagesService, NullLogger.Instance);
         var capabilities = new RuntimeCapabilities { Transport = RuntimeTransportKind.Xpc };
-        var xpc = new XpcContainerRuntime(
-            cli, apiserver, images, capabilities, options, NullLogger<XpcContainerRuntime>.Instance);
-        return (xpc, cli);
+        var logger = new RecordingLogger<XpcContainerRuntime>();
+        var xpc = new XpcContainerRuntime(cli, apiserver, images, capabilities, options, logger);
+        return (xpc, cli, logger);
     }
 
     private static string NewName(string suffix) => $"cider-e2e-xpc-{Guid.NewGuid():N}"[..24] + "-" + suffix;
+
+    /// <summary>Drift guard (task cider-f8v): fails if <c>CreateContainerAsync</c> took the CLI
+    /// fallback (<c>XpcContainerRuntime.WarnFallback</c> logs a Warning naming the route) — the exact
+    /// failure mode a future spec literal without a merged <see cref="ContainerSpec.Entrypoint"/> would
+    /// silently reintroduce. <paramref name="logger"/> is fresh per test (see <see cref="NewRuntimes"/>),
+    /// so the once-per-minute throttle on the warning never suppresses it here.</summary>
+    private static void AssertNoCreateFallback(RecordingLogger<XpcContainerRuntime> logger) =>
+        Assert.DoesNotContain(
+            logger.Entries,
+            e => e.Level == LogLevel.Warning && e.Message.Contains("containerCreate", StringComparison.Ordinal));
+
+    /// <summary>Captures every log entry made against it, so a test can assert a specific Warning
+    /// (here, <c>XpcContainerRuntime.WarnFallback</c>) either did or did not fire — see
+    /// <see cref="AssertNoCreateFallback"/>.</summary>
+    private sealed class RecordingLogger<T> : ILogger<T>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add((logLevel, formatter(state, exception)));
+    }
 
     // ---- create/delete/stop/kill (task cider-ede.6) ------------------------------------------------
 
@@ -76,7 +110,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(CreateBudget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, logger) = NewRuntimes();
         using var __ = xpc;
 
         await xpc.EnsureReadyAsync(ct);
@@ -87,13 +121,18 @@ public class XpcContainerRuntimeE2ETests
             {
                 RuntimeId = name,
                 Image = Image,
-                Args = ["sleep", "300"],
+                // Entrypoint must be set — see cider-f8v: a null/empty Entrypoint makes
+                // XpcContainerRuntime.CreateContainerAsync fall back to the CLI runtime, which would
+                // silently defeat this test's own purpose of exercising the XPC create path.
+                Entrypoint = "sleep",
+                Args = ["300"],
                 Env = ["E2E=yes"],
                 WorkingDir = "/tmp",
                 Networks = ["default"],
                 Labels = new Dictionary<string, string> { ["com.chillicream.cider.test"] = "1" },
             },
             ct);
+        AssertNoCreateFallback(logger);
 
         try
         {
@@ -122,7 +161,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(CreateBudget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, logger) = NewRuntimes();
         using var _ = xpc;
 
         await xpc.EnsureReadyAsync(ct);
@@ -133,11 +172,16 @@ public class XpcContainerRuntimeE2ETests
             {
                 RuntimeId = name,
                 Image = Image,
-                Args = ["sleep", "300"],
+                // Entrypoint must be set — see cider-f8v: a null/empty Entrypoint makes
+                // XpcContainerRuntime.CreateContainerAsync fall back to the CLI runtime, which would
+                // silently defeat this test's own purpose of exercising the XPC create path.
+                Entrypoint = "sleep",
+                Args = ["300"],
                 Networks = ["default"],
                 Hostname = "db",
             },
             ct);
+        AssertNoCreateFallback(logger);
 
         IContainerProcess? held = null;
         try
@@ -173,7 +217,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(CreateBudget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, logger) = NewRuntimes();
         using var _ = xpc;
 
         await xpc.EnsureReadyAsync(ct);
@@ -184,11 +228,16 @@ public class XpcContainerRuntimeE2ETests
             {
                 RuntimeId = name,
                 Image = Image,
-                Args = ["sleep", "300"],
+                // Entrypoint must be set — see cider-f8v: a null/empty Entrypoint makes
+                // XpcContainerRuntime.CreateContainerAsync fall back to the CLI runtime, which would
+                // silently defeat this test's own purpose of exercising the XPC create path.
+                Entrypoint = "sleep",
+                Args = ["300"],
                 Networks = ["default"],
                 Sysctls = new Dictionary<string, string> { ["net.core.somaxconn"] = "1024" },
             },
             ct);
+        AssertNoCreateFallback(logger);
 
         IContainerProcess? held = null;
         try
@@ -220,7 +269,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(CreateBudget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, logger) = NewRuntimes();
         using var _ = xpc;
 
         await xpc.EnsureReadyAsync(ct);
@@ -243,6 +292,7 @@ public class XpcContainerRuntimeE2ETests
                 Networks = [],
             },
             ct);
+        AssertNoCreateFallback(logger);
 
         IContainerProcess? held = null;
         try
@@ -280,7 +330,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(CreateBudget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, logger) = NewRuntimes();
         using var _ = xpc;
 
         await xpc.EnsureReadyAsync(ct);
@@ -296,11 +346,16 @@ public class XpcContainerRuntimeE2ETests
                 {
                     RuntimeId = name,
                     Image = Image,
-                    Args = ["sleep", "300"],
+                    // Entrypoint must be set — see cider-f8v: a null/empty Entrypoint makes
+                    // XpcContainerRuntime.CreateContainerAsync fall back to the CLI runtime, which would
+                    // silently defeat this test's own purpose of exercising the XPC create path.
+                    Entrypoint = "sleep",
+                    Args = ["300"],
                     Networks = ["default"],
                     Mounts = [new MountSpec { Kind = MountKind.Volume, Source = volumeName, Target = "/data" }],
                 },
                 ct);
+            AssertNoCreateFallback(logger);
 
             var inspected = await xpc.InspectContainerAsync(name, ct);
             Assert.NotNull(inspected);
@@ -325,15 +380,19 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(CreateBudget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, logger) = NewRuntimes();
         using var _ = xpc;
 
         await xpc.EnsureReadyAsync(ct);
 
         var name = NewName("stop");
         await xpc.CreateContainerAsync(
-            new ContainerSpec { RuntimeId = name, Image = Image, Args = ["sleep", "300"], Networks = ["default"] },
+            // Entrypoint must be set — see cider-f8v: a null/empty Entrypoint makes
+            // XpcContainerRuntime.CreateContainerAsync fall back to the CLI runtime, which would
+            // silently defeat this test's own purpose of exercising the XPC create path.
+            new ContainerSpec { RuntimeId = name, Image = Image, Entrypoint = "sleep", Args = ["300"], Networks = ["default"] },
             ct);
+        AssertNoCreateFallback(logger);
 
         IContainerProcess? held = null;
         try
@@ -368,15 +427,19 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(CreateBudget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, logger) = NewRuntimes();
         using var _ = xpc;
 
         await xpc.EnsureReadyAsync(ct);
 
         var name = NewName("kill");
         await xpc.CreateContainerAsync(
-            new ContainerSpec { RuntimeId = name, Image = Image, Args = ["sleep", "300"], Networks = ["default"] },
+            // Entrypoint must be set — see cider-f8v: a null/empty Entrypoint makes
+            // XpcContainerRuntime.CreateContainerAsync fall back to the CLI runtime, which would
+            // silently defeat this test's own purpose of exercising the XPC create path.
+            new ContainerSpec { RuntimeId = name, Image = Image, Entrypoint = "sleep", Args = ["300"], Networks = ["default"] },
             ct);
+        AssertNoCreateFallback(logger);
 
         IContainerProcess? held = null;
         try
@@ -415,7 +478,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, logger) = NewRuntimes();
         using var _ = xpc;
 
         await xpc.EnsureReadyAsync(ct);
@@ -423,8 +486,12 @@ public class XpcContainerRuntimeE2ETests
         async Task CreateAndRemoveAsync(string name)
         {
             await xpc.CreateContainerAsync(
-                new ContainerSpec { RuntimeId = name, Image = Image, Args = ["true"], Networks = ["default"] },
+                // Entrypoint must be set — see cider-f8v: a null/empty Entrypoint makes
+                // XpcContainerRuntime.CreateContainerAsync fall back to the CLI runtime, which would
+                // silently defeat this test's own purpose of measuring the XPC create path's latency.
+                new ContainerSpec { RuntimeId = name, Image = Image, Entrypoint = "true", Networks = ["default"] },
                 ct);
+            AssertNoCreateFallback(logger);
             await xpc.RemoveContainerAsync(name, force: true, ct);
         }
 
@@ -474,7 +541,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(Budget);
         var ct = cts.Token;
-        var (xpc, cli) = NewRuntimes();
+        var (xpc, cli, _) = NewRuntimes();
         using var _ = xpc;
 
         var cliContainers = await cli.ListContainersAsync(ct);
@@ -500,7 +567,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(Budget);
         var ct = cts.Token;
-        var (xpc, cli) = NewRuntimes();
+        var (xpc, cli, _) = NewRuntimes();
         using var _ = xpc;
 
         var missingId = $"cider-e2e-definitely-missing-{Guid.NewGuid():N}";
@@ -527,7 +594,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(Budget);
         var ct = cts.Token;
-        var (xpc, cli) = NewRuntimes();
+        var (xpc, cli, _) = NewRuntimes();
         using var _ = xpc;
 
         var missingId = $"cider-e2e-definitely-missing-{Guid.NewGuid():N}";
@@ -554,7 +621,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(Budget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, _) = NewRuntimes();
         using var _ = xpc;
 
         var info = await xpc.GetInfoAsync(ct);
@@ -570,7 +637,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(Budget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, _) = NewRuntimes();
         using var _ = xpc;
 
         var usage = await xpc.GetDiskUsageAsync(ct);
@@ -586,7 +653,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(Budget);
         var ct = cts.Token;
-        var (xpc, cli) = NewRuntimes();
+        var (xpc, cli, _) = NewRuntimes();
         using var _ = xpc;
 
         var cliNetworks = await cli.ListNetworksAsync(ct);
@@ -610,7 +677,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(Budget);
         var ct = cts.Token;
-        var (xpc, cli) = NewRuntimes();
+        var (xpc, cli, _) = NewRuntimes();
         using var _ = xpc;
 
         var cliVolumes = await cli.ListVolumesAsync(ct);
@@ -646,7 +713,7 @@ public class XpcContainerRuntimeE2ETests
     {
         using var cts = new CancellationTokenSource(Budget);
         var ct = cts.Token;
-        var (xpc, _) = NewRuntimes();
+        var (xpc, _, _) = NewRuntimes();
         using var _ = xpc;
 
         await xpc.ListContainersAsync(ct); // warm-up
