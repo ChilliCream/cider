@@ -41,6 +41,33 @@ public sealed class CrossProcessRaceFactAttribute : FactAttribute
 }
 
 /// <summary>
+/// An E2E fact that also needs <c>CIDER_E2E_XPROC_SOLO=1</c>: cider-ede.41's SOLO-PULL
+/// discriminator. One throwaway daemon, one pull, NOTHING else running — no race, no prune, no
+/// concurrent verb anywhere — with the shared store's blob directory sampled (file count + total
+/// bytes) every ~2s so the recorded output distinguishes "the pull wrote no durable bytes" from
+/// "the pull wrote bytes that were then lost". It exists because the 44212d2 post-fix run produced
+/// a dangling index entry in ~1.6s with zero sweeps in existence: if a solo pull alone reproduces
+/// that, Apple's pull is broken independent of any race and every race experiment is confounded.
+/// Never part of a default suite run: it pulls into the real machine-wide Apple store.
+/// </summary>
+public sealed class SoloPullDiscriminatorFactAttribute : FactAttribute
+{
+    /// <summary>Applies the skip reason unless the solo-pull discriminator is opted into.</summary>
+    public SoloPullDiscriminatorFactAttribute()
+    {
+        if (DaemonFixture.SkipReason is { } reason)
+        {
+            Skip = reason;
+        }
+        else if (!string.Equals(Environment.GetEnvironmentVariable("CIDER_E2E_XPROC_SOLO"), "1", StringComparison.Ordinal))
+        {
+            Skip = "set CIDER_E2E_XPROC_SOLO=1 to run cider-ede.41's solo-pull discriminator " +
+                "(one uncached pull into the shared machine-wide Apple store, byte progress sampled)";
+        }
+    }
+}
+
+/// <summary>
 /// An E2E fact that also needs <c>CIDER_PORT_PUBLISHING=apple</c>: it characterizes what
 /// Apple <c>container</c>'s own published-port forwarder does, which the default <c>proxy</c> mode
 /// deliberately bypasses.

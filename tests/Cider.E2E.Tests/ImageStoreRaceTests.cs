@@ -871,6 +871,233 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
     private static string[] DanglingEntries() =>
         ImageStoreRaceTests.ScanAppleStoreState() is { } scan ? [.. scan.MissingBlobEntries] : [];
 
+    /// <summary>
+    /// One byte-level sample of the shared store's blob directory: file count and total bytes under
+    /// <c>content/blobs/sha256</c>. This is the planner-required evidence stream for cider-ede.41's
+    /// post-44212d2 legs: sampled every ~2s it makes "the pull wrote no durable bytes" versus "the
+    /// pull wrote bytes that were then lost" a fact in the recorded output, not an inference from a
+    /// before/after pair. Returns <c>null</c> when the directory cannot be enumerated (transient
+    /// mid-write races are expected; a skipped sample is recorded as such, never invented).
+    /// </summary>
+    private static (int Count, long Bytes)? SampleBlobDir()
+    {
+        var dir = Path.Combine(ImageStoreRaceTests.AppleStoreRoot, "content", "blobs", "sha256");
+        try
+        {
+            var count = 0;
+            var bytes = 0L;
+            foreach (var file in new DirectoryInfo(dir).EnumerateFiles())
+            {
+                count++;
+                try
+                {
+                    bytes += file.Length;
+                }
+                catch (FileNotFoundException)
+                {
+                    // Deleted between enumeration and stat -- count it as seen, size unknown.
+                }
+            }
+
+            return (count, bytes);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or DirectoryNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Samples <see cref="SampleBlobDir"/> every ~2s into <paramref name="samples"/> (elapsed time,
+    /// count, bytes, and the delta against the run's baseline) until cancelled. Runs beside the
+    /// pull(s), never touches the store beyond reading directory metadata.
+    /// </summary>
+    private static async Task SampleBlobDirLoopAsync(
+        Stopwatch clock,
+        (int Count, long Bytes) baseline,
+        ConcurrentQueue<string> samples,
+        CancellationToken cancellation)
+    {
+        while (!cancellation.IsCancellationRequested)
+        {
+            samples.Enqueue(
+                SampleBlobDir() is { } s
+                    ? $"t={clock.Elapsed.TotalSeconds,7:F1}s blobs={s.Count} bytes={s.Bytes:N0} " +
+                      $"(delta vs baseline: {s.Count - baseline.Count:+0;-0;+0} file(s), {s.Bytes - baseline.Bytes:+#,0;-#,0;+0} byte(s))"
+                    : $"t={clock.Elapsed.TotalSeconds,7:F1}s sample unavailable (blob dir enumeration failed transiently)");
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2), cancellation);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// cider-ede.41 SOLO-PULL DISCRIMINATOR (post-44212d2, post store-repair + Apple-services
+    /// restart). The 44212d2 fix-leg run produced the dangling redis:8.6 entry on cycle 1, ~1.6s in,
+    /// with the fdc9c38 mitigation active and provably ZERO sweeps anywhere — the pull wrote no
+    /// durable bytes yet Apple committed the index entry. Prime suspect: stale in-memory content
+    /// state in Apple's long-lived services (up since Aug 25, across an out-of-band repair). The
+    /// operator has now repaired the store AND restarted the services, unloading that suspect. This
+    /// test is the cheap discriminator that must run BEFORE any further race: one throwaway
+    /// XPC-pinned daemon, one uncached pull, nothing else running, byte progress sampled every ~2s.
+    ///
+    /// FAILURE (pull errors, or a dangling entry appears): Apple's pull is broken independent of any
+    /// race — the run records timing, byte samples, error and index state, repairs NOTHING, and
+    /// fails loudly. That is a decisive finding, not a flake to retry.
+    /// SUCCESS (entry committed, digest blob durably on disk, image inspectable and creatable):
+    /// recorded with the same detail, then restored via normal <c>rmi</c> — the pulled blobs remain
+    /// as orphans by design (fdc9c38: nothing in cider sweeps; reclaim is Apple's own
+    /// <c>container image prune</c>, run quiescently by the operator or the fix leg, never here).
+    /// </summary>
+    [SoloPullDiscriminatorFact]
+    public async Task Solo_uncached_pull_with_nothing_else_running_writes_durable_bytes_and_commits_a_resolvable_entry()
+    {
+        // CLEAN BASELINE, required and recorded exactly as the race leg requires it.
+        var baselineLs = await Cmd.RunAsync("container", ["image", "ls"], timeout: TimeSpan.FromSeconds(60));
+        var baselineScan = ImageStoreRaceTests.ScanAppleStoreState();
+        var baselineBlobs = SampleBlobDir();
+        output.WriteLine(
+            $"SOLO BASELINE: `container image ls` ok={baselineLs.Ok}; index scan: " +
+            (baselineScan is null
+                ? "unavailable"
+                : $"{baselineScan.Value.References.Count} entries, {baselineScan.Value.MissingBlobEntries.Count} missing blob(s)") +
+            "; blob dir: " + (baselineBlobs is null ? "unavailable" : $"{baselineBlobs.Value.Count} file(s), {baselineBlobs.Value.Bytes:N0} bytes"));
+        if (!baselineLs.Ok || baselineScan is null || baselineBlobs is null ||
+            baselineScan.Value.MissingBlobEntries.Count > 0)
+        {
+            Assert.Fail(
+                "INCONCLUSIVE -- baseline store not clean before the solo-pull discriminator:\n" +
+                $"container image ls ok={baselineLs.Ok}\n{baselineLs}\n" +
+                "index scan: " + (baselineScan is null
+                    ? "unavailable"
+                    : string.Join('\n', baselineScan.Value.MissingBlobEntries)));
+        }
+
+        var baselineReferences = new HashSet<string>(baselineScan.Value.References, StringComparer.Ordinal);
+        Assert.True(
+            !baselineReferences.Any(r => ImageStoreRaceTests.ReferenceMatches(r, ChurnImage)),
+            $"churn image {ChurnImage} is already present in the shared store's index -- the solo " +
+            "discriminator needs a genuinely uncached pull");
+        output.WriteLine($"churn image {ChurnImage}: ABSENT from the store index at baseline (asserted, not assumed)");
+
+        await using var daemon = await SpawnDaemonAsync("solo");
+        Assert.True(
+            daemon.Process.Pid != Environment.ProcessId,
+            "the daemon and the test runner must be distinct OS processes");
+
+        var samples = new ConcurrentQueue<string>();
+        using var samplerCancellation = new CancellationTokenSource();
+        var clock = Stopwatch.StartNew();
+        var sampler = SampleBlobDirLoopAsync(clock, baselineBlobs.Value, samples, samplerCancellation.Token);
+
+        var pull = await daemon.DockerAsync(["pull", ChurnImage], PullTimeout);
+        var pullDuration = clock.Elapsed;
+
+        samplerCancellation.Cancel();
+        await sampler;
+        var finalBlobs = SampleBlobDir();
+
+        foreach (var sample in samples)
+        {
+            output.WriteLine("blob sample: " + sample);
+        }
+
+        output.WriteLine(
+            $"solo pull of {ChurnImage}: ok={pull.Ok}, duration {pullDuration.TotalSeconds:F1}s; blob dir " +
+            $"{baselineBlobs.Value.Count} -> {(finalBlobs is null ? "?" : finalBlobs.Value.Count.ToString(CultureInfo.InvariantCulture))} file(s), " +
+            $"{baselineBlobs.Value.Bytes:N0} -> {(finalBlobs is null ? "?" : finalBlobs.Value.Bytes.ToString("N0", CultureInfo.InvariantCulture))} bytes");
+
+        var postScan = ImageStoreRaceTests.ScanAppleStoreState();
+        var dangling = postScan?.MissingBlobEntries ?? [];
+        var postLs = await Cmd.RunAsync("container", ["image", "ls"], timeout: TimeSpan.FromSeconds(60));
+        output.WriteLine(
+            "post-pull state: index scan " +
+            (postScan is null
+                ? "unavailable"
+                : $"{postScan.Value.References.Count} entries, {dangling.Count} missing blob(s)") +
+            $"; container image ls ok={postLs.Ok}");
+
+        // DECISIVE FAILURE PATH: the pull failed, or committed an entry whose blob is not on disk,
+        // with nothing else running -- Apple's pull is broken independent of any race. Record
+        // everything; repair nothing.
+        if (!pull.Ok || dangling.Count > 0 || !postLs.Ok)
+        {
+            Assert.Fail(
+                "SOLO PULL BROKEN WITH NOTHING ELSE RUNNING -- no race, no prune, no concurrent " +
+                "verb anywhere, services freshly restarted. Apple's pull path itself produced this; " +
+                "every race experiment is confounded until it is understood. DO NOT repair from " +
+                "code; record for the operator:\n" +
+                $"pull ok={pull.Ok} after {pullDuration.TotalSeconds:F1}s\n{pull}\n" +
+                "dangling entries: " + (dangling.Count == 0 ? "(none)" : string.Join("; ", dangling)) + "\n" +
+                $"container image ls ok={postLs.Ok}\n" +
+                "byte samples above show whether durable bytes were ever written");
+        }
+
+        // SUCCESS PATH: the committed entry must resolve to a durable blob, and the image must be
+        // usable through normal verbs (inspect + create), not merely listed.
+        Assert.True(postScan is not null, "post-pull index scan unavailable although the pull succeeded");
+        var committed = postScan!.Value.References
+            .FirstOrDefault(r => ImageStoreRaceTests.ReferenceMatches(r, ChurnImage));
+        Assert.True(committed is not null, $"pull succeeded but {ChurnImage} is not in the store index");
+        var digest = ChurnDigestOf(committed!);
+        Assert.True(digest is not null, $"index entry {committed} has no digest");
+        var blobPath = Path.Combine(
+            ImageStoreRaceTests.AppleStoreRoot, "content", "blobs", "sha256", digest!["sha256:".Length..]);
+        Assert.True(File.Exists(blobPath), $"index entry {committed} -> {digest} has NO blob file on disk");
+        output.WriteLine($"committed entry: {committed} -> {digest}; index blob durably on disk ({new FileInfo(blobPath).Length:N0} bytes)");
+
+        var inspect = await daemon.DockerAsync(["image", "inspect", ChurnImage], TimeSpan.FromSeconds(60));
+        Assert.True(inspect.Ok, "pulled image is not inspectable:\n" + inspect);
+
+        var create = await daemon.DockerAsync(["create", ChurnImage], TimeSpan.FromMinutes(3));
+        output.WriteLine($"docker create ok={create.Ok} (runnability check)");
+        if (create.Ok)
+        {
+            var containerId = create.Stdout.Trim().Split('\n')[^1].Trim();
+            var rm = await daemon.DockerAsync(["rm", "-f", containerId], TimeSpan.FromMinutes(3));
+            output.WriteLine($"docker rm -f {containerId}: ok={rm.Ok}");
+        }
+
+        Assert.True(create.Ok, "pulled image could not create a container:\n" + create);
+
+        // RESTORE through normal verbs only: rmi removes the index entry; the blobs stay behind as
+        // orphans BY DESIGN (fdc9c38) -- reclaiming them is Apple's own `container image prune`,
+        // run quiescently outside this test.
+        var restoreRmi = await daemon.DockerAsync(["rmi", "-f", ChurnImage], PullTimeout);
+        var restoreScan = ImageStoreRaceTests.ScanAppleStoreState();
+        var restoreLs = await Cmd.RunAsync("container", ["image", "ls"], timeout: TimeSpan.FromSeconds(60));
+        var restoreBlobs = SampleBlobDir();
+        output.WriteLine(
+            $"restore: rmi ok={restoreRmi.Ok}; index scan " +
+            (restoreScan is null
+                ? "unavailable"
+                : $"{restoreScan.Value.References.Count} entries, {restoreScan.Value.MissingBlobEntries.Count} missing blob(s)") +
+            $"; container image ls ok={restoreLs.Ok}; blob dir " +
+            (restoreBlobs is null ? "unavailable" : $"{restoreBlobs.Value.Count} file(s), {restoreBlobs.Value.Bytes:N0} bytes") +
+            " (pulled blobs remain as orphans by design; reclaim is Apple's own prune, not cider's)");
+        Assert.True(restoreRmi.Ok, "restore rmi failed:\n" + restoreRmi);
+        Assert.True(
+            restoreScan is not null && baselineReferences.SetEquals(restoreScan.Value.References),
+            "the store index does not match the recorded baseline after restore:\n" +
+            $"baseline ({baselineReferences.Count}): {string.Join(", ", baselineReferences.Order(StringComparer.Ordinal))}\n" +
+            $"final ({restoreScan?.References.Count ?? 0}): {string.Join(", ", (restoreScan?.References ?? []).Order(StringComparer.Ordinal))}");
+        Assert.True(restoreLs.Ok, "`container image ls` exited non-zero after restore:\n" + restoreLs);
+        Assert.True(
+            restoreScan!.Value.MissingBlobEntries.Count == 0,
+            "dangling entries after restore: " + string.Join("; ", restoreScan.Value.MissingBlobEntries));
+
+        output.WriteLine(
+            "SOLO DISCRIMINATOR OUTCOME: pull succeeded, entry committed with durable content, " +
+            "image inspectable and creatable, store restored to baseline references -- consistent " +
+            "with the stale-service-state hypothesis for the 44212d2 incident (repair-under-running-" +
+            "services), now unloaded by the operator's restart");
+    }
+
     [CrossProcessRaceFact]
     public async Task Two_gated_daemons_pull_vs_prune_across_processes_against_the_shared_store()
     {
@@ -904,6 +1131,14 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
         }
 
         var baselineReferences = new HashSet<string>(baselineScan.Value.References, StringComparer.Ordinal);
+
+        // Byte-level baseline (planner requirement after the 44212d2 finding): the blob directory's
+        // file count and total bytes, sampled every ~2s for the whole race so any incident's output
+        // distinguishes "wrote no durable bytes" from "wrote then lost" on its face.
+        var baselineBlobs = SampleBlobDir();
+        output.WriteLine(
+            "blob dir at baseline: " +
+            (baselineBlobs is null ? "unavailable" : $"{baselineBlobs.Value.Count} file(s), {baselineBlobs.Value.Bytes:N0} bytes"));
 
         // The churn image must be genuinely uncached before the experiment starts.
         Assert.True(
@@ -1106,13 +1341,25 @@ public sealed class CrossProcessImageStoreRaceTests(ITestOutputHelper output)
             }
         }
 
+        var blobSamples = new ConcurrentQueue<string>();
+        using var blobSamplerCancellation = new CancellationTokenSource();
         var raceClock = Stopwatch.StartNew();
+        var blobSampler = baselineBlobs is { } blobBaseline
+            ? SampleBlobDirLoopAsync(raceClock, blobBaseline, blobSamples, blobSamplerCancellation.Token)
+            : Task.CompletedTask;
         await Task.WhenAll(PullLoopAsync(), PruneLoopAsync());
+        blobSamplerCancellation.Cancel();
+        await blobSampler;
         raceClock.Stop();
 
         foreach (var line in cycleLog)
         {
             output.WriteLine(line);
+        }
+
+        foreach (var sample in blobSamples)
+        {
+            output.WriteLine("blob sample: " + sample);
         }
 
         // RESTORE the shared store toward its recorded clean baseline through normal verbs only:
