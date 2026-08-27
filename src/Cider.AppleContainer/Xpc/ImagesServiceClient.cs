@@ -95,8 +95,25 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
     }
 
     /// <summary>
-    /// <c>imagePull{imageReference, ociPlatform?, insecureFlag:false, progressUpdateEndpoint?}</c> →
-    /// <c>imageDescription</c> (§6; fix direction §2). <paramref name="reference"/> travels verbatim:
+    /// <c>maxConcurrentDownloads</c> on <c>imagePull</c> — Apple's own client always sends it
+    /// (<c>ClientImage.swift:253-272</c> at 1.3.0: guarded <c>&gt; 0</c>, default 3, set
+    /// unconditionally), and the server treats an ABSENT key as 0: <c>ImagesServiceHarness.swift:51</c>
+    /// reads it with <c>message.int64</c> (0 for a missing key) and passes it straight through to
+    /// Containerization's <c>ImportOperation</c>, whose <c>fetchAll</c> loop
+    /// (<c>ImageStore+Import.swift:126</c>, containerization 0.41.0/5427fd2) starts
+    /// <c>0..&lt;maxConcurrentDownloads</c> download tasks — with 0, NOTHING is ever downloaded, the
+    /// manifest walk still "succeeds" via its in-memory registry fallback, the empty ingest commits,
+    /// and the very next <c>imageUnpack</c> dies at <c>Image.index()</c> with
+    /// <c>"content with digest sha256:…"</c> on the INDEX digest (cider-ede.43's exact failure: zero
+    /// durable bytes, dangling committed entry, only when content is genuinely absent from disk).
+    /// 3 matches Apple's default (<c>Flags.swift:428</c>).
+    /// </summary>
+    internal const long MaxConcurrentDownloads = 3;
+
+    /// <summary>
+    /// <c>imagePull{imageReference, ociPlatform?, insecureFlag:false, maxConcurrentDownloads,
+    /// progressUpdateEndpoint?}</c> → <c>imageDescription</c> (§6; fix direction §2).
+    /// <paramref name="reference"/> travels verbatim:
     /// <c>ImageManager.PullAsync</c> already normalized it (registry/<c>library/</c>/<c>:latest</c>
     /// defaults) above the <c>IContainerRuntime</c> seam before this is ever called — the very same
     /// normalized form Apple's own index annotates images with (verified live,
@@ -107,7 +124,22 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
     /// </summary>
     public virtual async Task<ImageDescription> ImagePullAsync(string reference, Platform? platform, XpcObject? progressEndpoint, CancellationToken ct)
     {
-        using var request = new XpcMessage("imagePull");
+        using var request = BuildImagePullRequest(reference, platform, progressEndpoint);
+        using var reply = await images.SendAsync(request, _longRunningOptions, ct).ConfigureAwait(false);
+
+        var bytes = reply.GetData("imageDescription")
+            ?? throw new JsonException("imagePull reply carried no imageDescription");
+        return XpcJson.Deserialize<ImageDescription>(bytes);
+    }
+
+    /// <summary>The <c>imagePull</c> request, built exactly as Apple's <c>ClientImage.pull</c> builds
+    /// it (field-by-field diff, cider-ede.43) — split out so
+    /// <c>tests/Cider.Tests/AppleContainer/Xpc/ImagesServiceClientPullRequestTests.cs</c> can assert
+    /// the wire message (in particular that <c>maxConcurrentDownloads</c> is present and nonzero;
+    /// see <see cref="MaxConcurrentDownloads"/>) without a live apiserver.</summary>
+    internal static XpcMessage BuildImagePullRequest(string reference, Platform? platform, XpcObject? progressEndpoint)
+    {
+        var request = new XpcMessage("imagePull");
         request.SetString("imageReference", reference);
         if (platform is not null)
         {
@@ -115,16 +147,13 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
         }
 
         request.SetBool("insecureFlag", false);
+        request.SetInt64("maxConcurrentDownloads", MaxConcurrentDownloads);
         if (progressEndpoint is not null)
         {
             request.SetValue("progressUpdateEndpoint", progressEndpoint);
         }
 
-        using var reply = await images.SendAsync(request, _longRunningOptions, ct).ConfigureAwait(false);
-
-        var bytes = reply.GetData("imageDescription")
-            ?? throw new JsonException("imagePull reply carried no imageDescription");
-        return XpcJson.Deserialize<ImageDescription>(bytes);
+        return request;
     }
 
     /// <summary><c>imagePush{imageReference, ociPlatform?, insecureFlag:false, progressUpdateEndpoint?}</c>

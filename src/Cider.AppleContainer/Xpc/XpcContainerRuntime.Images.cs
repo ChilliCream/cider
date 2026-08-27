@@ -532,7 +532,8 @@ internal sealed partial class XpcContainerRuntime
     // ---- images: write paths -----------------------------------------------------------------
 
     /// <summary>
-    /// <c>imagePull{imageReference, ociPlatform?, insecureFlag:false, progressUpdateEndpoint}</c> then
+    /// <c>imagePull{imageReference, ociPlatform?, insecureFlag:false, maxConcurrentDownloads,
+    /// progressUpdateEndpoint}</c> then
     /// <c>imageUnpack</c> on the same progress endpoint — the real CLI does both too
     /// (docs/spikes/xpc/02-apiserver-xpc-protocol.md §4's call-sequence table: "(I) imagePull
     /// [+progressUpdateEndpoint] ; (I) imageUnpack"). <see cref="ProgressUpdateListener"/> only ever
