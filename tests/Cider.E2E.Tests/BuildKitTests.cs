@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using Cider.E2E.Tests.Infrastructure;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Cider.E2E.Tests;
 
@@ -11,7 +13,7 @@ namespace Cider.E2E.Tests;
 /// </summary>
 [Collection(DaemonCollection.Name)]
 [Trait("Category", "E2E")]
-public sealed class BuildKitTests(DaemonFixture daemon)
+public sealed class BuildKitTests(DaemonFixture daemon, ITestOutputHelper output)
 {
     private const string Alpine = "FROM alpine:3.22\n";
 
@@ -489,17 +491,30 @@ public sealed class BuildKitTests(DaemonFixture daemon)
     [LargeContextFact]
     public async Task Large_200mib_context_characterization()
     {
+        const long ContextBytes = 200L * 1024 * 1024;
+
         var tag = UniqueTag("bk-large-200");
         var context = await NewContextAsync("bk-large-200", Alpine + "COPY . /ctx\nRUN ls -la /ctx > /listing\n");
-        await WriteRandomFileAsync(Path.Combine(context, "payload.bin"), 200L * 1024 * 1024);
+        await WriteRandomFileAsync(Path.Combine(context, "payload.bin"), ContextBytes);
 
+        var stopwatch = Stopwatch.StartNew();
         var build = await BuildAsync(["build", "-t", tag, "."], context, TimeSpan.FromMinutes(10));
+        stopwatch.Stop();
+
+        // Recorded on every run (not only success) so a regression shows up as a number, not just a
+        // pass/fail line: this is the only durable measurement of cider-ger.21's 8->32 MiB/s pacer
+        // retune and README.md's published "~6.2s" / "~32 MiB/s" figures (cider-ger.23). No pass/fail
+        // budget on the timing itself on purpose — this is characterization, not a throughput
+        // contract on the current exec-based context transport.
+        var seconds = stopwatch.Elapsed.TotalSeconds;
+        var mebibytesPerSecond = ContextBytes / 1024.0 / 1024.0 / seconds;
+        output.WriteLine(
+            $"Large_200mib_context_characterization: 200 MiB context build took {seconds:F2}s " +
+            $"({mebibytesPerSecond:F1} MiB/s), ok={build.Ok}");
 
         try
         {
-            // No pass/fail budget here on purpose: this is characterization for cider-ger.15, not a
-            // pass/fail contract on how fast the current exec-based context transport must be. The
-            // build itself must still succeed, whatever it costs.
+            // The build itself must still succeed, whatever it costs.
             Assert.True(build.Ok, build.ToString());
         }
         finally
