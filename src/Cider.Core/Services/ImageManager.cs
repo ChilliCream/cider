@@ -1107,7 +1107,29 @@ public sealed class ImageManager
         }
 
         onRuntimeCall?.Invoke();
-        var images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
+        IReadOnlyList<RuntimeImage> images;
+        try
+        {
+            images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
+        }
+        catch (RuntimeException ex)
+        {
+            // Total listing failure (cider-ede.24's enumerated-with-skips-is-a-success distinction
+            // means this branch is reached only when the runtime could produce no listing at all —
+            // e.g. a single dangling content entry taking out Apple's whole `image ls`), reached only
+            // after a direct-by-reference inspect above already came back empty. Unlike the load-diff
+            // snapshot this guard mirrors (SnapshotImageIdsByReferenceAsync), a caught failure here
+            // changes what the caller — and ultimately the user — is told, so it is logged at Warning,
+            // not Debug. Reported as "not found" rather than propagated: for a lookup that already
+            // missed on direct inspect, that is the same answer dockerd gives for a reference it
+            // cannot resolve, and it is what makes `docker rmi <absent-ref>` a 404 instead of a 500.
+            _logger.LogWarning(
+                ex,
+                "could not list images while resolving {Reference} after a direct inspect miss -- reporting not found",
+                reference);
+            return null;
+        }
+
         var candidate = MatchImage(images, reference);
         if (candidate is null)
         {
@@ -1675,7 +1697,27 @@ public sealed class ImageManager
     private async Task VerifyRuntimeDeleteActuallyHappenedAsync(
         RuntimeImage imageBefore, string reference, string? expectedGoneTag, CancellationToken ct)
     {
-        var images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
+        IReadOnlyList<RuntimeImage> images;
+        try
+        {
+            images = await _runtime.ListImagesAsync(ct).ConfigureAwait(false);
+        }
+        catch (RuntimeException ex)
+        {
+            // cider-ede.42 audit: this listing is a *verification* the runtime's own delete already
+            // reported succeeding (cider-eo0) -- a total listing failure here (same class of store-wide
+            // failure a single dangling content entry produces) must not be let through to become a
+            // spurious 500 for a delete that, as far as the runtime told us, already happened. There is
+            // no positive evidence of a no-op-success to report, so this is not "still there": trust the
+            // runtime's original success and skip the check, loudly, rather than manufacture a failure
+            // out of a listing we could not perform.
+            _logger.LogWarning(
+                ex,
+                "could not verify that image delete {Reference} actually happened -- trusting the runtime's reported success",
+                reference);
+            return;
+        }
+
         var current = images.FirstOrDefault(i => string.Equals(i.Id, imageBefore.Id, StringComparison.Ordinal));
 
         var stillThere = expectedGoneTag is null

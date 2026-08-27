@@ -185,9 +185,26 @@ public sealed partial class FakeContainerRuntime
         }
     }
 
+    /// <summary>
+    /// Test hook (cider-ede.42): references in this set make <see cref="InspectImageAsync"/> answer
+    /// <c>null</c> unconditionally, even though the image is genuinely present and <see
+    /// cref="ListImagesAsync"/> still reports it — models a reference the direct-inspect verb cannot
+    /// resolve (an alias form Apple's direct lookup does not accept) so a test can force
+    /// <c>ImageManager.FindImageDetailAsync</c> down its list-scan fallback and prove that path still
+    /// resolves correctly on its own, independent of whatever the direct-inspect branch does. Empty by
+    /// default: every other test keeps the fake's ordinary behavior, where direct inspect resolves
+    /// anything the list-based match would.
+    /// </summary>
+    public ISet<string> DirectInspectMisses { get; } = new HashSet<string>(StringComparer.Ordinal);
+
     public Task<RuntimeImageDetail?> InspectImageAsync(string reference, CancellationToken ct)
     {
         Record($"InspectImageAsync:{reference}");
+        if (DirectInspectMisses.Contains(reference))
+        {
+            return Task.FromResult<RuntimeImageDetail?>(null);
+        }
+
         lock (_sync)
         {
             return Task.FromResult(FindImage(reference));

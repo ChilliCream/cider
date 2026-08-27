@@ -12,6 +12,7 @@ using Cider.Core.Ids;
 using Cider.Core.Runtime;
 using Cider.Core.Services;
 using Cider.Tests.Fakes;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -169,6 +170,71 @@ public sealed class ImageManagerTests : IDisposable
             () => manager.InspectAsync("does-not-exist:latest", CancellationToken.None));
 
         Assert.Equal(System.Net.HttpStatusCode.NotFound, ex.Status);
+    }
+
+    // ---- cider-ede.42: FindImageDetailAsync's ListImagesAsync fallback must not 500 the whole
+    // ---- reference-lookup surface when the runtime's listing hits its documented total-failure
+    // ---- case (a single dangling content entry on this machine's real store) ------------------
+
+    /// <summary>
+    /// The bug itself: a reference a direct inspect cannot resolve falls through to
+    /// <c>FindImageDetailAsync</c>'s <c>ListImagesAsync</c> fallback, which on this machine's real
+    /// store throws for exactly this shape of miss (cider-ede.41's dangling entry). Before the fix
+    /// that <c>RuntimeException</c> propagated straight out of <c>RemoveAsync</c> as an uncaught
+    /// exception (a 500); the guard must turn it into the same "no such image" 404 Docker gives for
+    /// any other absent reference.
+    /// </summary>
+    [Fact]
+    public async Task RemoveAsync_AbsentReference_Returns404_NotPropagatedException_WhenFallbackListingThrows()
+    {
+        var (manager, runtime) = CreateManager();
+        runtime.ListImagesFailure = RuntimeException.Internal("simulated poisoned image store (dangling content entry)");
+
+        var ex = await Assert.ThrowsAsync<DockerApiException>(
+            () => manager.RemoveAsync("totally-absent-reference:latest", force: false, noPrune: false, CancellationToken.None));
+
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, ex.Status);
+    }
+
+    /// <summary>Same guard, exercised through <c>InspectAsync</c> (<c>GET /images/{name}/json</c>)
+    /// instead of <c>rmi</c>, and asserting the Warning this caught failure must log (task's own
+    /// verification point: unlike the load-diff sibling this changes what the caller/user is told,
+    /// so it is Warning, not Debug) fires exactly once.</summary>
+    [Fact]
+    public async Task InspectAsync_AbsentReference_LogsWarningOnce_WhenFallbackListingThrows()
+    {
+        var runtime = new FakeContainerRuntime();
+        var events = new EventBus();
+        var options = new CiderOptions { DataDir = _tmpDir };
+        var logger = new RecordingLogger<ImageManager>();
+        var manager = new ImageManager(runtime, events, options, logger);
+        runtime.ListImagesFailure = RuntimeException.Internal("simulated poisoned image store (dangling content entry)");
+
+        var ex = await Assert.ThrowsAsync<DockerApiException>(
+            () => manager.InspectAsync("totally-absent-reference:latest", CancellationToken.None));
+
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, ex.Status);
+        var warnings = logger.Entries.Where(e => e.Level == LogLevel.Warning).ToList();
+        var warning = Assert.Single(warnings);
+        Assert.Contains("totally-absent-reference:latest", warning.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The guard must not overreach: a reference the direct inspect verb cannot resolve but the
+    /// listing genuinely contains (an "enumerated with skips" listing per cider-ede.24 is a success,
+    /// not the total-failure case this guard catches) must still resolve normally through the
+    /// fallback's list scan — the fix must only swallow a listing that throws, never change what a
+    /// listing that succeeds (fully or partially) resolves to.
+    /// </summary>
+    [Fact]
+    public async Task InspectAsync_StillResolves_ViaFallbackListing_WhenDirectInspectMissesButListingSucceeds()
+    {
+        var (manager, runtime) = CreateManager();
+        runtime.DirectInspectMisses.Add("alpine:latest"); // the raw reference InspectAsync forwards verbatim
+
+        var inspect = await manager.InspectAsync("alpine:latest", CancellationToken.None);
+
+        Assert.Contains("alpine:latest", inspect.RepoTags);
     }
 
     [Fact]
@@ -646,6 +712,47 @@ public sealed class ImageManagerTests : IDisposable
 
         var images = await manager.ListAsync(all: true, Filters.Empty, digests: false, CancellationToken.None);
         Assert.Contains(images, i => i.Id == rawId);
+    }
+
+    /// <summary>
+    /// cider-ede.42 audit finding: <c>VerifyRuntimeDeleteActuallyHappenedAsync</c> (cider-eo0) is the
+    /// same unguarded-<c>ListImagesAsync</c> shape as <c>FindImageDetailAsync</c>'s fallback, just on
+    /// the other side of a delete that already genuinely succeeded — a verification listing that
+    /// throws (this machine's real dangling-entry case) must not turn an already-successful
+    /// <c>rmi</c> into a spurious 500; there is no positive evidence of a no-op-success to report, so
+    /// the runtime's own reported success must stand. Unlike the sibling tests above (which prove a
+    /// genuine no-op is correctly *reported*), this seeds a mismatched raw reference but leaves the
+    /// fake's *ordinary* (non-strict) removal on, so the delete this drives really does happen —
+    /// only the verification step's own listing is made to fail.
+    /// </summary>
+    [Fact]
+    public async Task RemoveAsync_StillReportsSuccess_WhenThePostDeleteVerificationListingThrows()
+    {
+        var (manager, runtime) = CreateManager();
+        var rawId = "sha256:" + new string('7', 64);
+        runtime.SeedImage(new RuntimeImageDetail
+        {
+            Id = rawId,
+            References = ["legacy-raw-ref"], // raw: normalizes to something else, so RequiredNormalization fires
+            Size = 1_000,
+            Created = DateTimeOffset.Parse("2026-01-01T00:00:00Z"),
+            Config = new ImageConfig(),
+            Architecture = "arm64",
+            Os = "linux",
+        });
+        // StrictExactReferenceMatchOnRemove left at its default (off): the runtime's delete genuinely
+        // succeeds via the fake's ordinary lenient match. Only the post-delete verification listing
+        // is poisoned.
+        runtime.ListImagesFailure = RuntimeException.Internal("simulated poisoned image store (dangling content entry)");
+
+        var items = await manager.RemoveAsync("legacy-raw-ref", force: false, noPrune: false, CancellationToken.None);
+
+        // One item announces the tag being untagged (the reference cider itself sent), the other
+        // the image actually being deleted -- both present is proof the delete was reported as the
+        // success it genuinely was, not swallowed into an exception by the poisoned verification
+        // listing.
+        Assert.Contains(items, i => i.Deleted == rawId);
+        Assert.Contains(items, i => i.Untagged == "legacy-raw-ref:latest");
     }
 
     [Theory]
@@ -1854,6 +1961,25 @@ public sealed class ImageManagerTests : IDisposable
     private sealed class SyncProgress<T>(Action<T> onReport) : IProgress<T>
     {
         public void Report(T value) => onReport(value);
+    }
+
+    /// <summary>Captures every log entry made against it, so a test can assert exactly one Warning was
+    /// logged (and what it said) instead of only that the call did not throw (cider-ede.42).</summary>
+    private sealed class RecordingLogger<T> : ILogger<T>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add((logLevel, formatter(state, exception)));
     }
 
     /// <summary>A <see cref="TimeProvider"/> whose clock only moves when <see cref="Advance"/> is
