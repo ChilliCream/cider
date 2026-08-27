@@ -128,19 +128,30 @@ public static partial class PfRedirect
     private static readonly Regex EnableTokenPattern = new(@"Token\s*:\s*(\d+)", RegexOptions.Compiled);
 
     /// <summary>
-    /// Extracts the reference token from <c>pfctl -E</c>'s stdout, or <see langword="null"/> when
+    /// Extracts the reference token from <c>pfctl -E</c>'s output, or <see langword="null"/> when
     /// none is present (empty output, unexpected format). Kept separate from the runner call so it
     /// is unit-testable against real macOS output without shelling out.
+    ///
+    /// Both streams are searched: macOS <c>pfctl</c> writes its human-readable status chatter —
+    /// <c>"No ALTQ support in kernel"</c>, <c>"pf enabled"</c> and the <c>"Token : &lt;n&gt;"</c>
+    /// line itself — to <b>stderr</b>, not stdout, so looking at stdout alone finds no token at all
+    /// and a later disable would never release the reference with <c>pfctl -X</c>. Searching both
+    /// also keeps this correct if a future release moves the line to stdout.
     /// </summary>
-    internal static string? ParseEnableToken(string stdout)
+    internal static string? ParseEnableToken(string? standardOutput, string? standardError = null)
     {
-        if (string.IsNullOrEmpty(stdout))
-        {
-            return null;
-        }
+        return Find(standardOutput) ?? Find(standardError);
 
-        var match = EnableTokenPattern.Match(stdout);
-        return match.Success ? match.Groups[1].Value : null;
+        static string? Find(string? text)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return null;
+            }
+
+            var match = EnableTokenPattern.Match(text);
+            return match.Success ? match.Groups[1].Value : null;
+        }
     }
 
     /// <summary>
@@ -157,7 +168,7 @@ public static partial class PfRedirect
             return null;
         }
 
-        var token = ParseEnableToken(enable.StdOut);
+        var token = ParseEnableToken(enable.StdOut, enable.StdErr);
         if (token is null)
         {
             var noToken = "pfctl -E succeeded but no token could be parsed from its output; " +
@@ -484,6 +495,9 @@ public static partial class PfRedirect
     /// <see cref="PfTokenPath"/> under <paramref name="dataDir"/>, so a later <see cref="TryDisableAsync"/>
     /// — possibly from a different process invocation — can release that exact reference with
     /// <c>pfctl -X &lt;token&gt;</c> (<c>-X</c> requires the token; see <see cref="ParseEnableToken"/>).
+    /// That recording happens whenever <c>-E</c> reported a token, including when a later step of
+    /// this same call failed — <c>-E</c> runs before the <c>pfctl -f</c> reload, so a failed enable
+    /// can still be holding a live reference, and forgetting its token would leak it for good.
     /// </summary>
     public static async Task<InstallResult> TryEnableAsync(
         string subnetCidr,
@@ -493,13 +507,37 @@ public static partial class PfRedirect
         CancellationToken ct,
         string anchorFilePath = AnchorFilePath,
         string anchorName = AnchorName)
+        => await TryEnableAsync(
+            subnetCidr, gatewayIp, log, dataDir, ct, anchorFilePath, anchorName, SudoAsync, PfConfPath)
+            .ConfigureAwait(false);
+
+    /// <summary>
+    /// Test seam for <see cref="TryEnableAsync(string, string, TextWriter, string, CancellationToken, string, string)"/>:
+    /// same behaviour, but with the privileged runner and the pf.conf path injectable so the
+    /// token-persistence rules can be exercised without ever shelling out to <c>sudo</c>/<c>pfctl</c>.
+    /// </summary>
+    internal static async Task<InstallResult> TryEnableAsync(
+        string subnetCidr,
+        string gatewayIp,
+        TextWriter log,
+        string dataDir,
+        CancellationToken ct,
+        string anchorFilePath,
+        string anchorName,
+        PrivilegedCommandRunner runner,
+        string pfConfPath)
     {
         ArgumentException.ThrowIfNullOrEmpty(dataDir);
 
         var (result, enableToken) = await TryEnableCoreAsync(
-            subnetCidr, gatewayIp, log, anchorFilePath, anchorName, SudoAsync, ct, PfConfPath).ConfigureAwait(false);
+            subnetCidr, gatewayIp, log, anchorFilePath, anchorName, runner, ct, pfConfPath).ConfigureAwait(false);
 
-        if (result.Success && enableToken is not null)
+        // Deliberately NOT conditioned on `result.Success`: `pfctl -E` runs before the `pfctl -f`
+        // that can still fail, so a failed enable can perfectly well have taken a live pf enable
+        // reference. Dropping the token there would leak that reference permanently — nothing else
+        // ever learns it, and `pfctl -X` cannot be sent without it. Recording it means the next
+        // `cider host-loopback disable` releases it even though this enable reported failure.
+        if (enableToken is not null)
         {
             try
             {

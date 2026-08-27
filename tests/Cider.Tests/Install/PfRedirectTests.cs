@@ -74,11 +74,13 @@ public class PfRedirectTests : IDisposable
         bool pfReportsEnabled = true,
         bool pfStatusSucceeds = true,
         bool disableRefSucceeds = true,
-        string enableToken = "42") =>
+        string enableToken = "42",
+        bool tokenOnStdErr = true) =>
         (argv, _) =>
         {
             bool succeeded;
             var stdOut = "";
+            string? extraStdErr = null;
             switch (argv[0])
             {
                 case "cp":
@@ -107,9 +109,19 @@ public class PfRedirectTests : IDisposable
                     break;
                 case "pfctl" when argv.Contains("-E"):
                     // Mirrors the line real macOS `pfctl -E` prints: `Token : <n>`, the value a
-                    // later `pfctl -X <token>` needs to release exactly this reference.
+                    // later `pfctl -X <token>` needs to release exactly this reference. macOS
+                    // prints it (with the rest of pfctl's status chatter) on STDERR, which is what
+                    // this fake does by default; `tokenOnStdErr: false` covers the stdout shape.
                     succeeded = true;
-                    stdOut = $"Token : {enableToken}\n";
+                    if (tokenOnStdErr)
+                    {
+                        extraStdErr = $"No ALTQ support in kernel\npf enabled\nToken : {enableToken}\n";
+                    }
+                    else
+                    {
+                        stdOut = $"Token : {enableToken}\n";
+                    }
+
                     break;
                 case "pfctl" when argv.Contains("-X"):
                     succeeded = disableRefSucceeds;
@@ -132,7 +144,7 @@ public class PfRedirectTests : IDisposable
                 "sudo -n " + string.Join(' ', argv),
                 succeeded ? 0 : 1,
                 stdOut,
-                succeeded ? "" : "sudo: a password is required\n",
+                extraStdErr ?? (succeeded ? "" : "sudo: a password is required\n"),
                 succeeded);
             return Task.FromResult(result);
         };
@@ -344,6 +356,31 @@ public class PfRedirectTests : IDisposable
     public void ParseEnableToken_ReturnsNull_WhenNoTokenIsPresent(string stdout)
     {
         Assert.Null(PfRedirect.ParseEnableToken(stdout));
+    }
+
+    [Fact]
+    public void ParseEnableToken_FindsTheToken_WhenPfctlPrintsItOnStdErr()
+    {
+        // This is the real macOS shape: `pfctl -E` writes its status chatter AND the token line to
+        // stderr, leaving stdout empty. Parsing stdout alone finds nothing, so no token is ever
+        // recorded and `pfctl -X <token>` is never sent on disable — the pf enable reference leaks.
+        const string stdErr = "No ALTQ support in kernel\nALTQ related functions disabled\npf enabled\nToken : 13743278968743587\n";
+
+        Assert.Equal("13743278968743587", PfRedirect.ParseEnableToken("", stdErr));
+    }
+
+    [Fact]
+    public void ParseEnableToken_FindsTheToken_WhenPfctlPrintsItOnStdOut()
+    {
+        // The other stream must keep working too: nothing in `man pfctl` promises which one the
+        // token line lands on, so both are searched.
+        Assert.Equal("21", PfRedirect.ParseEnableToken("Token : 21\n", "No ALTQ support in kernel\n"));
+    }
+
+    [Fact]
+    public void ParseEnableToken_ReturnsNull_WhenNeitherStreamCarriesAToken()
+    {
+        Assert.Null(PfRedirect.ParseEnableToken("", "pfctl: pf already enabled\n"));
     }
 
     // ---- TryEnableCoreAsync ----
@@ -616,6 +653,95 @@ public class PfRedirectTests : IDisposable
 
         Assert.NotEmpty(capturedTmpPaths);
         Assert.All(capturedTmpPaths, p => Assert.False(File.Exists(p)));
+    }
+
+    [Fact]
+    public async Task TryEnableCoreAsync_RecordsTheToken_WhenPfctlPrintsItOnStdOutInstead()
+    {
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
+        var (result, enableToken) = await PfRedirect.TryEnableCoreAsync(
+            "192.168.64.0/24",
+            "192.168.64.1",
+            new StringWriter(),
+            AnchorFile,
+            PfRedirect.AnchorName,
+            FakeRunner(tokenOnStdErr: false),
+            CancellationToken.None,
+            PfConfFile);
+
+        Assert.True(result.Success);
+        Assert.Equal("42", enableToken);
+    }
+
+    // ---- TryEnableAsync token persistence ----
+
+    [Fact]
+    public async Task TryEnableAsync_RecordsTheTokenPfctlPrintedOnStdErr()
+    {
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
+        var result = await PfRedirect.TryEnableAsync(
+            "192.168.64.0/24",
+            "192.168.64.1",
+            new StringWriter(),
+            DataDir,
+            CancellationToken.None,
+            AnchorFile,
+            PfRedirect.AnchorName,
+            FakeRunner(),
+            PfConfFile);
+
+        Assert.True(result.Success);
+        Assert.Equal("42", await File.ReadAllTextAsync(PfRedirect.PfTokenPath(DataDir)));
+    }
+
+    [Fact]
+    public async Task TryEnableAsync_StillRecordsTheToken_WhenPfctlEnableSucceededButTheRuleLoadFailed()
+    {
+        // `pfctl -E` runs BEFORE the `pfctl -f` reload, so this failure path is holding a live pf
+        // enable reference. If the token is only persisted on overall success it is lost forever —
+        // nothing else knows it, and `pfctl -X` cannot be sent without it — so the reference leaks
+        // permanently. A later `cider host-loopback disable` must still be able to release it.
+        await File.WriteAllTextAsync(PfConfFile, StockPfConf);
+
+        var result = await PfRedirect.TryEnableAsync(
+            "192.168.64.0/24",
+            "192.168.64.1",
+            new StringWriter(),
+            DataDir,
+            CancellationToken.None,
+            AnchorFile,
+            PfRedirect.AnchorName,
+            FakeRunner(reloadSucceeds: false),
+            PfConfFile);
+
+        Assert.False(result.Success);
+        Assert.True(File.Exists(PfRedirect.PfTokenPath(DataDir)));
+        Assert.Equal("42", await File.ReadAllTextAsync(PfRedirect.PfTokenPath(DataDir)));
+    }
+
+    [Fact]
+    public async Task TryEnableAsync_WritesNoTokenFile_WhenTheEnableReferenceWasNeverTaken()
+    {
+        // pf.conf already registered and pf reports enabled: no `pfctl -E` runs at all, so there is
+        // no reference of this call's to release and nothing to record.
+        var alreadyRegistered = PfRedirect.InsertAnchorLines(StockPfConf, PfRedirect.AnchorName, AnchorFile);
+        await File.WriteAllTextAsync(PfConfFile, alreadyRegistered);
+
+        var result = await PfRedirect.TryEnableAsync(
+            "192.168.64.0/24",
+            "192.168.64.1",
+            new StringWriter(),
+            DataDir,
+            CancellationToken.None,
+            AnchorFile,
+            PfRedirect.AnchorName,
+            FakeRunner(pfReportsEnabled: true),
+            PfConfFile);
+
+        Assert.True(result.Success);
+        Assert.False(File.Exists(PfRedirect.PfTokenPath(DataDir)));
     }
 
     // ---- TryDisableCoreAsync ----
