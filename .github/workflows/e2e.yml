@@ -16,14 +16,51 @@ permissions:
   contents: read
 
 jobs:
+  # cider-5ve: fail fast when the runner cannot virtualize at all, BEFORE the expensive matrix
+  # spins up. GitHub-hosted macos-15 runners are themselves VMs on Apple Silicon with no nested
+  # virtualization, so Apple `container` can never boot a VM there — every bootstrap dies with
+  # VZErrorDomain Code=2 "Virtualization is not available on this hardware" and the matrix
+  # cascades red over ~10 minutes. This probe turns that into one ~30-second red with the real
+  # reason.
+  #
+  # Probe choice: `sysctl -n kern.hv.supported` (the Apple Silicon Hypervisor.framework
+  # capability sysctl; `kern.hv_support` is its legacy alias). Virtualization.framework — which
+  # `container` uses to boot its VMs — is built on Hypervisor.framework, so hv support is a
+  # necessary precondition and this passive read reflects exactly the capability that fails with
+  # VZErrorDomain Code=2. It reads 1 on bare-metal Apple Silicon (verified locally) and 0 inside
+  # GitHub's non-nested runner VMs. Chosen over the ticket's alternative (`container system
+  # start` + a trivial `container run` under a timeout) because it is instant, has no install
+  # step, and cannot itself hang.
+  #
+  # Deliberately FAILS RED rather than skip-green: a suite that cannot run is not a pass
+  # (standing rule). The matrix jobs `needs:` this job, so on failure they are skipped and the
+  # probe's message is the whole story.
+  virt-probe:
+    name: Virtualization probe
+    runs-on: macos-15
+    timeout-minutes: 2
+    steps:
+      - name: Probe nested virtualization availability
+        run: |
+          set -euo pipefail
+          hv="$(sysctl -n kern.hv.supported 2>/dev/null || sysctl -n kern.hv_support 2>/dev/null || echo 0)"
+          echo "kern.hv.supported=${hv}"
+          if [ "${hv}" != "1" ]; then
+            echo "::error::cider-5ve infrastructure: nested virtualization unavailable on this runner (kern.hv.supported=${hv}) — Cider E2E requires bare-metal Apple Silicon; Apple container VMs cannot boot here (VZErrorDomain Code=2). Failing fast instead of letting the matrix cascade red."
+            exit 1
+          fi
+          echo "Hypervisor support present — runner can host Apple container VMs."
+
   e2e:
     name: E2E (${{ matrix.transport }})
+    # Gated on the virtualization probe above (cider-5ve): skipped, not attempted, on runners
+    # that cannot virtualize.
+    needs: virt-probe
     # Apple Silicon, matching release.yml's build-sign-notarize job — the real Apple `container`
-    # engine is arm64-only. Whether GitHub's hosted macos-15 image supports the nested
-    # Virtualization.framework use that `container` needs is NOT verified by this workflow (this repo
-    # had no prior test-running CI job to confirm it against); if the "Start Apple container services"
-    # step below fails or hangs here, the fix is very likely a self-hosted runner with `container`
-    # pre-provisioned, not a change to the steps themselves.
+    # engine is arm64-only. GitHub's hosted macos-15 image does NOT support the nested
+    # Virtualization.framework use that `container` needs (verified red: run 33053386488,
+    # 2026-08-27) — the virt-probe job above reports that explicitly; a green run of this job
+    # requires a runner on bare-metal Apple hardware.
     runs-on: macos-15
     strategy:
       fail-fast: false

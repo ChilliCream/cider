@@ -24,11 +24,38 @@ permissions:
   contents: read
 
 jobs:
+  # cider-5ve: same fail-fast virtualization probe as e2e.yml — GitHub-hosted macos-15 runners
+  # are VMs without nested virtualization, so Apple `container` can never boot a VM there
+  # (VZErrorDomain Code=2). `sysctl -n kern.hv.supported` is the Apple Silicon
+  # Hypervisor.framework capability sysctl (legacy alias kern.hv_support) that
+  # Virtualization.framework depends on: 1 on bare-metal Apple Silicon (verified locally),
+  # 0 inside non-nested runner VMs. Fails RED, never skip-green: a suite that cannot run is
+  # not a pass (standing rule). The expensive job needs: this one, so the probe's message is
+  # the whole story instead of a slow cascade.
+  virt-probe:
+    name: Virtualization probe
+    runs-on: macos-15
+    timeout-minutes: 2
+    steps:
+      - name: Probe nested virtualization availability
+        run: |
+          set -euo pipefail
+          hv="$(sysctl -n kern.hv.supported 2>/dev/null || sysctl -n kern.hv_support 2>/dev/null || echo 0)"
+          echo "kern.hv.supported=${hv}"
+          if [ "${hv}" != "1" ]; then
+            echo "::error::cider-5ve infrastructure: nested virtualization unavailable on this runner (kern.hv.supported=${hv}) — Cider E2E requires bare-metal Apple Silicon; Apple container VMs cannot boot here (VZErrorDomain Code=2). Failing fast instead of letting the matrix cascade red."
+            exit 1
+          fi
+          echo "Hypervisor support present — runner can host Apple container VMs."
+
   e2e-large:
     name: E2E Large Context
+    # Gated on the virtualization probe above (cider-5ve): skipped, not attempted, on runners
+    # that cannot virtualize.
+    needs: virt-probe
     # Apple Silicon — see e2e.yml's identical comment; the real Apple `container` engine is
-    # arm64-only, and whether GitHub's hosted macos-15 runners support the nested
-    # Virtualization.framework use `container` needs is unverified by either workflow.
+    # arm64-only, and GitHub's hosted macos-15 runners do not support the nested
+    # Virtualization.framework use `container` needs (see e2e.yml, cider-5ve).
     runs-on: macos-15
     env:
       CIDER_E2E: "1"
