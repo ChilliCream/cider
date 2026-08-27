@@ -49,8 +49,10 @@ public sealed class PublishedPortHandle : IDisposable
     internal IPortForwarder? Forwarder => _resource as IPortForwarder;
 
     /// <summary>
-    /// Supplies the container's address once it is known: retargets the forwarder and replaces
-    /// <see cref="Port"/> with a copy carrying it. Callers hold the owning manager's lock.
+    /// Supplies the container's address: retargets the forwarder and replaces <see cref="Port"/>
+    /// with a copy carrying it. Re-callable when the address changes (cider-bum) — a restarted
+    /// container comes back on a new VM address, and the publication must follow it. Callers hold
+    /// the owning manager's lock.
     /// </summary>
     internal void Resolve(IPAddress containerIp)
     {
@@ -97,15 +99,18 @@ public interface IPortPublisher : IDisposable
     bool IsPublished(string containerId, string proto, IPAddress hostIp, int hostPort);
 
     /// <summary>
-    /// <c>true</c> when at least one live publication of this container was bound with
-    /// <paramref name="containerId"/>'s address still unknown and has not been resolved since.
+    /// <c>true</c> when at least one live publication of this container is not currently targeting
+    /// <paramref name="containerIp"/>: it was bound with the address still unknown, or (TCP only,
+    /// cider-bum) it targets a different — stale — address and can be retargeted. A UDP relay
+    /// cannot be retargeted in place, so one holding a different address does not count.
     /// </summary>
-    bool NeedsAddress(string containerId);
+    bool NeedsAddress(string containerId, IPAddress containerIp);
 
     /// <summary>
-    /// Supplies the container's address to every publication of it that was bound without one, and
-    /// unblocks whatever connections were waiting on it. A no-op for a container with no publications,
-    /// or none still pending.
+    /// Supplies the container's address to every publication of it that is not targeting it yet —
+    /// the ones bound without one (unblocking whatever connections were waiting on it) and, for TCP
+    /// (cider-bum), the ones still targeting a previous boot's address. A no-op for a container with
+    /// no publications, or none needing the address.
     /// </summary>
     void ResolveAddress(string containerId, IPAddress containerIp);
 
@@ -145,7 +150,7 @@ public sealed class NullPortPublisher : IPortPublisher
     public bool IsPublished(string containerId, string proto, IPAddress hostIp, int hostPort) => false;
 
     /// <inheritdoc />
-    public bool NeedsAddress(string containerId) => false;
+    public bool NeedsAddress(string containerId, IPAddress containerIp) => false;
 
     /// <inheritdoc />
     public void ResolveAddress(string containerId, IPAddress containerIp)
@@ -214,7 +219,7 @@ public sealed class PortProxyManager : IPortPublisher
         {
             forwarder = isUdp
                 ? new UdpPortForwarder(host, new IPEndPoint(containerIp!, containerPort), _logger)
-                : new TcpPortForwarder(host, containerIp, containerPort, _logger);
+                : new TcpPortForwarder(host, containerId, containerIp, containerPort, _logger);
         }
         catch (SocketException ex)
         {
@@ -300,8 +305,9 @@ public sealed class PortProxyManager : IPortPublisher
     }
 
     /// <inheritdoc />
-    public bool NeedsAddress(string containerId)
+    public bool NeedsAddress(string containerId, IPAddress containerIp)
     {
+        ArgumentNullException.ThrowIfNull(containerIp);
         if (string.IsNullOrEmpty(containerId) || !_byContainer.TryGetValue(containerId, out var handles))
         {
             return false;
@@ -309,7 +315,7 @@ public sealed class PortProxyManager : IPortPublisher
 
         lock (handles)
         {
-            return handles.Exists(handle => handle.Port.ContainerIp is null);
+            return handles.Exists(handle => NeedsAddress(handle, containerIp));
         }
     }
 
@@ -326,16 +332,40 @@ public sealed class PortProxyManager : IPortPublisher
         {
             foreach (var handle in handles)
             {
-                if (handle.Port.ContainerIp is not null)
+                if (!NeedsAddress(handle, containerIp))
                 {
                     continue;
                 }
 
+                var stale = handle.Port.ContainerIp;
                 handle.Resolve(containerIp);
-                _logger.LogDebug("resolved {Publication} for container {Container}", handle.Port, containerId);
+                if (stale is null)
+                {
+                    _logger.LogDebug("resolved {Publication} for container {Container}", handle.Port, containerId);
+                }
+                else
+                {
+                    // Info, not debug: this is the corrective path for cider-bum — the record carried
+                    // a previous boot's address and the forwarder was dialing a dead target.
+                    _logger.LogInformation(
+                        "retargeted {Publication} for container {Container} (was {StaleIp})",
+                        handle.Port,
+                        containerId,
+                        stale);
+                }
             }
         }
     }
+
+    /// <summary>
+    /// Whether one publication still needs <paramref name="containerIp"/>: pending (bound without an
+    /// address), or a TCP publication targeting a different, stale one. A UDP relay holding an
+    /// address cannot be retargeted in place, so it never counts (cider-bum leaves UDP alone).
+    /// </summary>
+    private static bool NeedsAddress(PublishedPortHandle handle, IPAddress containerIp) =>
+        handle.Port.ContainerIp is null ||
+        (!handle.Port.ContainerIp.Equals(containerIp) &&
+            !string.Equals(handle.Port.Proto, "udp", StringComparison.OrdinalIgnoreCase));
 
     /// <inheritdoc />
     public IReadOnlyList<PublishedPort> Snapshot()

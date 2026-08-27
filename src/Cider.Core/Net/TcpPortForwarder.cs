@@ -12,10 +12,12 @@ internal interface IPortForwarder : IDisposable
     IPEndPoint HostEndPoint { get; }
 
     /// <summary>
-    /// Supplies the backend address to a forwarder that was bound without one yet, unblocking whatever
-    /// connections are already waiting on it (cider-ede.18). A no-op on a forwarder that already has a
-    /// target — which is every <see cref="UdpPortForwarder"/>: it has no accept-and-hold mode and is
-    /// never constructed without one to begin with.
+    /// Supplies the backend address: on a forwarder bound without one yet it unblocks whatever
+    /// connections are already waiting (cider-ede.18); on a <see cref="TcpPortForwarder"/> that
+    /// already has one it retargets every connection accepted from now on (cider-bum: a container
+    /// restarted onto a new VM address must not keep being dialed at the previous boot's address).
+    /// A no-op only on <see cref="UdpPortForwarder"/>, which has no accept-and-hold mode, cannot be
+    /// retargeted in place, and is never constructed without a target to begin with.
     /// </summary>
     void ResolveTarget(IPAddress containerIp);
 }
@@ -51,6 +53,7 @@ internal sealed class TcpPortForwarder : IPortForwarder
     internal static readonly TimeSpan TargetWaitTimeout = TimeSpan.FromSeconds(30);
 
     private readonly Socket _listener;
+    private readonly string _containerId;
     private readonly int _containerPort;
     private readonly ILogger _logger;
     private readonly TimeSpan _targetWaitTimeout;
@@ -66,17 +69,19 @@ internal sealed class TcpPortForwarder : IPortForwarder
     /// when the container's address is not known yet.
     /// </summary>
     /// <exception cref="SocketException">The host endpoint could not be bound.</exception>
-    public TcpPortForwarder(IPEndPoint host, IPAddress? containerIp, int containerPort, ILogger logger)
-        : this(host, containerIp, containerPort, logger, TargetWaitTimeout)
+    public TcpPortForwarder(IPEndPoint host, string containerId, IPAddress? containerIp, int containerPort, ILogger logger)
+        : this(host, containerId, containerIp, containerPort, logger, TargetWaitTimeout)
     {
     }
 
     /// <summary>As the public constructor, but with an injectable wait timeout for tests.</summary>
     internal TcpPortForwarder(
-        IPEndPoint host, IPAddress? containerIp, int containerPort, ILogger logger, TimeSpan targetWaitTimeout)
+        IPEndPoint host, string containerId, IPAddress? containerIp, int containerPort, ILogger logger,
+        TimeSpan targetWaitTimeout)
     {
         ArgumentNullException.ThrowIfNull(host);
 
+        _containerId = containerId ?? "";
         _containerPort = containerPort;
         _logger = logger;
         _targetWaitTimeout = targetWaitTimeout;
@@ -100,6 +105,13 @@ internal sealed class TcpPortForwarder : IPortForwarder
         SetTarget(containerIp);
     }
 
+    /// <summary>
+    /// Records the (possibly new) backend address and wakes any held connections. Re-callable on
+    /// purpose (cider-bum): connections accepted from now on dial the latest address, so a forwarder
+    /// published with a stale address (a restarted container whose record still carried the previous
+    /// boot's IP) is corrected in place the moment the real one is learned. Connections already
+    /// relaying to the old address are left alone, exactly as dockerd leaves established flows.
+    /// </summary>
     private void SetTarget(IPAddress containerIp)
     {
         _containerIp = containerIp;
@@ -192,9 +204,15 @@ internal sealed class TcpPortForwarder : IPortForwarder
             var containerIp = await AwaitTargetAsync(deadline, ct);
             if (containerIp is null)
             {
-                _logger.LogDebug(
-                    "closing a connection on published port {Endpoint}: no backend address within {Timeout}",
+                // Warn, not debug (cider-bum): this drop is the daemon failing to deliver a
+                // published port, and a silent close leaves the operator staring at a client-side
+                // reset with no daemon-side trace at all (absence-as-evidence).
+                _logger.LogWarning(
+                    "dropping a connection to published port {Endpoint} of container {Container}: no backend "
+                    + "address for container port {ContainerPort} within {Timeout}",
                     HostEndPoint,
+                    _containerId,
+                    _containerPort,
                     _targetWaitTimeout);
                 return;
             }
@@ -203,10 +221,11 @@ internal sealed class TcpPortForwarder : IPortForwarder
             upstream = await DialAsync(target, wasHeld, deadline, ct);
             if (upstream is null)
             {
-                _logger.LogDebug(
-                    "closing a connection on published port {Endpoint}: backend at {Target} never accepted "
-                    + "within {Timeout}",
+                _logger.LogWarning(
+                    "dropping a held connection to published port {Endpoint} of container {Container}: backend "
+                    + "at {Target} never accepted within {Timeout}",
                     HostEndPoint,
+                    _containerId,
                     target,
                     _targetWaitTimeout);
                 return;
@@ -252,7 +271,12 @@ internal sealed class TcpPortForwarder : IPortForwarder
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
         try
         {
-            return await _targetTcs.Task.WaitAsync(linked.Token);
+            await _targetTcs.Task.WaitAsync(linked.Token);
+
+            // Not the TCS's own value: a retarget (SetTarget called again) updates _containerIp but
+            // cannot change an already-completed TaskCompletionSource, and a held connection should
+            // dial the latest known address.
+            return _containerIp;
         }
         catch (OperationCanceledException)
         {

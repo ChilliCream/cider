@@ -271,6 +271,10 @@ public sealed partial class ContainerManager
             record.State.Error = error;
         }
 
+        // The VM address died with this run (cider-bum): clearing it here — the shared transition —
+        // is what lets the next start re-derive the target instead of publishing against it.
+        ClearNetworkAddresses(record);
+
         Persist(record);
         CompleteExitWait(record.Id, record.State.ExitCode);
     }
@@ -814,6 +818,10 @@ public sealed partial class ContainerManager
             {
                 health.Status = "unhealthy";
             }
+
+            // Same reason as MarkExited's call (the other half of the running->exited transition):
+            // the address belonged to the run that just ended (cider-bum).
+            ClearNetworkAddresses(record);
 
             Persist(record);
         }

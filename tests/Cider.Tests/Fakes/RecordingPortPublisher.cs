@@ -82,7 +82,7 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
     }
 
     /// <inheritdoc />
-    public bool NeedsAddress(string containerId)
+    public bool NeedsAddress(string containerId, IPAddress containerIp)
     {
         if (!_byContainer.TryGetValue(containerId, out var live))
         {
@@ -91,7 +91,7 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
 
         lock (live)
         {
-            return live.Exists(handle => handle.Port.ContainerIp is null);
+            return live.Exists(handle => NeedsAddress(handle, containerIp));
         }
     }
 
@@ -108,7 +108,7 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
             for (var i = 0; i < live.Count; i++)
             {
                 var handle = live[i];
-                if (handle.Port.ContainerIp is not null)
+                if (!NeedsAddress(handle, containerIp))
                 {
                     continue;
                 }
@@ -117,6 +117,12 @@ public sealed class RecordingPortPublisher(bool enabled = true) : IPortPublisher
             }
         }
     }
+
+    /// <summary>Mirrors <c>PortProxyManager</c>: pending, or a TCP publication on a stale address.</summary>
+    private static bool NeedsAddress(PublishedPortHandle handle, IPAddress containerIp) =>
+        handle.Port.ContainerIp is null ||
+        (!handle.Port.ContainerIp.Equals(containerIp) &&
+            !string.Equals(handle.Port.Proto, "udp", StringComparison.OrdinalIgnoreCase));
 
     /// <inheritdoc />
     public IReadOnlyList<PublishedPort> Snapshot()

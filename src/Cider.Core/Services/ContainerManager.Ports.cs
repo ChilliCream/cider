@@ -36,8 +36,9 @@ public sealed partial class ContainerManager
         var haveAddress = TryGetContainerAddress(record, out var containerIp);
 
         // The steady-state case on every tick once a container has settled: everything this record
-        // declares is already bound, and — if the address is known — every listener already has it.
-        if (_publisher.IsPublished(record.Id) && (!haveAddress || !_publisher.NeedsAddress(record.Id)))
+        // declares is already bound, and — if the address is known — every listener already targets
+        // it (NeedsAddress also flags a listener stuck on a different, stale address: cider-bum).
+        if (_publisher.IsPublished(record.Id) && (!haveAddress || !_publisher.NeedsAddress(record.Id, containerIp)))
         {
             return;
         }
@@ -51,7 +52,7 @@ public sealed partial class ContainerManager
                 return;
             }
 
-            if (haveAddress && _publisher.NeedsAddress(record.Id))
+            if (haveAddress && _publisher.NeedsAddress(record.Id, containerIp))
             {
                 _publisher.ResolveAddress(record.Id, containerIp);
             }
@@ -114,6 +115,31 @@ public sealed partial class ContainerManager
         if (ProxyPublishing)
         {
             _publisher.Unpublish(containerId);
+        }
+    }
+
+    /// <summary>
+    /// Drops the runtime-assigned addresses from every network endpoint of a record leaving the
+    /// running state (cider-bum). The VM address belongs to one boot: keeping it across a stop made
+    /// the next start publish forwarders against the previous boot's address — an address
+    /// <see cref="EnsurePublishedPortsAsync"/> then considered settled, while the container came up
+    /// somewhere else. With the record cleared, the restart binds pending listeners and re-derives
+    /// the target from the same inspect-backed source of truth <c>ApplyNetworkInfo</c> fills (and
+    /// <c>docker inspect</c> reads), retried by the state poller until the container stops. Also what
+    /// real dockerd reports: a stopped container's <c>NetworkSettings</c> carries no addresses.
+    /// The network memberships themselves (keys, aliases, network ids) are kept.
+    /// </summary>
+    private static void ClearNetworkAddresses(ContainerRecord record)
+    {
+        foreach (var endpoint in record.Networks.Values)
+        {
+            endpoint.IPAddress = "";
+            endpoint.Gateway = "";
+            endpoint.IPPrefixLen = 0;
+            endpoint.GlobalIPv6Address = "";
+            endpoint.IPv6Gateway = "";
+            endpoint.GlobalIPv6PrefixLen = 0;
+            endpoint.MacAddress = null;
         }
     }
 

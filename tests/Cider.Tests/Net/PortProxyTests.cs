@@ -1,7 +1,9 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using Cider.Core.Net;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -187,6 +189,7 @@ public sealed class PortProxyTests
     {
         using var forwarder = new TcpPortForwarder(
             new IPEndPoint(IPAddress.Loopback, 0),
+            ContainerId,
             null,
             9,
             NullLogger<PortProxyManager>.Instance,
@@ -213,6 +216,7 @@ public sealed class PortProxyTests
 
         using var forwarder = new TcpPortForwarder(
             new IPEndPoint(IPAddress.Loopback, 0),
+            ContainerId,
             null,
             backendPort,
             NullLogger<PortProxyManager>.Instance,
@@ -236,6 +240,109 @@ public sealed class PortProxyTests
 
         await stream.WriteAsync(Encoding.UTF8.GetBytes("pong\n"));
         Assert.Equal("PONG\n", await ReadAsync(stream, 5));
+    }
+
+    /// <summary>
+    /// cider-bum, resolve-then-flow: a publication bound pending and resolved before any client
+    /// shows up relays like one that was published with the address up front.
+    /// </summary>
+    [Fact]
+    public async Task A_publication_resolved_before_the_first_connection_relays_normally()
+    {
+        await using var server = EchoServer.Start();
+        using var proxy = new PortProxyManager(NullLogger<PortProxyManager>.Instance);
+
+        var handle = await proxy.PublishAsync(
+            ContainerId, "tcp", IPAddress.Loopback, 0, null, server.Port, CancellationToken.None);
+        Assert.Null(handle.Port.ContainerIp);
+
+        proxy.ResolveAddress(ContainerId, IPAddress.Loopback);
+        Assert.Equal(IPAddress.Loopback, handle.Port.ContainerIp);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, handle.Port.HostPort);
+        var stream = client.GetStream();
+
+        await stream.WriteAsync(Encoding.UTF8.GetBytes("ping\n"));
+        Assert.Equal("PING\n", await ReadAsync(stream, 5));
+    }
+
+    /// <summary>
+    /// cider-bum, resolve-never: a held connection dropped because the backend address never arrived
+    /// must leave a warning naming the container and the container port — the live failure was
+    /// diagnosed against a daemon.log with zero forwarder lines — and the client must observe the
+    /// drop rather than an open-forever socket.
+    /// </summary>
+    [Fact]
+    public async Task A_held_connection_dropped_on_target_wait_timeout_warns_with_container_and_port()
+    {
+        var logger = new RecordingLogger();
+        using var forwarder = new TcpPortForwarder(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            ContainerId,
+            null,
+            5432,
+            logger,
+            TimeSpan.FromMilliseconds(300));
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, forwarder.HostEndPoint.Port);
+        var stream = client.GetStream();
+
+        // Bytes sent while held go nowhere; once the wait times out the connection is dropped and
+        // the client sees the reset — either straight at the read (the unread bytes make the close
+        // an RST, exactly what the live postgres probe observed) or, after a bare FIN, on writing.
+        await stream.WriteAsync(Encoding.UTF8.GetBytes("SSLRequest"));
+        var reset = await Assert.ThrowsAsync<IOException>(async () =>
+        {
+            var probe = new byte[16];
+            if (await stream.ReadAsync(probe).AsTask().WaitAsync(TimeSpan.FromSeconds(5)) > 0)
+            {
+                Assert.Fail("the held connection relayed data although no target was ever resolved");
+            }
+
+            for (var i = 0; i < 50; i++)
+            {
+                await stream.WriteAsync(Encoding.UTF8.GetBytes("more"));
+                await Task.Delay(20);
+            }
+        });
+        Assert.IsType<SocketException>(reset.InnerException);
+
+        var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning);
+        Assert.Contains(ContainerId, warning.Message, StringComparison.Ordinal);
+        Assert.Contains("5432", warning.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// cider-bum, the root cause itself: a publication carrying a stale address (the record kept the
+    /// previous boot's IP across a restart) must be retargeted when the address is resolved again,
+    /// not skipped as "already resolved" — that skip is what left the live forwarder dialing a dead
+    /// target while <c>docker inspect</c> showed the right one.
+    /// </summary>
+    [Fact]
+    public async Task A_publication_with_a_stale_address_is_retargeted_when_the_address_is_resolved_again()
+    {
+        await using var server = EchoServer.Start();
+        using var proxy = new PortProxyManager(NullLogger<PortProxyManager>.Instance);
+
+        // 127.0.0.2 answers with connection-refused on macOS loopback: a live but wrong backend.
+        var stale = IPAddress.Parse("127.0.0.2");
+        var handle = await proxy.PublishAsync(
+            ContainerId, "tcp", IPAddress.Loopback, 0, stale, server.Port, CancellationToken.None);
+
+        Assert.True(proxy.NeedsAddress(ContainerId, IPAddress.Loopback));
+
+        proxy.ResolveAddress(ContainerId, IPAddress.Loopback);
+        Assert.Equal(IPAddress.Loopback, handle.Port.ContainerIp);
+        Assert.False(proxy.NeedsAddress(ContainerId, IPAddress.Loopback));
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, handle.Port.HostPort);
+        var stream = client.GetStream();
+
+        await stream.WriteAsync(Encoding.UTF8.GetBytes("ping\n"));
+        Assert.Equal("PING\n", await ReadAsync(stream, 5));
     }
 
     [Fact]
@@ -312,6 +419,24 @@ public sealed class PortProxyTests
         using var memory = new MemoryStream();
         await stream.CopyToAsync(memory).WaitAsync(TimeSpan.FromSeconds(10));
         return Encoding.UTF8.GetString(memory.ToArray());
+    }
+
+    /// <summary>Captures log entries so the tests can assert on level and rendered message.</summary>
+    private sealed class RecordingLogger : ILogger
+    {
+        private readonly ConcurrentQueue<(LogLevel Level, string Message)> _entries = new();
+
+        public IReadOnlyList<(LogLevel Level, string Message)> Entries => [.. _entries];
+
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            _entries.Enqueue((logLevel, formatter(state, exception)));
     }
 
     /// <summary>Stands in for the container: upper-cases whatever it is sent, on loopback.</summary>

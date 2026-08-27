@@ -84,6 +84,56 @@ public sealed class PortTests(DaemonFixture daemon)
     }
 
     /// <summary>
+    /// cider-bum (the broken live Aspire session): a port published for a container on a
+    /// user-created network must actually carry traffic — the forwarder's target has to be resolved
+    /// from the same inspect-backed source of truth, on a non-default network too — and must keep
+    /// carrying it across a stop/start, where the container comes back on a fresh VM address and a
+    /// forwarder stuck on the previous boot's address would accept and then reset every connection.
+    /// </summary>
+    [E2EFact]
+    public async Task A_published_port_on_a_user_defined_network_carries_traffic_including_across_a_restart()
+    {
+        if (DaemonFixture.AppleModePorts)
+        {
+            return;
+        }
+
+        var network = DaemonFixture.NewName("bumnet");
+        var name = DaemonFixture.NewName("bum");
+        var hostPort = FreeHostPort();
+
+        var createNetwork = await daemon.DockerAsync(["network", "create", network], timeout: TimeSpan.FromMinutes(2));
+        Assert.True(createNetwork.Ok, createNetwork.ToString());
+
+        try
+        {
+            var run = await daemon.DockerAsync(
+                [
+                    "run", "-d", "--name", name, "--network", network,
+                    "-p", $"{hostPort.ToString(CultureInfo.InvariantCulture)}:8080",
+                    Image, "sh", "-c", Server,
+                ],
+                timeout: TimeSpan.FromMinutes(4));
+            Assert.True(run.Ok, run.ToString());
+
+            Assert.Equal("hi", await HttpGetAsync("127.0.0.1", hostPort, TimeSpan.FromSeconds(90)));
+
+            var stop = await daemon.DockerAsync(["stop", name], timeout: TimeSpan.FromMinutes(2));
+            Assert.True(stop.Ok, stop.ToString());
+
+            var start = await daemon.DockerAsync(["start", name], timeout: TimeSpan.FromMinutes(4));
+            Assert.True(start.Ok, start.ToString());
+
+            Assert.Equal("hi", await HttpGetAsync("127.0.0.1", hostPort, TimeSpan.FromSeconds(90)));
+        }
+        finally
+        {
+            await daemon.DockerAsync(["rm", "-f", name], timeout: TimeSpan.FromMinutes(2));
+            await daemon.DockerAsync(["network", "rm", network], timeout: TimeSpan.FromMinutes(2));
+        }
+    }
+
+    /// <summary>
     /// cider-ede.18's own named verification: a published TCP port must accept connections the moment
     /// it is bound at <c>start</c>, before the container's VM address is known, and succeed on a single
     /// attempt fired immediately after <c>docker run -d</c> returns — not merely "never refused", but

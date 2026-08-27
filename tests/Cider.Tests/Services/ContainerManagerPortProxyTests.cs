@@ -166,6 +166,49 @@ public sealed class ContainerManagerPortProxyTests
         await harness.Containers.KillAsync(record.Id, "SIGKILL", default);
     }
 
+    /// <summary>
+    /// cider-bum: the VM address belongs to one boot. Stopping must clear the record's addresses
+    /// (what <c>docker inspect</c> reads — the same source the publisher resolves from), and a
+    /// restart that comes up on a different address must end with every listener targeting the new
+    /// one instead of silently forwarding to the previous boot's.
+    /// </summary>
+    [Fact]
+    public async Task A_restart_onto_a_new_address_retargets_the_published_ports()
+    {
+        await using var harness = await ContainerTestHarness.CreateAsync();
+
+        var record = await harness.RunShellAsync("sleep 30", "web", request =>
+            request.HostConfig = new HostConfig
+            {
+                PortBindings = { ["8080/tcp"] = [new PortBinding()] },
+            });
+
+        var published = await WaitUntil(
+            () => harness.Publisher.LiveFor(record.Id),
+            ports => ports.Count > 0 && ports.All(port => port.ContainerIp is not null));
+        var firstAddress = published[0].ContainerIp!;
+
+        await harness.Containers.StopAsync(record.Id, timeoutSeconds: 1, signal: null, default);
+
+        // The exit transition drops the runtime-assigned addresses: a stopped container has none,
+        // and keeping one is what used to freeze the next publish onto a dead target.
+        Assert.All(record.Networks.Values, endpoint => Assert.True(string.IsNullOrEmpty(endpoint.IPAddress)));
+
+        // The container comes back on a different VM address, as a real restart can.
+        var newAddress = "192.168.64.99";
+        Assert.NotEqual(firstAddress.ToString(), newAddress);
+        harness.Runtime.GetContainer("web")!.Address = newAddress;
+
+        await harness.Containers.StartAsync(record.Id, default);
+
+        var republished = await WaitUntil(
+            () => harness.Publisher.LiveFor(record.Id),
+            ports => ports.Count > 0 && ports.All(port => port.ContainerIp is not null));
+        Assert.All(republished, port => Assert.Equal(IPAddress.Parse(newAddress), port.ContainerIp));
+
+        await harness.Containers.KillAsync(record.Id, "SIGKILL", default);
+    }
+
     [Fact]
     public async Task Reconciling_at_startup_republishes_a_container_that_is_still_running()
     {
