@@ -567,4 +567,49 @@ public class LaunchdInstallerTests
         Assert.Equal(20, commands.Count(c => c.Contains(" print ", StringComparison.Ordinal)));
         Assert.Contains(steps, s => s.Contains("attempting bootstrap anyway", StringComparison.Ordinal));
     }
+
+    [Theory]
+    [InlineData("/opt/homebrew/Cellar/cider/0.2.0/bin/cider", "/opt/homebrew/opt/cider/bin/cider")]
+    [InlineData("/usr/local/Cellar/cider/0.3.0-rc.1/bin/cider", "/usr/local/opt/cider/bin/cider")]
+    [InlineData("/home/linuxbrew/.linuxbrew/Cellar/cider/1.0.0/bin/cider", "/home/linuxbrew/.linuxbrew/opt/cider/bin/cider")]
+    public void StabilizeHomebrewExecutablePath_MapsVersionedCellarPath_ToStableOptSymlink(string cellarPath, string expectedOptPath)
+    {
+        string? probed = null;
+        var result = LaunchdInstaller.StabilizeHomebrewExecutablePathCore(cellarPath, p =>
+        {
+            probed = p;
+            return true;
+        });
+
+        Assert.Equal(expectedOptPath, result);
+        Assert.Equal(expectedOptPath, probed);
+    }
+
+    [Theory]
+    [InlineData("/Users/dev/local/cider/src/Cider.Daemon/bin/Debug/net10.0/cider")] // dev build
+    [InlineData("/usr/local/bin/cider")] // .pkg install
+    [InlineData("/opt/homebrew/opt/cider/bin/cider")] // already the stable opt path
+    [InlineData("/opt/homebrew/Cellar/cider/0.2.0/libexec/cider")] // not under bin/
+    [InlineData("/opt/homebrew/Cellar/cider/bin/cider")] // no version segment (bin where <version> goes)
+    [InlineData("/data/Cellar-archive/cider/0.2.0/bin/cider")] // "Cellar" only as a substring
+    [InlineData("Cellar/cider/0.2.0/bin/cider")] // relative path
+    [InlineData("")]
+    public void StabilizeHomebrewExecutablePath_LeavesNonCellarPathsUntouched_WithoutTouchingTheFilesystem(string path)
+    {
+        var result = LaunchdInstaller.StabilizeHomebrewExecutablePathCore(
+            path,
+            _ => throw new InvalidOperationException("non-Cellar paths must not probe the filesystem"));
+
+        Assert.Equal(path, result);
+    }
+
+    [Fact]
+    public void StabilizeHomebrewExecutablePath_FallsBackToTheCellarPath_WhenTheOptSymlinkIsMissing()
+    {
+        const string cellarPath = "/opt/homebrew/Cellar/cider/0.2.0/bin/cider";
+
+        var result = LaunchdInstaller.StabilizeHomebrewExecutablePathCore(cellarPath, _ => false);
+
+        Assert.Equal(cellarPath, result);
+    }
 }

@@ -101,6 +101,49 @@ public static class LaunchdInstaller
     }
 
     /// <summary>
+    /// Maps a Homebrew Cellar executable path to the stable <c>opt</c> symlink brew maintains
+    /// across upgrades: <c>&lt;prefix&gt;/Cellar/&lt;name&gt;/&lt;version&gt;/bin/&lt;exe&gt;</c> becomes
+    /// <c>&lt;prefix&gt;/opt/&lt;name&gt;/bin/&lt;exe&gt;</c>. The versioned Cellar directory is deleted by
+    /// <c>brew cleanup</c> on upgrade, so a plist pointing at it leaves KeepAlive respawning a
+    /// deleted binary if the post-upgrade `cider install` never succeeds. Any path that does not
+    /// match the Cellar shape (dev builds, .pkg installs) — or whose opt symlink does not exist —
+    /// is returned unchanged.
+    /// </summary>
+    public static string StabilizeHomebrewExecutablePath(string executablePath) =>
+        StabilizeHomebrewExecutablePathCore(executablePath, File.Exists);
+
+    /// <summary>
+    /// <see cref="StabilizeHomebrewExecutablePath"/> with the single allowed filesystem probe
+    /// (does the opt path exist?) injectable so tests run against no real Homebrew prefix.
+    /// </summary>
+    internal static string StabilizeHomebrewExecutablePathCore(string executablePath, Func<string, bool> fileExists)
+    {
+        // Pure string mapping over an absolute path shaped <prefix>/Cellar/<name>/<version>/bin/<exe>.
+        if (executablePath.Length == 0 || executablePath[0] != '/')
+        {
+            return executablePath;
+        }
+
+        var segments = executablePath.Split('/');
+        var n = segments.Length;
+
+        // Need at least "" + <prefix...> + Cellar/<name>/<version>/bin/<exe> — Cellar sits at n-5.
+        if (n < 7
+            || segments[n - 5] != "Cellar"
+            || segments[n - 2] != "bin"
+            || segments[n - 4].Length == 0
+            || segments[n - 3].Length == 0
+            || segments[n - 1].Length == 0)
+        {
+            return executablePath;
+        }
+
+        var prefix = string.Join('/', segments[..(n - 5)]);
+        var optPath = $"{prefix}/opt/{segments[n - 4]}/bin/{segments[n - 1]}";
+        return fileExists(optPath) ? optPath : executablePath;
+    }
+
+    /// <summary>
     /// Writes the plist, (re)loads it under launchd, and waits up to 10s for the daemon's
     /// socket to appear. Optionally wires up a docker context and/or the system socket symlink.
     /// </summary>

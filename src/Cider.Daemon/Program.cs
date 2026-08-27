@@ -161,8 +161,11 @@ public static class Program
             ["--system-socket", "--force-system-socket", "--no-context", "--host-loopback"]);
         var options = CiderOptions.Load(parsed.Value("--data-dir"), parsed.Value("--socket"), parsed.Value("--log-level"));
 
-        var executable = Environment.ProcessPath
-            ?? throw new InvalidOperationException("cannot determine the path of the running executable");
+        // Environment.ProcessPath resolves the brew symlink to the versioned Cellar dir, which
+        // brew cleanup deletes on upgrade; write the stable <prefix>/opt/<name> path instead.
+        var executable = LaunchdInstaller.StabilizeHomebrewExecutablePath(
+            Environment.ProcessPath
+            ?? throw new InvalidOperationException("cannot determine the path of the running executable"));
 
         var installOptions = new InstallOptions(
             executable,
