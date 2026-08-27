@@ -55,11 +55,20 @@ public sealed class TokenBucketPacerTests
         using var scope = tracker.BeginCall();
 
         var before = tracker.LastProgress;
-        await Task.Delay(TimeSpan.FromMilliseconds(50));
+        // 500ms pre-delay (vs. a 200ms staleness bound) gives ~20x margin over the queued-dispatch
+        // gap between RecordProgress and this read (the await above resumes via
+        // Xunit.Sdk.AsyncTestSyncContext.Post, not inline, because AcquireAsync's internal
+        // Task.Delay uses ConfigureAwait(false) while this await does not; observed gap is
+        // single-digit ms, ~10ms worst case under heavy load). A pacer that never calls
+        // RecordProgress would report ~500ms stale here and fail hard.
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
         await pacer.AcquireAsync(4096, CancellationToken.None);
+        var sinceProgress = Stopwatch.GetElapsedTime(tracker.LastProgress);
 
         Assert.True(tracker.LastProgress > before);
-        Assert.False(tracker.IsStalled(TimeSpan.FromMilliseconds(10)));
+        Assert.False(
+            tracker.IsStalled(TimeSpan.FromMilliseconds(200)),
+            $"expected RecordProgress to have run within the last 200ms, measured {sinceProgress}");
     }
 
     [Fact]
