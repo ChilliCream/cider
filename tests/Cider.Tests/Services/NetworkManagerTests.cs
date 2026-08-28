@@ -461,6 +461,60 @@ public sealed class NetworkManagerTests
     }
 
     [Fact]
+    public async Task InspectAsync_ContainerEndpointAddresses_AreCidrOrEmptyNeverBare()
+    {
+        // Aspire's DCP verifies a container's network attachment by shelling out to
+        // `docker network inspect --format {{json .}}`; docker CLI >= 28 feeds
+        // Containers[].IPv4Address/IPv6Address to netip.ParsePrefix, which errors on a bare
+        // address and fails the whole inspect ("only 0 out of 1 networks"). An inspect that can
+        // never succeed means DCP can never observe the attachment and retries
+        // `docker network connect` on the running container every ~8s forever (cider-eqa.1).
+        await using var harness = await ContainerTestHarness.CreateAsync();
+        await harness.Networks.CreateAsync(
+            new NetworkCreateRequest
+            {
+                Name = "dual",
+                EnableIPv6 = true,
+                IPAM = new Ipam
+                {
+                    Config =
+                    [
+                        new IpamConfig { Subnet = "192.168.100.0/24", Gateway = "192.168.100.1" },
+                        new IpamConfig { Subnet = "fd00::/64" },
+                    ],
+                },
+            },
+            CancellationToken.None);
+        await harness.Networks.CreateAsync(new NetworkCreateRequest { Name = "v4only" }, CancellationToken.None);
+
+        var created = await harness.CreateShellAsync("sleep 30", "c1");
+        await harness.Networks.ConnectAsync("dual", new NetworkConnectRequest { Container = "c1" }, CancellationToken.None);
+        await harness.Networks.ConnectAsync("v4only", new NetworkConnectRequest { Container = "c1" }, CancellationToken.None);
+        await harness.Containers.StartAsync(created.Id, CancellationToken.None);
+
+        var record = await harness.Containers.ResolveAsync(created.Id, CancellationToken.None);
+        await ContainerTestHarness.WaitUntilAsync(
+            () => record.Networks.Values.All(endpoint => !string.IsNullOrEmpty(endpoint.IPAddress)),
+            "every endpoint to have an address");
+
+        // Apple reports IPv6 addresses without a prefix length: the live endpoint carries a bare
+        // GlobalIPv6Address and GlobalIPv6PrefixLen 0, exactly what the XPC transport records.
+        record.Networks["dual"].GlobalIPv6Address = "fd00::1234";
+        record.Networks["v4only"].GlobalIPv6Address = "fd00::5678";
+
+        var dual = await harness.Networks.InspectAsync("dual", verbose: false, scope: null, CancellationToken.None);
+        var dualEndpoint = Assert.Single(dual.Containers.Values);
+        Assert.EndsWith("/24", dualEndpoint.IPv4Address);
+        // The prefix length is borrowed from the network's IPv6 subnet.
+        Assert.Equal("fd00::1234/64", dualEndpoint.IPv6Address);
+
+        // No IPv6 subnet to borrow a prefix from: empty, never the bare address.
+        var v4Only = await harness.Networks.InspectAsync("v4only", verbose: false, scope: null, CancellationToken.None);
+        var v4OnlyEndpoint = Assert.Single(v4Only.Containers.Values);
+        Assert.Equal("", v4OnlyEndpoint.IPv6Address);
+    }
+
+    [Fact]
     public async Task ConnectAsync_TwiceToTheSameNetwork_Throws403()
     {
         await using var harness = await ContainerTestHarness.CreateAsync();

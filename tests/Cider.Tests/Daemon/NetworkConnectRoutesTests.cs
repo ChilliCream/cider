@@ -26,9 +26,22 @@ public sealed class NetworkConnectRoutesTests
         Assert.Equal(["bridge", "nc-net"], networks.EnumerateObject().Select(property => property.Name).Order().ToArray());
         Assert.Equal("", networks.GetProperty("nc-net").GetProperty("IPAddress").GetString());
 
-        // ... and the addresses arrive on both networks once it starts.
+        // ... and the addresses arrive on both networks once it starts. Address registration is a
+        // detached follow-up of Start (cider-ede.26), so poll instead of asserting the first read.
         Assert.Equal(204, (await host.PostJsonAsync($"/containers/{id}/start")).Status);
         var started = await NetworksOfAsync(host, id);
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            if (started.EnumerateObject().All(
+                    network => !string.IsNullOrEmpty(network.Value.GetProperty("IPAddress").GetString())))
+            {
+                break;
+            }
+
+            await Task.Delay(50);
+            started = await NetworksOfAsync(host, id);
+        }
+
         foreach (var network in started.EnumerateObject())
         {
             Assert.False(

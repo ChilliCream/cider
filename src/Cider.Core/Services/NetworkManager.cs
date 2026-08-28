@@ -692,8 +692,14 @@ public sealed class NetworkManager
             return address;
         }
 
+        // Never fall back to the bare address: docker CLI >= 28 decodes these fields with
+        // netip.ParsePrefix, which errors on an address without "/len" and makes the whole
+        // `docker network inspect` fail ("only 0 out of 1 networks"). Aspire's DCP shells out to
+        // exactly that command to verify a container's network attachment, and an inspect that can
+        // never succeed keeps it retrying `docker network connect` on a running container forever
+        // (cider-eqa.1). An empty string is the documented "no address" value and parses fine.
         var length = prefixLength > 0 ? prefixLength : PrefixLengthOf(subnet);
-        return length > 0 ? address + "/" + length.ToString(CultureInfo.InvariantCulture) : address;
+        return length > 0 ? address + "/" + length.ToString(CultureInfo.InvariantCulture) : "";
     }
 
     /// <summary>One <see cref="Ipam"/> config entry list mixes IPv4 and IPv6 subnets; this is how they're told apart.</summary>
@@ -776,7 +782,7 @@ public sealed class NetworkManager
                     // Docker reports these in CIDR form here (unlike NetworkSettings.IPAddress);
                     // the docker CLI feeds them to netip.ParsePrefix, which panics on a bare IP.
                     IPv4Address = ToCidr(endpoint.IPAddress, endpoint.IPPrefixLen, subnet),
-                    IPv6Address = ToCidr(endpoint.GlobalIPv6Address, endpoint.GlobalIPv6PrefixLen, null),
+                    IPv6Address = ToCidr(endpoint.GlobalIPv6Address, endpoint.GlobalIPv6PrefixLen, subnetV6),
                 };
             }
         }
