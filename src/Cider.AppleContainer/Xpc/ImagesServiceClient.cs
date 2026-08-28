@@ -59,8 +59,11 @@ internal class ImagesServiceClient(XpcClient images, TimeSpan pullTimeout)
 
     /// <summary><c>snapshotGet</c> — <c>ociPlatform</c> is required (§6), unlike <c>imageUnpack</c>'s
     /// optional one. Throws <see cref="XpcException"/> with code <c>notFound</c> when no snapshot
-    /// exists yet — the caller's cue to <see cref="ImageUnpackAsync"/> then retry (§3.2 item 3).</summary>
-    public async Task<Filesystem> SnapshotGetAsync(ImageDescription image, Platform platform, CancellationToken ct)
+    /// exists yet — the caller's cue to <see cref="ImageUnpackAsync"/> then retry (§3.2 item 3).
+    /// <c>virtual</c> only for the cider-eqa.2 test seam
+    /// (<c>tests/Cider.Tests/AppleContainer/Xpc/InitImageResolverTests.cs</c>), the same shape
+    /// <see cref="ImagePullAsync"/>/<see cref="ImageUnpackAsync"/> already use.</summary>
+    public virtual async Task<Filesystem> SnapshotGetAsync(ImageDescription image, Platform platform, CancellationToken ct)
     {
         using var request = new XpcMessage("snapshotGet");
         request.SetData("imageDescription", XpcJson.SerializeToUtf8Bytes(image));

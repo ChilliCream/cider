@@ -536,6 +536,73 @@ public class XpcContainerRuntimeE2ETests
         Assert.True(median <= 100.0, $"median create+delete latency was {median:F3} ms, expected <= 100 ms");
     }
 
+    /// <summary>
+    /// cider-eqa.2: the create-path init-image precondition must be able to ensure vminit itself over
+    /// the same XPC pull normal images use, instead of degrading the whole create to the CLI (the
+    /// post-store-repair failure mode: vminit absent → every create logged "falling back to the CLI").
+    /// This leg is state-dependent by design: it reads the live store first (read-only) and
+    /// - if vminit is ABSENT (the state this ticket was filed against), the create below must trigger
+    ///   the resolver's XPC pull (asserted via the Information log and vminit's subsequent presence in
+    ///   <c>imageList</c>) — which also repairs the absence as a side effect of the fix working,
+    ///   through normal pull verbs only;
+    /// - if vminit is PRESENT (someone re-pulled it since), the test still exercises the precondition
+    ///   path end-to-end (resolve → match → snapshot ensure → containerCreate) and asserts no pull was
+    ///   logged and no fallback happened.
+    /// Either way <see cref="AssertNoCreateFallback"/> proves the transport stayed xpc. The container's
+    /// own image is ensured over the runtime's normal XPC pull verb first if the store repair removed
+    /// it too — the same thing <c>ImageManager.EnsureImageAsync</c> does above this seam in production.
+    /// </summary>
+    [E2EFact]
+    public async Task Create_with_vminit_absent_pulls_it_over_xpc_and_the_create_stays_on_xpc()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        var ct = cts.Token;
+        var (xpc, _, logger) = NewRuntimes();
+        using var _ = xpc;
+
+        await xpc.EnsureReadyAsync(ct);
+
+        static bool HasVminit(IReadOnlyList<RuntimeImage> images) => images.Any(
+            i => i.References.Any(r => r.Contains("containerization/vminit", StringComparison.Ordinal)));
+
+        var before = await xpc.ListImagesAsync(ct);
+        var vminitWasAbsent = !HasVminit(before);
+
+        if (!before.Any(i => i.References.Contains(Image, StringComparer.Ordinal)))
+        {
+            // Normal pull verb, over XPC — never a store mutation outside the runtime's own API.
+            await xpc.PullImageAsync(Image, null, null, new Progress<ProgressEvent>(), ct);
+        }
+
+        var name = NewName("initimg");
+        try
+        {
+            await xpc.CreateContainerAsync(
+                new ContainerSpec { RuntimeId = name, Image = Image, Entrypoint = "true", Networks = ["default"] },
+                ct);
+
+            AssertNoCreateFallback(logger);
+
+            bool PullLogged() => logger.Entries.Any(
+                e => e.Level == LogLevel.Information &&
+                     e.Message.Contains("pulling it over the xpc images service", StringComparison.Ordinal));
+
+            if (vminitWasAbsent)
+            {
+                Assert.True(PullLogged(), "vminit was absent, so the create precondition must have pulled it over xpc");
+                Assert.True(HasVminit(await xpc.ListImagesAsync(ct)), "vminit must be present after the xpc pull");
+            }
+            else
+            {
+                Assert.False(PullLogged(), "vminit was already present; the precondition must not have pulled it again");
+            }
+        }
+        finally
+        {
+            await xpc.RemoveContainerAsync(name, force: true, CancellationToken.None);
+        }
+    }
+
     /// <summary>Polls <see cref="IContainerRuntime.InspectContainerAsync"/> until <paramref name="name"/>
     /// reports <see cref="RuntimeContainerState.Running"/> — bootstrap+start (still CLI fallback, X7)
     /// is not instantaneous.</summary>

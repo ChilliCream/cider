@@ -17,10 +17,11 @@ internal sealed partial class XpcContainerRuntime
     /// <summary>
     /// Resolves every precondition (§8.3: "the image snapshot must already exist... any named volume
     /// must already exist... networks[].network must name an existing network"), builds the
-    /// <see cref="ContainerConfiguration"/>, and calls <c>containerCreate</c>. Any client-side
-    /// precondition failure that means "the xpc transport cannot do this yet" — the init image is not
-    /// present locally and cider-ede.10 has not landed pull support (see
-    /// <see cref="InitImageResolver"/>'s own doc comment) — surfaces as
+    /// <see cref="ContainerConfiguration"/>, and calls <c>containerCreate</c>. An absent init image
+    /// is no longer a fallback trigger by itself: <see cref="InitImageResolver"/> pulls it over the
+    /// same XPC <c>imagePull</c> route normal images use (cider-eqa.2; see its doc comment). Any
+    /// client-side precondition failure that means "the xpc transport cannot do this" — e.g. that
+    /// init-image XPC pull itself failing — surfaces as
     /// <see cref="RuntimeErrorKind.Unavailable"/> and is treated exactly like an apiserver-unavailable
     /// XPC failure: fall back to the CLI runtime, which still does its own client-side pull/unpack
     /// work (task fix direction §4's Fallback rule). Every other failure (bad id, missing volume,

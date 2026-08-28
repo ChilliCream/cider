@@ -27,15 +27,19 @@ namespace Cider.AppleContainer.Xpc;
 ///    for. This is not "a new CLI dependency for something the apiserver can do" (the ground rules'
 ///    ban): there is no XPC route that reports this value at all (§2 has no such route), only a
 ///    config file this task cannot rely on being present.
-/// 2. <b>Unpack</b> — <c>imageList</c> → match → <c>snapshotGet</c>/<c>imageUnpack</c>, identical to
-///    <see cref="ImageSnapshotEnsurer"/>. Unlike the container's own image, nothing above the runtime
-///    seam ever pulls the init image, and this task's <see cref="ImagesServiceClient"/> deliberately
-///    carries no <c>imagePull</c> route (file scope: "only these three routes... let X9 extend it";
-///    non-goals: "pull with progress (X9)"). When the init image is not present locally at all, this
-///    throws <see cref="RuntimeErrorKind.Unavailable"/> — <see cref="XpcContainerRuntime.CreateContainerAsync"/>
-///    treats that exactly like an apiserver-unavailable read (task fix direction §4's Fallback rule)
-///    and falls back to the CLI runtime, whose own <c>container create</c> still pulls the init image
-///    for itself, exactly as it always has.
+/// 2. <b>Pull + unpack</b> — <c>imageList</c> → match → <c>snapshotGet</c>/<c>imageUnpack</c>,
+///    identical to <see cref="ImageSnapshotEnsurer"/>. Unlike the container's own image, nothing
+///    above the runtime seam ever pulls the init image — so when it is not present locally at all
+///    (live failure mode: the store-index repairs left vminit absent and every XPC create degraded
+///    to the whole-create CLI path), this pulls it itself over the SAME <c>imagePull</c> route
+///    <see cref="XpcContainerRuntime.PullImageAsync"/> uses for normal images (cider-eqa.2; the
+///    historical "cannot pull yet" blocker was cider-ede.10 predating pull support, gone since
+///    540c493 fixed <c>maxConcurrentDownloads</c>), entering the runtime's <see cref="BlobSweepGate"/>
+///    as a write first (cider-ede.31). Only when that pull itself fails does this throw
+///    <see cref="RuntimeErrorKind.Unavailable"/> with the pull failure as the reason —
+///    <see cref="XpcContainerRuntime.CreateContainerAsync"/> treats that exactly like an
+///    apiserver-unavailable read (task fix direction §4's Fallback rule) and falls back to the CLI
+///    runtime as last resort, whose own <c>container create</c> still pulls the init image for itself.
 /// </remarks>
 internal sealed class InitImageResolver
 {
@@ -51,14 +55,33 @@ internal sealed class InitImageResolver
 
     private readonly ContainerCli _cli;
     private readonly ImagesServiceClient _images;
+    private readonly BlobSweepGate _blobSweepGate;
+    private readonly ILogger _logger;
+    private readonly Func<CancellationToken, Task<string>>? _referenceResolver;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private string? _reference;
     private bool _ensured;
 
-    public InitImageResolver(AppleContainerOptions options, ImagesServiceClient images, ILogger logger)
+    /// <param name="blobSweepGate">The owning runtime's own <see cref="BlobSweepGate"/> instance —
+    /// the pull-on-absent path below writes blobs exactly like
+    /// <see cref="XpcContainerRuntime.PullImageAsync"/> does, so it must enter the same gate that
+    /// runtime's sweep (the apiserver-unavailable CLI delete fallback) contends on (cider-ede.31).</param>
+    /// <param name="referenceResolver">Test-only seam (cider-eqa.2): overrides the whole
+    /// config-file/CLI reference resolution so a unit test can drive the ensure/pull step without a
+    /// <c>container</c> binary on the machine. <c>null</c> (every production call site) keeps the
+    /// normal resolution.</param>
+    public InitImageResolver(
+        AppleContainerOptions options,
+        ImagesServiceClient images,
+        BlobSweepGate blobSweepGate,
+        ILogger logger,
+        Func<CancellationToken, Task<string>>? referenceResolver = null)
     {
         _cli = new ContainerCli(options, logger);
         _images = images;
+        _blobSweepGate = blobSweepGate;
+        _logger = logger;
+        _referenceResolver = referenceResolver;
     }
 
     /// <summary>Returns the cached, already-unpacked init image reference, resolving and unpacking it
@@ -88,6 +111,11 @@ internal sealed class InitImageResolver
 
     private async Task<string> ResolveReferenceAsync(CancellationToken ct)
     {
+        if (_referenceResolver is not null)
+        {
+            return await _referenceResolver(ct).ConfigureAwait(false);
+        }
+
         foreach (var path in ConfigFilePaths)
         {
             if (TryReadVminitImage(path) is { Length: > 0 } fromConfig)
@@ -101,16 +129,11 @@ internal sealed class InitImageResolver
 
     private async Task EnsureUnpackedAsync(string reference, CancellationToken ct)
     {
-        var descriptions = await _images.ImageListAsync(ct).ConfigureAwait(false);
-        var match = ImageSnapshotEnsurer.Match(descriptions, reference);
-        if (match is null)
-        {
-            throw RuntimeException.Unavailable(
-                $"cider: the init image '{reference}' is not present locally and the xpc transport " +
-                "cannot pull it yet (cider-ede.10); falling back to the CLI, which will pull it itself");
-        }
-
         var platform = Platform.Current;
+        var descriptions = await _images.ImageListAsync(ct).ConfigureAwait(false);
+        var match = ImageSnapshotEnsurer.Match(descriptions, reference)
+            ?? await PullOverXpcAsync(reference, platform, ct).ConfigureAwait(false);
+
         try
         {
             await _images.SnapshotGetAsync(match, platform, ct).ConfigureAwait(false);
@@ -119,6 +142,40 @@ internal sealed class InitImageResolver
         {
             await _images.ImageUnpackAsync(match, platform, ct).ConfigureAwait(false);
             await _images.SnapshotGetAsync(match, platform, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Pulls the absent init image over the SAME <c>imagePull</c> route
+    /// <see cref="XpcContainerRuntime.PullImageAsync"/> uses for normal images (cider-eqa.2), pinned
+    /// to <paramref name="platform"/> (the current platform — the only variant
+    /// <see cref="EnsureUnpackedAsync"/> ever unpacks, matching the CLI's own per-arch vminit fetch).
+    /// No progress endpoint: like <see cref="ImageSnapshotEnsurer"/>'s unpack, a create precondition
+    /// has no progress stream to report onto. A pull failure — apiserver unreachable, registry
+    /// unreachable, anything — throws <see cref="RuntimeErrorKind.Unavailable"/> with the reason in
+    /// the message, so <see cref="XpcContainerRuntime.CreateContainerAsync"/>'s existing catch arm
+    /// logs it (<c>WarnFallback</c>) and takes the CLI fallback as last resort.
+    /// </summary>
+    private async Task<ImageDescription> PullOverXpcAsync(string reference, Platform platform, CancellationToken ct)
+    {
+        _logger.LogInformation(
+            "init image '{Reference}' is not present locally; pulling it over the xpc images service (cider-eqa.2)",
+            reference);
+
+        // cider-ede.31: a pull writes blobs before its index entry is committed — enter the owning
+        // runtime's own gate as a write, exactly like XpcContainerRuntime.PullImageAsync, so this
+        // pull can never race the transport's one remaining store-wide sweep (the
+        // apiserver-unavailable CLI delete fallback in RemoveImageAsync).
+        await using var write = await _blobSweepGate.EnterImageWriteAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await _images.ImagePullAsync(reference, platform, progressEndpoint: null, ct).ConfigureAwait(false);
+        }
+        catch (XpcException ex)
+        {
+            throw RuntimeException.Unavailable(
+                $"cider: the init image '{reference}' is not present locally and the xpc pull failed " +
+                $"({ex.Message}); falling back to the CLI, which will pull it itself");
         }
     }
 

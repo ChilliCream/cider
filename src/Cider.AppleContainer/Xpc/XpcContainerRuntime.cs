@@ -134,7 +134,7 @@ internal sealed partial class XpcContainerRuntime : IContainerRuntime, IDisposab
         _imagesClient = imagesClient ?? new ImagesServiceClient(images, options.PullTimeout);
         _kernelCache = new KernelCache(apiserver);
         _imageSnapshotEnsurer = new ImageSnapshotEnsurer(_imagesClient);
-        _initImageResolver = new InitImageResolver(options, _imagesClient, logger);
+        _initImageResolver = new InitImageResolver(options, _imagesClient, _blobSweepGate, logger);
         _dnsDomainResolver = new SystemDnsDomainResolver(options, logger);
 
         // Task cider-ede.14 fix direction: "add a startup Information log listing fallback members
